@@ -284,26 +284,46 @@ async fn insert_and_read_back(db: &str, table: &str) -> Result<(Vec<u64>, Vec<St
     Ok((ids, same_strings(&read, "tag"), ns))
 }
 
-/// The server still DECLARES the column `JSON` and upstream's Native reader
-/// refuses that type, so this is the one read the transports disagree on.
+/// JSON reads the same on both transports. The HTTP arm gets there by asking
+/// the server for the TCP wire shape (`client_protocol_version`) and decoding
+/// it with this crate's codec, rather than upstream's Native reader, which
+/// refuses the declared type outright.
 #[tokio::test]
 #[ignore = "needs a ClickHouse cluster -- see the module docs"]
-async fn json_columns_read_on_tcp_only() {
+async fn json_columns_read_the_same_on_both_transports() {
     const SQL: &str = r#"SELECT CAST('{"a":1}', 'JSON') AS doc"#;
 
-    let over_tcp = tcp()
-        .fetch_columns(SQL)
-        .await
-        .expect("tcp reads a JSON column as String");
-    assert_eq!(over_tcp.get::<String>("doc").unwrap(), [r#"{"a":1}"#]);
+    let over_tcp = tcp().fetch_columns(SQL).await.expect("tcp reads JSON");
+    let over_http = http().fetch_columns(SQL).await.expect("http reads JSON");
 
-    let message = http()
-        .fetch_columns(SQL)
-        .await
-        .expect_err("upstream's Native reader has no JSON deserialiser")
-        .to_string();
-    assert!(
-        message.contains("unimplemented deserialization"),
-        "expected the upstream JSON gap, got {message}"
+    assert_eq!(over_tcp.get::<String>("doc").unwrap(), [r#"{"a":1}"#]);
+    assert_eq!(
+        over_http.get::<String>("doc").unwrap(),
+        over_tcp.get::<String>("doc").unwrap(),
+        "a JSON column must read identically on both transports"
     );
+}
+
+/// Variant and Dynamic take the same route as JSON: one document per row, and
+/// the same document whichever transport carried it.
+#[tokio::test]
+#[ignore = "needs a ClickHouse cluster -- see the module docs"]
+async fn semi_structured_columns_read_the_same_on_both_transports() {
+    // CAST to Variant only accepts a type the Variant already lists, so the
+    // literal is widened to UInt64 first rather than left as UInt8.
+    const SQL: &str = "SELECT CAST(42::UInt64, 'Variant(UInt64, String)') AS v, \
+                       CAST('hello', 'Dynamic') AS d";
+
+    let over_tcp = tcp().fetch_columns(SQL).await.expect("tcp reads them");
+    let over_http = http().fetch_columns(SQL).await.expect("http reads them");
+
+    for column in ["v", "d"] {
+        let tcp_values = over_tcp.get::<String>(column).unwrap();
+        assert_eq!(tcp_values.len(), 1, "{column} must carry one row");
+        assert_eq!(
+            over_http.get::<String>(column).unwrap(),
+            tcp_values,
+            "{column} must read identically on both transports"
+        );
+    }
 }

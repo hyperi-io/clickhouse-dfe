@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TCP transport (connection actor, deadpool pool, retry, TLS trust) and the Native-format wire codec
 - Column-typed reads over TCP: `TcpClient::query(sql).fetch_blocks()` plus `DecodedBlock::column_as` over the `FromColumn` trait
 - Dynamic layer: runtime-schema inserts from `serde_json::Map` rows over HTTP (`FORMAT RowBinary`) and TCP (`FORMAT Native`)
-- JSON columns over TCP travel as `String` in both directions, with `TcpClient::with_json_as_string` to opt out
+- JSON columns travel as `String` in both directions, with `TcpClient::with_json_as_string` to opt out
+- `UnifiedClient::fetch_columns` decodes with this crate's Native codec on both transports, so `JSON`, `Variant` and `Dynamic` read over HTTP as well as TCP
 - Unified client over both transports: `UnifiedClient`, `Columns::get::<T>` by column name, and `dynamic_insert` resolving its schema over whichever transport is configured
 - `ClientExt` on `clickhouse::Client`: ping, kill query, query id, session id, role, plus `ServerException` parsed from a server error body with a retriable-code test
 - Server-side query parameters over TCP: `TcpQuery::param` emits the Query packet's parameters section, so `{name:Type}` binds instead of being interpolated

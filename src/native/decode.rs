@@ -530,13 +530,51 @@ impl<T: FromColumn> FromColumn for Option<T> {
     }
 }
 
+/// Consume a block's info section: `(field_id varuint, value)` pairs then a
+/// zero terminator, per `NativeWriter.cpp:126` `block.info.write` and the cpp
+/// `ReadBlock` at 854-877. `NativeWriter` emits it whenever the client
+/// revision is above zero, so both transports read it here.
+///
+/// The values mean nothing to a non-distributed client, but the field ids are
+/// asserted rather than skipped: a misaligned or hostile encoder then surfaces
+/// as a clean error instead of a silently mis-parsed block. Field 3
+/// (`out_of_order_buckets`) appears only above the 54459 pin, so a revision
+/// bump past 54480 must revisit this.
+///
+/// # Errors
+///
+/// [`Error::BadResponse`] on an unexpected field id or terminator.
+pub(crate) async fn read_block_info<R: ClickHouseRead>(r: &mut R) -> Result<()> {
+    let field1 = r.read_var_uint().await?;
+    if field1 != 1 {
+        return Err(Error::BadResponse(format!(
+            "native: block info field id {field1} (expected 1 = is_overflows)"
+        )));
+    }
+    let _is_overflows = r.read_u8().await?;
+    let field2 = r.read_var_uint().await?;
+    if field2 != 2 {
+        return Err(Error::BadResponse(format!(
+            "native: block info field id {field2} (expected 2 = bucket_num)"
+        )));
+    }
+    let _bucket_num = r.read_i32_le().await?;
+    let terminator = r.read_var_uint().await?;
+    if terminator != 0 {
+        return Err(Error::BadResponse(format!(
+            "native: block info terminator {terminator} (expected 0)"
+        )));
+    }
+    Ok(())
+}
+
 /// Read one Native-format data block body off the wire.
 ///
 /// Stream pointer position on entry MUST be immediately after the
 /// `num_columns` + `num_rows` varuint pair the caller already consumed
-/// from the Data packet header. The decoder consumes exactly the
-/// column-payload bytes for `num_columns` columns at `num_rows` rows;
-/// on return the stream pointer is aligned for the next packet ID.
+/// from the block header. The decoder consumes exactly the column-payload
+/// bytes for `num_columns` columns at `num_rows` rows; on return the stream
+/// pointer is aligned for whatever the transport puts next.
 ///
 /// `server_revision` decides whether the per-column custom-serialization
 /// flag byte is on the wire -- 25.x servers are always above the gate.

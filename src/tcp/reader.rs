@@ -305,34 +305,8 @@ async fn read_data_block_header<R: ClickHouseRead>(
         None
     };
 
-    // Block info -- (field_id varint, value) pairs + zero terminator,
-    // cpp `ReadBlock` 854-877. The values carry no meaning for a
-    // non-distributed client, but the field ids are asserted rather than
-    // skipped, so a misaligned or hostile encoder surfaces as a clean
-    // BadResponse instead of a silently mis-parsed block. Field 3
-    // (out_of_order_buckets) appears only above the 54459 revision pin,
-    // so a bump past 54480 must revisit this.
     if server_revision >= DBMS_MIN_REVISION_WITH_BLOCK_INFO {
-        let field1 = r.read_var_uint().await?;
-        if field1 != 1 {
-            return Err(Error::BadResponse(format!(
-                "tcp: block info field id {field1} (expected 1 = is_overflows)"
-            )));
-        }
-        let _is_overflows = r.read_u8().await?;
-        let field2 = r.read_var_uint().await?;
-        if field2 != 2 {
-            return Err(Error::BadResponse(format!(
-                "tcp: block info field id {field2} (expected 2 = bucket_num)"
-            )));
-        }
-        let _bucket_num = r.read_i32_le().await?;
-        let terminator = r.read_var_uint().await?;
-        if terminator != 0 {
-            return Err(Error::BadResponse(format!(
-                "tcp: block info terminator {terminator} (expected 0)"
-            )));
-        }
+        crate::native::decode::read_block_info(r).await?;
     }
 
     let num_columns = r.read_var_uint().await?;

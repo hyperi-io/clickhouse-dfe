@@ -9,22 +9,31 @@
 //! One client over both transports. Reads land in [`Columns`] whichever
 //! transport answered.
 //!
-//! [`Columns::get`] reads what [`FromColumn`] covers: `String`, `Vec<u8>`,
-//! `u64`, `u8`, `i64`, `bool`, `Option<String>`; anything else errors on both.
-//! `LowCardinality(_)` is left wrapped so it fails on HTTP as it already does
-//! on TCP, and `JSON` reads on TCP alone -- upstream's Native reader rejects
-//! the declared type outright.
+//! Both arms decode with this crate's own Native codec, so a type reads the
+//! same way on either -- `JSON`, `Variant` and `Dynamic` included, which
+//! upstream's Native reader rejects on the declared type name. The HTTP arm
+//! gets there by asking the server for the same wire shape the TCP handshake
+//! negotiates; see [`UnifiedClient::fetch_columns`].
 
 use clickhouse::Client;
-use clickhouse::native::decode::{Decode, ValueReader};
-use clickhouse::native::{Block, Column, DataTypeNode};
 
-use crate::error::Result;
-use crate::native::{DecodedBlock, DecodedColumn, FromColumn};
+use crate::error::{Error, Result};
+use crate::native::decode::decode_block;
+use crate::native::io::ClickHouseRead;
+use crate::native::{DecodedBlock, FromColumn};
 use crate::tcp::TcpClient;
+use crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION;
 
 /// Sent on the HTTP arm to match the [`TcpClient`] default.
 const JSON_AS_STRING: &str = "output_format_native_write_json_as_string";
+
+/// URL parameter, not a setting: `HTTPHandler.cpp:318-321` reads it off the
+/// query string and calls `setClientProtocolVersion`, which is what makes
+/// `NativeWriter` emit block info, the per-column custom-serialization flag
+/// and the V2 JSON/Dynamic serialisation (`NativeWriter.cpp:81-90,:100,:125`).
+/// Left unset the server writes revision 0 -- a different wire shape from the
+/// one the TCP transport negotiates, and one this decoder does not read.
+const CLIENT_PROTOCOL_VERSION: &str = "client_protocol_version";
 
 /// Which wire protocol a [`UnifiedClient`] answers on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,15 +123,15 @@ impl UnifiedClient {
     pub async fn fetch_columns(&self, sql: &str) -> Result<Columns> {
         let blocks = match self {
             Self::Http(client) => {
-                let mut cursor = client
+                let cursor = client
                     .query_raw(sql)
                     .with_setting(JSON_AS_STRING, "1")
-                    .fetch_native()?;
-                let mut blocks = Vec::new();
-                while let Some(block) = cursor.next().await? {
-                    blocks.push(decoded_block(&block)?);
-                }
-                blocks
+                    .with_setting(
+                        CLIENT_PROTOCOL_VERSION,
+                        DBMS_TCP_PROTOCOL_VERSION.to_string(),
+                    )
+                    .fetch_bytes("Native")?;
+                decode_native_stream(cursor).await?
             }
             Self::Tcp(client) => client.query(sql).fetch_blocks().await?,
         };
@@ -220,84 +229,57 @@ impl Columns {
     }
 }
 
-/// A `String` cell, borrowed verbatim. Upstream's own impls go through `&str`,
-/// which rejects the non-UTF-8 bytes ClickHouse's `String` permits.
-struct RawBytes<'a>(&'a [u8]);
+/// Decode a `FORMAT Native` body: block info, the column and row counts, then
+/// the block, repeated until the stream ends.
+///
+/// The same [`decode_block`] the TCP transport uses, at the same revision, so
+/// a type that reads on one transport reads on the other. There is no
+/// terminator in the format -- the body simply stops -- so the end is a read
+/// that returns no bytes where the next block's first byte would be.
+async fn decode_native_stream<R: ClickHouseRead>(mut r: R) -> Result<Vec<DecodedBlock>> {
+    use crate::native::io::read_var_uint_or_eof;
 
-impl<'a> Decode<'a> for RawBytes<'a> {
-    fn compatible(data_type: &DataTypeNode) -> bool {
-        matches!(data_type, DataTypeNode::String)
-    }
-
-    fn decode(
-        reader: &mut ValueReader<'a>,
-    ) -> std::result::Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Ok(Self(reader.native_bytes()))
-    }
-}
-
-fn collect<'a, T: Decode<'a>>(column: &'a Column) -> Result<Vec<T>> {
-    let values: std::result::Result<Vec<T>, clickhouse::error::Error> =
-        column.iter::<T>()?.collect();
-    Ok(values?)
-}
-
-fn decoded_block(block: &Block) -> Result<DecodedBlock> {
-    let mut schema = Vec::with_capacity(block.columns().len());
-    let mut columns = Vec::with_capacity(block.columns().len());
-    for column in block.columns() {
-        // `Column::name()` panics on a non-UTF-8 name; a lossy key still works.
-        schema.push((
-            String::from_utf8_lossy(column.name_bytes()).into_owned(),
-            column.data_type().to_string(),
-        ));
-        columns.push(decoded_column(column)?);
-    }
-    Ok(DecodedBlock {
-        columns,
-        schema,
-        num_rows: block.num_rows() as u64,
-    })
-}
-
-/// Map onto the [`DecodedColumn`] the TCP reader produces for the same wire
-/// type; anything else stays `Unsupported` so a read fails the same way.
-fn decoded_column(column: &Column) -> Result<DecodedColumn> {
-    // `SimpleAggregateFunction(f, T)` is wire-identical to `T` and the TCP
-    // reader unwraps it too. `LowCardinality(_)` is deliberately left wrapped.
-    let mut data_type = column.data_type();
-    while let DataTypeNode::SimpleAggregateFunction(_, inner) = data_type {
-        data_type = inner;
-    }
-
-    Ok(match data_type {
-        DataTypeNode::String => DecodedColumn::String(
-            collect::<RawBytes<'_>>(column)?
-                .into_iter()
-                .map(|cell| cell.0.to_vec())
-                .collect(),
-        ),
-        DataTypeNode::UInt8 => DecodedColumn::UInt8(collect(column)?),
-        DataTypeNode::UInt64 => DecodedColumn::UInt64(collect(column)?),
-        DataTypeNode::Int64 => DecodedColumn::Int64(collect(column)?),
-        // The TCP reader folds `Bool` onto `UInt8` as well.
-        DataTypeNode::Bool => {
-            DecodedColumn::UInt8(collect::<bool>(column)?.into_iter().map(u8::from).collect())
+    let mut blocks = Vec::new();
+    loop {
+        // The block info's first field id doubles as the end probe: the
+        // server writes the info section for every block at a non-zero
+        // client revision, which is what this reader asks for.
+        let Some(field1) = read_var_uint_or_eof(&mut r).await? else {
+            return Ok(blocks);
+        };
+        if field1 != 1 {
+            return Err(Error::BadResponse(format!(
+                "native over http: block info field id {field1} (expected 1)"
+            )));
         }
-        DataTypeNode::Nullable(inner) if matches!(**inner, DataTypeNode::String) => {
-            let cells = collect::<Option<RawBytes<'_>>>(column)?;
-            DecodedColumn::Nullable {
-                mask: cells.iter().map(|c| u8::from(c.is_none())).collect(),
-                child: Box::new(DecodedColumn::String(
-                    cells
-                        .into_iter()
-                        .map(|c| c.map_or_else(Vec::new, |cell| cell.0.to_vec()))
-                        .collect(),
-                )),
-            }
-        }
-        other => DecodedColumn::Unsupported(other.to_string()),
-    })
+        finish_block_info(&mut r).await?;
+
+        let num_columns = r.read_var_uint().await?;
+        let num_rows = r.read_var_uint().await?;
+        blocks.push(decode_block(&mut r, num_columns, num_rows, DBMS_TCP_PROTOCOL_VERSION).await?);
+    }
+}
+
+/// The rest of a block info section, after its first field id was read as the
+/// end-of-stream probe.
+async fn finish_block_info<R: ClickHouseRead>(r: &mut R) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    let _is_overflows = r.read_u8().await?;
+    let field2 = r.read_var_uint().await?;
+    if field2 != 2 {
+        return Err(Error::BadResponse(format!(
+            "native over http: block info field id {field2} (expected 2)"
+        )));
+    }
+    let _bucket_num = r.read_i32_le().await?;
+    let terminator = r.read_var_uint().await?;
+    if terminator != 0 {
+        return Err(Error::BadResponse(format!(
+            "native over http: block info terminator {terminator} (expected 0)"
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -355,13 +337,25 @@ mod tests {
     }
 
     /// The same two columns as a `format=Native` HTTP body.
+    /// The body a server writes for `FORMAT Native` once the request carries
+    /// `client_protocol_version`: block info, the counts, then each column
+    /// with its custom-serialization flag. Byte-for-byte what the TCP Data
+    /// packet carries after its header, which is the point of the adapter.
     fn native_body() -> Vec<u8> {
         let mut out = Vec::new();
+        // Block info: is_overflows, bucket_num, terminator.
+        out.put_var_uint(1);
+        out.push(0);
+        out.put_var_uint(2);
+        out.extend_from_slice(&(-1i32).to_le_bytes());
+        out.put_var_uint(0);
+
         out.put_var_uint(2);
         out.put_var_uint(NAMES.len() as u64);
         for (name, values) in [("name", NAMES), ("col_type", TYPES)] {
             out.put_string(name);
             out.put_string("String");
+            out.push(0);
             for value in values {
                 out.put_string(value);
             }

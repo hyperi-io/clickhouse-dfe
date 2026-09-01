@@ -159,7 +159,11 @@ pub(crate) async fn read_exact_grown<R: AsyncRead + Unpin>(
 }
 
 /// Extension trait on `AsyncRead` for `ClickHouse` wire protocol.
-pub(crate) trait ClickHouseRead: AsyncRead + Unpin + Send + Sync {
+///
+/// No `Sync` bound: the returned futures only need `&mut Self` to be `Send`,
+/// and upstream's `BytesCursor` -- the reader behind `Query::fetch_bytes`, so
+/// the HTTP half of the codec -- is `Send` but not `Sync`.
+pub(crate) trait ClickHouseRead: AsyncRead + Unpin + Send {
     fn read_var_uint(&mut self) -> impl Future<Output = Result<u64>> + Send + '_;
 
     fn read_string(&mut self) -> impl Future<Output = Result<Vec<u8>>> + Send + '_;
@@ -173,7 +177,30 @@ pub(crate) trait ClickHouseRead: AsyncRead + Unpin + Send + Sync {
     }
 }
 
-impl<T: AsyncRead + Unpin + Send + Sync> ClickHouseRead for T {
+/// A varuint, or `None` when the stream ended cleanly on a block boundary.
+///
+/// A `FORMAT Native` body is a bare run of blocks with no terminator, so the
+/// only way to know it is finished is that the next block's first byte never
+/// arrives. Ending part-way through a value is still an error.
+pub(crate) async fn read_var_uint_or_eof<R: ClickHouseRead>(r: &mut R) -> Result<Option<u64>> {
+    let mut first = [0u8; 1];
+    if r.read(&mut first).await? == 0 {
+        return Ok(None);
+    }
+    let mut decoder = VarUintDecoder::default();
+    if let Some(value) = decoder.push(first[0])? {
+        return Ok(Some(value));
+    }
+    loop {
+        let mut octet = [0u8; 1];
+        r.read_exact(&mut octet[..]).await?;
+        if let Some(value) = decoder.push(octet[0])? {
+            return Ok(Some(value));
+        }
+    }
+}
+
+impl<T: AsyncRead + Unpin + Send> ClickHouseRead for T {
     async fn read_var_uint(&mut self) -> Result<u64> {
         let mut decoder = VarUintDecoder::default();
         loop {
