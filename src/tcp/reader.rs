@@ -493,6 +493,10 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
 
 #[cfg(test)]
 mod tests {
+    // The fuzz driver's PRNG: every draw is immediately taken modulo a small
+    // bound, so narrowing it is the point rather than a hazard.
+    #![allow(clippy::cast_possible_truncation)]
+
     use super::*;
     use crate::native::io::ClickHouseWrite;
     use crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION;

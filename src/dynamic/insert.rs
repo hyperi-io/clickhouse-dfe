@@ -182,12 +182,7 @@ impl DynamicInsert {
     /// Nothing is fetched or cached here -- the caller resolved the schema
     /// before opening the insert.
     #[cfg(feature = "tcp")]
-    pub fn tcp(
-        client: TcpClient,
-        database: &str,
-        table: &str,
-        schema: Arc<DynamicSchema>,
-    ) -> Self {
+    pub fn tcp(client: TcpClient, database: &str, table: &str, schema: Arc<DynamicSchema>) -> Self {
         Self {
             backend: Backend::Tcp(client),
             database: database.to_string(),
@@ -209,14 +204,15 @@ impl DynamicInsert {
         }
         let full = self.full_table();
         let schema = match &self.backend {
-            Backend::Http { client, cache } => match cache.get(&full) {
-                Some(cached) => cached,
-                None => {
+            Backend::Http { client, cache } => {
+                if let Some(cached) = cache.get(&full) {
+                    cached
+                } else {
                     let fetched = fetch_dynamic_schema(client, &self.database, &self.table).await?;
                     cache.insert(&full, Arc::clone(&fetched));
                     fetched
                 }
-            },
+            }
             #[cfg(feature = "tcp")]
             Backend::Tcp(_) => return Ok(()),
         };
@@ -322,16 +318,16 @@ impl DynamicInsert {
     pub async fn write_map_with_raw(
         &mut self,
         row: &Map<String, Value>,
-        raw: (&str, &[u8]),
+        passthrough: (&str, &[u8]),
     ) -> Result<(), DynamicError> {
-        self.write(row, &[raw.0], Some(raw)).await
+        self.write(row, &[passthrough.0], Some(passthrough)).await
     }
 
     async fn write(
         &mut self,
         row: &Map<String, Value>,
         raw_names: &[&str],
-        raw: Option<(&str, &[u8])>,
+        passthrough: Option<(&str, &[u8])>,
     ) -> Result<(), DynamicError> {
         self.ensure_schema().await?;
         self.ensure_active(row, raw_names).await?;
@@ -346,7 +342,7 @@ impl DynamicInsert {
                     message: "insert sink not initialised".to_string(),
                 })?;
 
-        let dynamic_row = match raw {
+        let dynamic_row = match passthrough {
             Some((json_col, raw_bytes)) => DynamicRow::with_raw(row, columns, raw_bytes, json_col),
             None => DynamicRow::new(row, columns),
         };
@@ -392,10 +388,7 @@ impl DynamicInsert {
                     native,
                     mut block,
                 } => match send_block(&session, &native, &mut block, &full).await {
-                    Ok(()) => session
-                        .finish()
-                        .await
-                        .map_err(|e| classify_error(&full, e)),
+                    Ok(()) => session.finish().await.map_err(|e| classify_error(&full, e)),
                     Err(e) => {
                         session.abort();
                         Err(e)

@@ -149,6 +149,10 @@ impl ClientInfo {
 
 #[cfg(test)]
 mod tests {
+    // Cursor positions into a buffer this module just built: the value cannot
+    // exceed the buffer, so a 32-bit `usize` narrowing is not reachable.
+    #![allow(clippy::cast_possible_truncation)]
+
     use super::*;
     use crate::native::io::ClickHouseRead;
     use crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION;

@@ -24,41 +24,77 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TypeTag {
+    /// `String`: a varuint length then the bytes, which need not be UTF-8.
     String,
+    /// `FixedString(N)`: exactly N bytes, no length prefix.
     FixedString,
+    /// `UInt8`.
     UInt8,
+    /// `UInt16`.
     UInt16,
+    /// `UInt32`.
     UInt32,
+    /// `UInt64`.
     UInt64,
+    /// `UInt128`.
     UInt128,
+    /// `UInt256`, carried as 32 little-endian bytes.
     UInt256,
+    /// `Int8`.
     Int8,
+    /// `Int16`.
     Int16,
+    /// `Int32`.
     Int32,
+    /// `Int64`.
     Int64,
+    /// `Int128`.
     Int128,
+    /// `Int256`, carried as 32 little-endian bytes.
     Int256,
+    /// `Float32`.
     Float32,
+    /// `Float64`.
     Float64,
+    /// `Bool`, which is a `UInt8` on the wire.
     Bool,
+    /// `Date`: unsigned days since the epoch, `UInt16` wide.
     Date,
+    /// `Date32`: signed days since the epoch, `Int32` wide.
     Date32,
+    /// `DateTime`: epoch seconds, `UInt32` wide.
     DateTime,
+    /// `DateTime64(P)`: `Int64` ticks at P sub-second digits.
     DateTime64,
+    /// `Decimal(P, S)` with P <= 9, on an `Int32` backing.
     Decimal32,
+    /// `Decimal(P, S)` with P <= 18, on an `Int64` backing.
     Decimal64,
+    /// `Decimal(P, S)` with P <= 38, on an `Int128` backing.
     Decimal128,
+    /// `Decimal(P, S)` above 38 digits, on an `Int256` backing.
     Decimal256,
+    /// `UUID`, 16 raw bytes.
     UUID,
+    /// `IPv4`, on a `UInt32` backing.
     IPv4,
+    /// `IPv6`, 16 raw bytes.
     IPv6,
+    /// `Enum8(...)`: the member index, `Int8` wide.
     Enum8,
+    /// `Enum16(...)`: the member index, `Int16` wide.
     Enum16,
+    /// `Array(T)`; the element type is the parsed type's first child.
     Array,
+    /// `Map(K, V)`; the key and value types are the two children.
     Map,
+    /// `Point`, which is `Tuple(Float64, Float64)`.
     Point,
+    /// `JSON`, written by this encoder as length-prefixed document text.
     JSON,
+    /// `Variant(T1, ...)`, which this encoder rejects.
     Variant,
+    /// `Dynamic`, which this encoder rejects.
     Dynamic,
     /// A type name this parser does not recognise; the encoder rejects it.
     Unknown,
@@ -352,8 +388,9 @@ impl ParsedType {
     /// Coercion category for the base type, for a caller deciding how to shape
     /// a value before handing it over.
     ///
-    /// A name this parser does not recognise falls back to `"String"` here; the
-    /// encoder still rejects it rather than writing bytes for it.
+    /// A name this parser does not recognise reports `"Unknown"`, not
+    /// `"String"`: the encoder rejects it either way, and calling it a string
+    /// would let [`Self::is_string`] agree to stringify a `Variant`.
     #[must_use]
     pub fn category(&self) -> &str {
         match self.base.as_str() {
@@ -378,7 +415,7 @@ impl ParsedType {
             "Point" | "Ring" | "Polygon" | "MultiPolygon" | "LineString" | "MultiLineString" => {
                 "Geo"
             }
-            _ => "String",
+            _ => "Unknown",
         }
     }
 
@@ -547,7 +584,10 @@ mod tests {
         assert_eq!(ParsedType::parse("UUID").category(), "UUID");
         assert_eq!(ParsedType::parse("IPv4").category(), "IPv4");
         assert_eq!(ParsedType::parse("JSON").category(), "JSON");
-        assert_eq!(ParsedType::parse("SomeNewType").category(), "String");
+        // Unknown, not String -- otherwise `is_string` would agree to
+        // stringify a type the encoder is going to reject.
+        assert_eq!(ParsedType::parse("SomeNewType").category(), "Unknown");
+        assert!(!ParsedType::parse("SomeNewType").is_string());
     }
 
     #[test]

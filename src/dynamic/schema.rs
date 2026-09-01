@@ -378,7 +378,10 @@ mod tests {
         let sql = system_columns_sql("db", "t'; DROP TABLE users; --");
         // The quote is escaped, so the literal never closes and the injected
         // text stays inside it as data.
-        assert!(sql.contains(r"table = 't\'; DROP TABLE users; --'"), "{sql}");
+        assert!(
+            sql.contains(r"table = 't\'; DROP TABLE users; --'"),
+            "{sql}"
+        );
         assert!(sql.ends_with("ORDER BY position"), "{sql}");
         assert!(sql.contains("database = 'db'"), "{sql}");
         // A backslash is escaped too, so it cannot escape the closing quote.

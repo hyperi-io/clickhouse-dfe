@@ -111,19 +111,19 @@ impl<'a> DynamicRow<'a> {
     }
 
     /// Same as [`DynamicRow::new`], but the named JSON column (e.g. `_json`)
-    /// is written from `raw` bytes -- a zero-copy passthrough of the original
+    /// is written from `raw_json` -- a zero-copy passthrough of the original
     /// payload as a JSON string -- instead of from `row`.
     #[must_use]
     pub fn with_raw(
         row: &'a Map<String, Value>,
         columns: &'a [ColumnDef],
-        raw: &'a [u8],
+        raw_json: &'a [u8],
         json_col: &'a str,
     ) -> Self {
         Self {
             row,
             columns,
-            raw: Some((json_col, raw)),
+            raw: Some((json_col, raw_json)),
         }
     }
 
@@ -468,12 +468,26 @@ fn value_to_str(value: &Value) -> Cow<'_, str> {
     }
 }
 
+/// A JSON float converts only when it is whole and inside the target range.
+/// The bounds are 2^64 and +/-2^63, each exact in `f64`; an `as` cast alone
+/// would saturate `1e30` to the maximum instead of rejecting the value.
+#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+fn whole_f64_as_u64(v: f64) -> Option<u64> {
+    (v.fract() == 0.0 && (0.0..18_446_744_073_709_551_616.0).contains(&v)).then_some(v as u64)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn whole_f64_as_i64(v: f64) -> Option<i64> {
+    let in_range = (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&v);
+    (v.fract() == 0.0 && in_range).then_some(v as i64)
+}
+
 fn as_u64(value: &Value, col: &str) -> Result<u64, DynamicError> {
     match value {
         Value::Number(n) => n
             .as_u64()
-            .or_else(|| n.as_i64().map(|v| v as u64))
-            .or_else(|| n.as_f64().map(|v| v as u64))
+            .or_else(|| n.as_i64().and_then(|v| u64::try_from(v).ok()))
+            .or_else(|| n.as_f64().and_then(whole_f64_as_u64))
             .ok_or_else(|| enc_err(col, "not a valid unsigned integer")),
         Value::Bool(b) => Ok(u64::from(*b)),
         Value::String(s) => s
@@ -488,8 +502,8 @@ fn as_i64(value: &Value, col: &str) -> Result<i64, DynamicError> {
     match value {
         Value::Number(n) => n
             .as_i64()
-            .or_else(|| n.as_u64().map(|v| v as i64))
-            .or_else(|| n.as_f64().map(|v| v as i64))
+            .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok()))
+            .or_else(|| n.as_f64().and_then(whole_f64_as_i64))
             .ok_or_else(|| enc_err(col, "not a valid integer")),
         Value::Bool(b) => Ok(i64::from(*b)),
         Value::String(s) => s
@@ -505,7 +519,7 @@ fn as_u128(value: &Value, col: &str) -> Result<u128, DynamicError> {
         Value::Number(n) => n
             .as_u64()
             .map(u128::from)
-            .or_else(|| n.as_i64().map(|v| v as u128))
+            .or_else(|| n.as_i64().and_then(|v| u128::try_from(v).ok()))
             .ok_or_else(|| enc_err(col, "not a valid u128")),
         Value::Bool(b) => Ok(u128::from(*b)),
         Value::String(s) => s
@@ -662,7 +676,11 @@ fn decimal_from_text(text: &str, scale: u8) -> Option<i128> {
     if frac.get(usize::from(scale)).is_some_and(|&b| b >= b'5') {
         acc = acc.checked_add(1)?;
     }
-    if negative { acc.checked_neg() } else { Some(acc) }
+    if negative {
+        acc.checked_neg()
+    } else {
+        Some(acc)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -705,7 +723,7 @@ fn to_epoch_seconds(value: &Value, col: &str) -> Result<i64, DynamicError> {
         Value::Number(n) => {
             let raw = n
                 .as_i64()
-                .or_else(|| n.as_f64().map(|f| f as i64))
+                .or_else(|| n.as_f64().and_then(whole_f64_as_i64))
                 .ok_or_else(|| enc_err(col, "invalid epoch number"))?;
             Ok(epoch_to_seconds(raw))
         }
@@ -755,7 +773,7 @@ fn datetime64_to_ticks(value: &Value, precision: u8, col: &str) -> Result<i64, D
     match value {
         Value::Number(n) => n
             .as_i64()
-            .or_else(|| n.as_f64().map(|f| f as i64))
+            .or_else(|| n.as_f64().and_then(whole_f64_as_i64))
             .ok_or_else(|| enc_err(col, "invalid DateTime64 number")),
         Value::String(s) => {
             let s = s.trim();
@@ -814,7 +832,8 @@ fn parse_datetime_str(s: &str) -> Result<(i64, u32), String> {
             .parse()
             .map_err(|_| "invalid fractional seconds".to_string())?;
         if clamped < 9 {
-            frac *= 10u32.pow(9 - clamped as u32);
+            // `clamped` is at most 9 by the line above, so the exponent fits.
+            frac *= 10u32.pow(9 - u32::try_from(clamped).unwrap_or(9));
         }
         frac
     } else {
@@ -854,16 +873,16 @@ fn parse_datetime_str(s: &str) -> Result<(i64, u32), String> {
     let min: u32 = s[14..16]
         .parse()
         .map_err(|_| "invalid minute".to_string())?;
-    let sec: u32 = s[17..19]
+    let second: u32 = s[17..19]
         .parse()
         .map_err(|_| "invalid second".to_string())?;
 
-    if !check_calendar_day(year, month, day) || hour > 23 || min > 59 || sec > 59 {
+    if !check_calendar_day(year, month, day) || hour > 23 || min > 59 || second > 59 {
         return Err("invalid DateTime string".into());
     }
 
     let days = civil_days_from_epoch(year, month, day);
-    let secs = days * 86_400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(sec);
+    let secs = days * 86_400 + i64::from(hour) * 3600 + i64::from(min) * 60 + i64::from(second);
     Ok((secs, frac_nanos))
 }
 
@@ -873,8 +892,8 @@ fn civil_days_from_epoch(year: i32, month: u32, day: u32) -> i64 {
     let m = i64::from(if month <= 2 { month + 9 } else { month - 3 });
     let era = y.div_euclid(400);
     let yoe = y.rem_euclid(400);
-    let doy = (153 * m + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let day_of_year = (153 * m + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + day_of_year;
     era * 146_097 + doe - 719_468
 }
 
@@ -1000,9 +1019,8 @@ fn encode_array(
     col: &str,
     buf: &mut Vec<u8>,
 ) -> Result<(), DynamicError> {
-    let arr = match value {
-        Value::Array(a) => a,
-        _ => return Err(enc_err(col, "expected array")),
+    let Value::Array(arr) = value else {
+        return Err(enc_err(col, "expected array"));
     };
     buf.put_var_uint(arr.len() as u64);
     for item in arr {
@@ -1018,9 +1036,8 @@ fn encode_map(
     col: &str,
     buf: &mut Vec<u8>,
 ) -> Result<(), DynamicError> {
-    let obj = match value {
-        Value::Object(m) => m,
-        _ => return Err(enc_err(col, "expected object for Map")),
+    let Value::Object(obj) = value else {
+        return Err(enc_err(col, "expected object for Map"));
     };
     // A JSON object key is text, so `String` (and `LowCardinality(String)`,
     // which is the bare String on this path) is the only key type that can be
@@ -1042,17 +1059,29 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn columns_of(cols: &[(&str, &str)]) -> Vec<ColumnDef> {
+        cols.iter().map(|(n, t)| ColumnDef::new(*n, *t)).collect()
+    }
+
+    /// The row is consumed into its object, so no test row is cloned.
+    fn object_of(row: Value) -> Map<String, Value> {
+        let Value::Object(obj) = row else {
+            panic!("a test row must be a JSON object")
+        };
+        obj
+    }
+
     /// Encode a one-row map against the given columns and return wire bytes.
     fn enc(row: Value, cols: &[(&str, &str)]) -> Vec<u8> {
-        let columns: Vec<ColumnDef> = cols.iter().map(|(n, t)| ColumnDef::new(*n, *t)).collect();
-        let obj = row.as_object().unwrap().clone();
-        DynamicRow::new(&obj, &columns).encode().unwrap()
+        DynamicRow::new(&object_of(row), &columns_of(cols))
+            .encode()
+            .unwrap()
     }
 
     fn enc_err_of(row: Value, cols: &[(&str, &str)]) -> DynamicError {
-        let columns: Vec<ColumnDef> = cols.iter().map(|(n, t)| ColumnDef::new(*n, *t)).collect();
-        let obj = row.as_object().unwrap().clone();
-        DynamicRow::new(&obj, &columns).encode().unwrap_err()
+        DynamicRow::new(&object_of(row), &columns_of(cols))
+            .encode()
+            .unwrap_err()
     }
 
     // ---- String / FixedString ----
@@ -1139,7 +1168,7 @@ mod tests {
             100u128.to_le_bytes()
         );
         // From numeric string (large value beyond i64).
-        let v: i128 = 170141183460469231731687303715884105727;
+        let v: i128 = 170_141_183_460_469_231_731_687_303_715_884_105_727;
         assert_eq!(
             enc(json!({"x": v.to_string()}), &[("x", "Int128")]),
             v.to_le_bytes()
@@ -1198,7 +1227,7 @@ mod tests {
     #[test]
     fn date_from_string() {
         // 2024-12-25 = day 20082 since epoch.
-        let days = civil_days_from_epoch(2024, 12, 25) as u16;
+        let days = u16::try_from(civil_days_from_epoch(2024, 12, 25)).unwrap();
         assert_eq!(
             enc(json!({"d": "2024-12-25"}), &[("d", "Date")]),
             days.to_le_bytes()
@@ -1215,7 +1244,7 @@ mod tests {
 
     #[test]
     fn date32_from_string() {
-        let days = civil_days_from_epoch(2024, 12, 25) as i32;
+        let days = i32::try_from(civil_days_from_epoch(2024, 12, 25)).unwrap();
         assert_eq!(
             enc(json!({"d": "2024-12-25"}), &[("d", "Date32")]),
             days.to_le_bytes()
@@ -1598,15 +1627,15 @@ mod tests {
             ColumnDef::new("_json", "Nullable(JSON)"),
         ];
         let row = json!({"id": 1}).as_object().unwrap().clone();
-        let raw = br#"{"event":"login","user":"alice"}"#;
-        let bytes = DynamicRow::with_raw(&row, &columns, raw, "_json")
+        let raw_json = br#"{"event":"login","user":"alice"}"#;
+        let bytes = DynamicRow::with_raw(&row, &columns, raw_json, "_json")
             .encode()
             .unwrap();
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&1u32.to_le_bytes());
         expected.push(0); // not null
-        expected.put_string(raw);
+        expected.put_string(raw_json);
         assert_eq!(bytes, expected);
     }
 
@@ -1786,7 +1815,7 @@ mod tests {
             );
         }
         // 2024 is a leap year, so the 29th of February exists.
-        let days = civil_days_from_epoch(2024, 2, 29) as u16;
+        let days = u16::try_from(civil_days_from_epoch(2024, 2, 29)).unwrap();
         assert_eq!(
             enc(json!({"d": "2024-02-29"}), &[("d", "Date")]),
             days.to_le_bytes()
@@ -1812,7 +1841,10 @@ mod tests {
             json!({"m": {"a": 1}}),
             &[("m", "Map(LowCardinality(String), UInt32)")],
         );
-        assert_eq!(bytes, enc(json!({"m": {"a": 1}}), &[("m", "Map(String, UInt32)")]));
+        assert_eq!(
+            bytes,
+            enc(json!({"m": {"a": 1}}), &[("m", "Map(String, UInt32)")])
+        );
     }
 
     #[test]
@@ -1850,7 +1882,10 @@ mod tests {
     /// separate `encode()` calls concatenated.
     #[test]
     fn encode_into_appends_without_disturbing_earlier_rows() {
-        let columns = [ColumnDef::new("id", "UInt32"), ColumnDef::new("s", "String")];
+        let columns = [
+            ColumnDef::new("id", "UInt32"),
+            ColumnDef::new("s", "String"),
+        ];
         let rows = [json!({"id": 1, "s": "a"}), json!({"id": 2, "s": "bb"})];
 
         let mut arena = Vec::new();

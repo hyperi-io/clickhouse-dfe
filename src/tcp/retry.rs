@@ -129,6 +129,7 @@ fn is_transient_io_kind(e: &std::io::Error) -> bool {
 /// so it passes through unchanged and stays classifiable. Pool-internal
 /// conditions (acquire timeout, closed pool, missing runtime, hook
 /// failure) carry no crate error, so they become [`Error::Transient`].
+#[must_use]
 pub fn map_pool_error(e: PoolError<Error>) -> Error {
     match e {
         PoolError::Backend(err) => err,

@@ -30,7 +30,9 @@ const JSON_AS_STRING: &str = "output_format_native_write_json_as_string";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Transport {
+    /// Upstream's HTTP client.
     Http,
+    /// This crate's native TCP client.
     Tcp,
 }
 
@@ -39,11 +41,15 @@ pub enum Transport {
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum UnifiedClient {
+    /// Speaks HTTP through upstream's client.
     Http(Client),
+    /// Speaks the native protocol through this crate's pooled TCP client.
     Tcp(TcpClient),
 }
 
 impl UnifiedClient {
+    /// Which transport this client answers on.
+    #[must_use]
     pub fn transport(&self) -> Transport {
         match self {
             Self::Http(_) => Transport::Http,
@@ -73,7 +79,12 @@ impl UnifiedClient {
     }
 
     /// Run a statement that returns no rows. `sql` goes over the wire verbatim
-    /// -- no `?` binding, no `?fields` -- and errors on a server rejection.
+    /// -- no `?` binding, no `?fields`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the transport returns: a connection failure, or the server's
+    /// own rejection of the statement.
     pub async fn execute(&self, sql: &str) -> Result<()> {
         match self {
             Self::Http(client) => Ok(client.query_raw(sql).execute().await?),
@@ -81,7 +92,11 @@ impl UnifiedClient {
         }
     }
 
-    /// Round-trip the server; errors on a transport failure or a bad credential.
+    /// Round-trip the server.
+    ///
+    /// # Errors
+    ///
+    /// A transport failure, or a credential the server rejects.
     pub async fn ping(&self) -> Result<()> {
         match self {
             // HTTP has no ping frame.
@@ -132,6 +147,9 @@ impl UnifiedClient {
         use crate::dynamic::DynamicInsert;
         use crate::dynamic::schema::{schema_from_system_columns, system_columns_sql};
 
+        // Two arms, one of which returns: `if let` would have to name the
+        // other arm's binding a second time to reach the TCP client.
+        #[allow(clippy::single_match_else)]
         let client = match self {
             Self::Http(client) => {
                 return Ok(DynamicInsert::http(client.clone(), database, table, cache));
@@ -140,22 +158,21 @@ impl UnifiedClient {
         };
 
         let full = format!("{database}.{table}");
-        let schema = match cache.get(&full) {
-            Some(cached) => cached,
-            None => {
-                let columns = self
-                    .fetch_columns(&system_columns_sql(database, table))
-                    .await?;
-                let rows = columns
-                    .get::<String>("name")?
-                    .into_iter()
-                    .zip(columns.get::<String>("col_type")?)
-                    .zip(columns.get::<String>("default_kind")?)
-                    .map(|((name, col_type), kind)| (name, col_type, kind));
-                let fetched = schema_from_system_columns(full.clone(), rows)?;
-                cache.insert(&full, std::sync::Arc::clone(&fetched));
-                fetched
-            }
+        let schema = if let Some(cached) = cache.get(&full) {
+            cached
+        } else {
+            let columns = self
+                .fetch_columns(&system_columns_sql(database, table))
+                .await?;
+            let rows = columns
+                .get::<String>("name")?
+                .into_iter()
+                .zip(columns.get::<String>("col_type")?)
+                .zip(columns.get::<String>("default_kind")?)
+                .map(|((name, col_type), kind)| (name, col_type, kind));
+            let fetched = schema_from_system_columns(full.clone(), rows)?;
+            cache.insert(&full, std::sync::Arc::clone(&fetched));
+            fetched
         };
         Ok(DynamicInsert::tcp(client.clone(), database, table, schema))
     }
@@ -185,10 +202,19 @@ impl Columns {
     }
 
     /// Rows across every block; schema-only and empty blocks count nothing.
+    ///
+    /// A block's declared count is saturated into `usize`, which only bites on
+    /// a 32-bit target that could not have held the block anyway.
+    #[must_use]
     pub fn rows(&self) -> usize {
-        self.blocks.iter().map(|b| b.num_rows as usize).sum()
+        self.blocks
+            .iter()
+            .map(|b| usize::try_from(b.num_rows).unwrap_or(usize::MAX))
+            .sum()
     }
 
+    /// Whether the result set carries no rows.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.rows() == 0
     }
@@ -500,7 +526,10 @@ mod tests {
         let columns = client.fetch_columns("SELECT name").await.unwrap();
 
         assert_eq!(columns.rows(), 5);
-        assert_eq!(columns.get::<String>("name").unwrap(), ["a", "b", "c", "d", "e"]);
+        assert_eq!(
+            columns.get::<String>("name").unwrap(),
+            ["a", "b", "c", "d", "e"]
+        );
 
         let _sock = server.await.unwrap();
     }

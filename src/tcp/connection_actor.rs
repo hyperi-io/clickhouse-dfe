@@ -1103,15 +1103,13 @@ impl ConnectionActor {
                 }
             }
         };
-        match tokio::time::timeout(DRAIN_TIMEOUT, drain).await {
-            Ok(r) => r,
-            Err(_) => {
-                self.poisoned.store(true, Ordering::Release);
-                Err(Error::Custom(
-                    "tcp: drain to EndOfStream exceeded 30s timeout".into(),
-                ))
-            }
-        }
+        let Ok(drained) = tokio::time::timeout(DRAIN_TIMEOUT, drain).await else {
+            self.poisoned.store(true, Ordering::Release);
+            return Err(Error::Custom(
+                "tcp: drain to EndOfStream exceeded 30s timeout".into(),
+            ));
+        };
+        drained
     }
 }
 
@@ -1772,9 +1770,10 @@ mod tests {
                 break;
             }
             match tokio::time::timeout(remaining, server.read(&mut chunk)).await {
-                Ok(Ok(0)) | Err(_) => break,
-                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
-                Ok(Err(_)) => break,
+                Ok(Ok(n)) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                // EOF, a read error, or the deadline: the caller inspects
+                // whatever arrived before this point.
+                _ => break,
             }
         }
         buf

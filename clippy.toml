@@ -20,3 +20,21 @@ too-many-lines-threshold = 150
 # stay deny-level for library code only.
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
+
+# Product and protocol names `doc_markdown` would otherwise want backticked.
+doc-valid-idents = [
+    "ClickHouse",
+    "LowCardinality",
+    "RowBinary",
+    "SimpleAggregateFunction",
+    "FixedString",
+    "DateTime",
+    "IPv4",
+    "IPv6",
+    "UUID",
+    "deadpool",
+    "rustls",
+    "webpki",
+    "tokio",
+    "..",
+]

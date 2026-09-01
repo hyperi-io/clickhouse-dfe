@@ -32,6 +32,7 @@ pub struct ServerException {
 impl ServerException {
     /// `None` for any other [`Error`] variant, and for a body that does not
     /// open with `Code: N.` -- a proxy page or a bare status line.
+    #[must_use]
     pub fn parse(error: &Error) -> Option<Self> {
         let Error::BadResponse(body) = error else {
             return None;
@@ -84,6 +85,7 @@ impl ServerException {
     }
 
     /// Off the same table as [`crate::Error::is_retriable_code`].
+    #[must_use]
     pub fn is_retriable(&self) -> bool {
         crate::Error::is_retriable_code(self.code)
     }
@@ -99,12 +101,15 @@ pub trait ClientExt: Sized {
     fn kill_query(&self, query_id: &str) -> impl Future<Output = Result<()>> + Send;
 
     /// What `system.query_log` records and [`Self::kill_query`] matches on.
+    #[must_use]
     fn with_query_id(self, query_id: impl Into<String>) -> Self;
 
     /// Bind statements to a session, so `SET` and temp tables survive between.
+    #[must_use]
     fn with_session_id(self, session_id: impl Into<String>) -> Self;
 
     /// Run statements under `role`. `Client::with_default_roles` clears it.
+    #[must_use]
     fn with_role(self, role: impl Into<String>) -> Self;
 }
 

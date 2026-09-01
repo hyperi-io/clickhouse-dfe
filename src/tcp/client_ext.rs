@@ -352,10 +352,10 @@ mod tests {
         let pool = pool_of(refusing, 1);
         // `TcpInsertSession` is not `Debug`, so match rather than
         // `expect_err`.
-        let err = match insert_native_via_pool(&pool, "q", "INSERT INTO t FORMAT Native", &[]).await
-        {
-            Ok(_) => panic!("every endpoint refuses; the insert must not open"),
-            Err(e) => e,
+        // let-else, not `expect_err`: `TcpInsertSession` is not `Debug`.
+        let Err(err) = insert_native_via_pool(&pool, "q", "INSERT INTO t FORMAT Native", &[]).await
+        else {
+            panic!("every endpoint refuses; the insert must not open")
         };
         assert!(
             !matches!(err, Error::Custom(_)),

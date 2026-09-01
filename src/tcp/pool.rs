@@ -601,8 +601,18 @@ mod tests {
             (None, ms(10_000), true, None),
             (None, ms(0), false, Some("connection poisoned")),
             (Some(ms(10)), ms(9), true, None),
-            (Some(ms(10)), ms(10), true, Some("connection exceeded max_lifetime")),
-            (Some(ms(10)), ms(11), false, Some("connection exceeded max_lifetime")),
+            (
+                Some(ms(10)),
+                ms(10),
+                true,
+                Some("connection exceeded max_lifetime"),
+            ),
+            (
+                Some(ms(10)),
+                ms(11),
+                false,
+                Some("connection exceeded max_lifetime"),
+            ),
             (Some(ms(10)), ms(9), false, Some("connection poisoned")),
         ];
         for (max, elapsed, alive, want) in cases {
@@ -686,10 +696,11 @@ mod tests {
             .build()
             .expect("test pool builds");
 
-        let err = match tokio::time::timeout(Duration::from_secs(2), pool.get()).await {
-            Err(_) => panic!("acquire hung past the create timeout"),
-            Ok(Ok(_)) => panic!("create never completes; acquire must fail"),
-            Ok(Err(e)) => e,
+        let Ok(acquired) = tokio::time::timeout(Duration::from_secs(2), pool.get()).await else {
+            panic!("acquire hung past the create timeout")
+        };
+        let Err(err) = acquired else {
+            panic!("create never completes; acquire must fail")
         };
         let mapped = crate::tcp::retry::map_pool_error(err);
         assert!(
@@ -721,16 +732,16 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = tokio::time::timeout(Duration::from_millis(200), pool.get()).await;
         let elapsed = start.elapsed();
-        match result {
-            Ok(Err(_)) => {
-                assert!(
-                    elapsed < Duration::from_millis(200),
-                    "acquire should have errored quickly, took {elapsed:?}"
-                );
-            }
-            Ok(Ok(_)) => panic!("acquire should not have succeeded with one held slot"),
-            Err(_) => panic!("acquire hung past the wait_timeout bound"),
-        }
+        let Ok(acquired) = result else {
+            panic!("acquire hung past the wait_timeout bound")
+        };
+        let Err(_refused) = acquired else {
+            panic!("acquire should not have succeeded with one held slot")
+        };
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "acquire should have errored quickly, took {elapsed:?}"
+        );
     }
 
     // ---- Endpoint rotation + connect-failover -------------------------
@@ -857,9 +868,9 @@ mod tests {
         let mgr = manager_over(refusing);
         // `ConnectionHandle` is not `Debug`, so avoid `expect_err`;
         // match the Result directly.
-        let err = match mgr.create().await {
-            Ok(_) => panic!("all endpoints refuse; create must not connect"),
-            Err(e) => e,
+        // let-else, not `expect_err`: `ConnectionHandle` is not `Debug`.
+        let Err(err) = mgr.create().await else {
+            panic!("all endpoints refuse; create must not connect")
         };
         // A refused connect round-trips io::Error -> Error::Other; the
         // classifier must treat it as a retriable transport failure.
@@ -889,9 +900,8 @@ mod tests {
         )
         .expect("configured-but-failed trust still BUILDS a (fail-closed) pool");
         // Connecting must refuse -- fail closed, no default-trust fallback.
-        let err = match pool.get().await {
-            Ok(_) => panic!("a fail-closed TLS pool must refuse to connect"),
-            Err(e) => e,
+        let Err(err) = pool.get().await else {
+            panic!("a fail-closed TLS pool must refuse to connect")
         };
         let msg = format!("{err}");
         assert!(

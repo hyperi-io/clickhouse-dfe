@@ -66,7 +66,9 @@ impl Default for TlsTrust {
 #[derive(Clone)]
 #[non_exhaustive]
 pub enum TlsConfigSource {
+    /// A config the caller built; used as-is, nothing here inspects it.
     Explicit(Arc<rustls::ClientConfig>),
+    /// A trust description resolved to a config at transport-build time.
     Trust(TlsTrust),
 }
 
@@ -143,6 +145,12 @@ fn build_config_with_roots(roots: RootCertStore) -> Result<Arc<rustls::ClientCon
 }
 
 /// Resolve a [`TlsConfigSource`] into a ready [`rustls::ClientConfig`].
+///
+/// # Errors
+///
+/// [`Error::Custom`] if a CA file cannot be read or yields no usable
+/// certificate, if exclusive trust is requested with no files, or if the
+/// assembled store ends up empty.
 pub fn build_client_config(src: &TlsConfigSource) -> Result<Arc<rustls::ClientConfig>> {
     match src {
         TlsConfigSource::Explicit(cfg) => Ok(cfg.clone()),
@@ -195,20 +203,15 @@ mod tests {
     fn add_pem_file_errors_on_zero_certs() {
         let (_dir, path) = write_tmp("empty.pem", "not a pem at all\n");
         let mut store = RootCertStore::empty();
-        let err = match add_pem_file_certs(&mut store, &path) {
-            Ok(_) => panic!("zero-cert file must error"),
-            Err(e) => e,
-        };
+        let err = add_pem_file_certs(&mut store, &path).expect_err("zero-cert file must error");
         assert!(format!("{err}").contains("no usable certificates"));
     }
 
     #[test]
     fn add_pem_file_errors_on_missing_path() {
         let mut store = RootCertStore::empty();
-        let err = match add_pem_file_certs(&mut store, Path::new("/no/such/ca.pem")) {
-            Ok(_) => panic!("missing file must error"),
-            Err(e) => e,
-        };
+        let err = add_pem_file_certs(&mut store, Path::new("/no/such/ca.pem"))
+            .expect_err("missing file must error");
         assert!(format!("{err}").contains("cannot read CA file"));
     }
 
@@ -251,10 +254,7 @@ mod tests {
             extra_intermediates: Vec::new(),
             exclusive: true,
         };
-        let err = match build_root_store(&trust) {
-            Ok(_) => panic!("exclusive with no files must error"),
-            Err(e) => e,
-        };
+        let err = build_root_store(&trust).expect_err("exclusive with no files must error");
         assert!(format!("{err}").contains("no explicit CA files"));
     }
 
@@ -269,10 +269,8 @@ mod tests {
             extra_intermediates: Vec::new(),
             exclusive: false,
         };
-        let err = match build_client_config(&TlsConfigSource::Trust(trust)) {
-            Ok(_) => panic!("an empty trust store must error"),
-            Err(e) => e,
-        };
+        let err = build_client_config(&TlsConfigSource::Trust(trust))
+            .expect_err("an empty trust store must error");
         assert!(format!("{err}").contains("trust store is empty"), "{err}");
     }
 
