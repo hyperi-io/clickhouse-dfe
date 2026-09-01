@@ -132,11 +132,13 @@ const fn case(ch_type: &'static str, values: &'static [&'static str]) -> Case {
 }
 
 /// `NativeWriter.cpp:93-94` serialises EVERY nested prefix for a column
-/// before any of its data, so a nested `LowCardinality` writes its version
-/// ahead of the enclosing array's offsets. This codec reads and writes each
-/// prefix inline where the child sits, so both directions desync. Fixing it
-/// means splitting the reader and the writer into a prefix phase and a data
-/// phase, mirroring `ISerialization::serializeBinaryBulkStatePrefix`.
+/// before any of its data, while this codec reads and writes each prefix
+/// inline where the child sits. The two orders coincide until an enclosing
+/// type writes data of its own first: a `Tuple` writes nothing before its
+/// fields and round-trips, an `Array` writes its offsets and pushes the
+/// child's prefix out of place. Fixing it means a prefix phase and a data
+/// phase in both directions, mirroring
+/// `ISerialization::serializeBinaryBulkStatePrefix`.
 const PREFIX_PHASE: &str = "nested prefixes are not split from data (NativeWriter.cpp:93-94)";
 
 const CASES: &[Case] = &[
@@ -223,6 +225,22 @@ const CASES: &[Case] = &[
         &["'text'::String", "42::UInt64", "NULL"],
     ),
     case("Dynamic", &["'text'", "42::UInt64", "NULL"]),
+    // Prefix-bearing types nested one level down. A Tuple writes no data of
+    // its own before its fields, so its child's prefix lands first either
+    // way and these pass; an Array's offsets come first, which is what
+    // pushes the child's prefix out of place.
+    case("Tuple(LowCardinality(String), UInt8)", &["('a', 1)"]),
+    case("Array(JSON)", &[r#"['{"a":1}']"#, "[]"]),
+    Case {
+        ch_type: "Array(Dynamic)",
+        values: &["['x', 42::UInt64]", "[]"],
+        known_broken: Some(PREFIX_PHASE),
+    },
+    Case {
+        ch_type: "Array(Variant(UInt64, String))",
+        values: &["['x'::String]", "[]"],
+        known_broken: Some(PREFIX_PHASE),
+    },
 ];
 
 /// The decoded shape, rendered. `DecodedColumn` is not `PartialEq`, and the
