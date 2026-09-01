@@ -40,6 +40,22 @@ fn tcp_client_builds_and_configures_offline() {
     assert!(settings.contains(&("role".to_string(), "reader".to_string())));
 }
 
+/// JSON columns are unreadable over Native unless the server stringifies
+/// them, so only an explicit opt-out drops the flag.
+#[test]
+fn json_as_string_is_on_by_default_and_can_be_turned_off() {
+    let flag = (
+        "output_format_native_write_json_as_string".to_string(),
+        "1".to_string(),
+    );
+
+    let client = TcpClient::new("127.0.0.1:9000");
+    assert!(client.insert_settings().contains(&flag));
+
+    let raw = client.with_json_as_string(false);
+    assert!(!raw.insert_settings().contains(&flag));
+}
+
 /// The thread bounds are part of the public contract, not an implementation
 /// detail.
 #[test]

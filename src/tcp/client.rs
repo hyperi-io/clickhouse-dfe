@@ -31,6 +31,9 @@ use crate::tcp::retry::RetryPolicy;
 mod settings {
     pub(super) const DATABASE: &str = "database";
     pub(super) const ROLE: &str = "role";
+    /// Makes the server emit JSON columns as String in Native output; the
+    /// block decoder has no reader for the path-based serialisation.
+    pub(super) const JSON_AS_STRING: &str = "output_format_native_write_json_as_string";
 }
 
 /// A ClickHouse client that speaks ONLY the native TCP protocol
@@ -49,6 +52,8 @@ pub struct TcpClient {
     settings: Vec<(String, String)>,
     /// `SET ROLE`-equivalent, emitted as repeated `role` settings.
     roles: Vec<String>,
+    /// Send [`settings::JSON_AS_STRING`] with every query.
+    json_as_string: bool,
     /// Explicit TLS trust. `None` means "not configured" -- the pool's
     /// TLS arm then resolves the default native+webpki anchors.
     #[cfg(feature = "tls")]
@@ -74,6 +79,7 @@ impl TcpClient {
             config,
             settings: Vec::new(),
             roles: Vec::new(),
+            json_as_string: true,
             #[cfg(feature = "tls")]
             tls: None,
             // Placeholder replaced immediately by `rebuild`; the pool is
@@ -158,6 +164,14 @@ impl TcpClient {
         self
     }
 
+    /// Ask the server to send JSON columns as String, which is the default.
+    /// Turning it off yields the path-based JSON serialisation, which
+    /// [`crate::native::DecodedBlock`] does not materialise.
+    pub fn with_json_as_string(mut self, on: bool) -> Self {
+        self.json_as_string = on;
+        self
+    }
+
     /// Replace the role set. Emitted as repeated `role` settings.
     pub fn with_roles(mut self, roles: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.roles = roles.into_iter().map(Into::into).collect();
@@ -233,13 +247,17 @@ impl TcpClient {
         self.config.retry
     }
 
-    /// Per-query / per-INSERT settings: database, plain settings, roles.
+    /// Per-query / per-INSERT settings: database, the JSON-as-String flag,
+    /// plain settings, roles.
     pub fn insert_settings(&self) -> Vec<(String, String)> {
-        let mut out = Vec::with_capacity(1 + self.settings.len() + self.roles.len());
+        let mut out = Vec::with_capacity(2 + self.settings.len() + self.roles.len());
         out.push((
             settings::DATABASE.to_string(),
             self.config.handshake.database.clone(),
         ));
+        if self.json_as_string {
+            out.push((settings::JSON_AS_STRING.to_string(), "1".to_string()));
+        }
         out.extend(self.settings.iter().cloned());
         for role in &self.roles {
             out.push((settings::ROLE.to_string(), role.clone()));

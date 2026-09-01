@@ -18,6 +18,12 @@ by column name off each block. Row-typed `fetch::<T>()` and `insert::<T>()` are
 not in -- they need two small upstream re-exports of the RowBinary row serialiser
 and deserialiser.
 
+`JSON` columns travel over TCP as `String` in both directions: an insert declares
+them as `String` and the server casts, and every query asks for
+`output_format_native_write_json_as_string=1` so they come back as JSON text.
+`TcpClient::with_json_as_string(false)` turns the read side off, at which point a
+JSON column arrives in the path-based serialisation and does not decode.
+
 ## Layers
 
 Every layer is a feature. Take what you need and pay for nothing else.

@@ -887,18 +887,29 @@ async fn read_variant_column<R: ClickHouseRead>(
     Ok(result)
 }
 
+/// JSON serialization version carrying one JSON string per row, which
+/// `output_format_native_write_json_as_string=1` selects.
+pub(crate) const JSON_SERIALIZATION_STRING: u64 = 1;
+
 /// New JSON column (ClickHouse 24.x+) reader.
-///
-/// Dispatches based on the wire serialization version:
-/// - `1`: each row is a plain JSON string (String column format)
-/// - `2`: path-based object format with Dynamic v1/v2 sub-columns + shared data
-/// - `3`: path-based object format with Dynamic v3 sub-columns (no shared data)
 async fn read_json_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<ColumnData> {
     use tokio::io::AsyncReadExt as _;
 
     let version = reader.read_u64_le().await?;
+    read_json_body(reader, n, version).await
+}
+
+/// JSON column payload, after the u64 serialization version:
+/// - `1`: each row is a plain JSON string (String column format)
+/// - `2`: path-based object format with Dynamic v1/v2 sub-columns + shared data
+/// - `3`: path-based object format with Dynamic v3 sub-columns (no shared data)
+pub(crate) async fn read_json_body<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    version: u64,
+) -> Result<ColumnData> {
     match version {
-        1 => read_string_column(reader, n).await,
+        JSON_SERIALIZATION_STRING => read_string_column(reader, n).await,
         2 => read_json_object_v2_column(reader, n).await,
         3 => read_json_object_v3_column(reader, n).await,
         _ => Err(Error::BadResponse(format!(

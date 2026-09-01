@@ -8,7 +8,8 @@
 //! All scalar fixed-size types, String, FixedString(N), Nullable(T),
 //! LowCardinality(T), Array(T), Map(K, V), Tuple(T1..Tn), and nested combinations.
 //! LowCardinality is fully encoded with a per-block dictionary + indices.
-//! Variant, Dynamic, and JSON are not yet supported.
+//! JSON is declared and written as a String column and cast server-side.
+//! Variant and Dynamic are not yet supported.
 
 use crate::error::{Error, Result};
 use crate::native::columns::ColumnType;
@@ -138,7 +139,14 @@ pub fn encode_columns(
     let mut out = Vec::with_capacity(payload_size + header_size);
     for (ci, col) in columns.iter().enumerate() {
         out.put_string(col.name.as_bytes());
-        out.put_string(col.type_name.as_bytes());
+        // A JSON column is declared as String and cast by the server, which
+        // converts block columns to the table's types by position
+        // (`InterpreterInsertQuery.cpp`, `makeConvertingActions`).
+        let type_name = match col.col_type {
+            ColumnType::NewJson | ColumnType::Json => "String",
+            _ => col.type_name.as_str(),
+        };
+        out.put_string(type_name.as_bytes());
         // Newer servers expect a custom-serialization flag byte (0 = normal) per column.
         if has_custom_ser {
             out.push(0u8);
@@ -156,7 +164,10 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
     if col_type.fixed_size().is_some()
         || matches!(
             col_type,
-            ColumnType::String | ColumnType::FixedString(_) | ColumnType::Json
+            ColumnType::String
+                | ColumnType::FixedString(_)
+                | ColumnType::Json
+                | ColumnType::NewJson
         )
     {
         for v in values {
@@ -381,7 +392,7 @@ fn rb_advance(data: &[u8], pos: &mut usize, col_type: &ColumnType) -> Result<()>
     }
 
     match col_type {
-        ColumnType::String | ColumnType::Json => {
+        ColumnType::String | ColumnType::Json | ColumnType::NewJson => {
             let (len, hdr) = rb_read_varuint(data, *pos)?;
             let end = pos
                 .checked_add(hdr)
@@ -452,7 +463,7 @@ fn rb_write_default(out: &mut Vec<u8>, col_type: &ColumnType) {
         return;
     }
     match col_type {
-        ColumnType::String | ColumnType::Json => {
+        ColumnType::String | ColumnType::Json | ColumnType::NewJson => {
             out.put_var_uint(0); // empty string: single 0x00 varuint
         }
         ColumnType::FixedString(n) => {
@@ -587,6 +598,14 @@ mod tests {
         let hdr_len = b"\x01n\x10Nullable(UInt8)".len();
         let data = &out[hdr_len..];
         assert_eq!(data, &[0x01u8, 0x00u8]);
+    }
+
+    #[test]
+    fn json_column_is_declared_and_written_as_string() {
+        let cols = ColumnSchema::from_headers(&[("j".to_string(), "JSON".to_string())]).unwrap();
+        let rows = vec![b"\x02{}".to_vec(), b"\x07{\"a\":1}".to_vec()];
+        let out = encode_columns(&rows, &cols, 0).unwrap();
+        assert_eq!(out.as_slice(), b"\x01j\x06String\x02{}\x07{\"a\":1}");
     }
 
     #[test]

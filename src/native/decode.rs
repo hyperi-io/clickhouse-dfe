@@ -37,9 +37,12 @@
 //!   `timezone` for DateTime64).
 //! - UUID, IPv4, IPv6.
 //! - Nullable(T), Array(T), Tuple(T1, ..., Tn), Map(K, V), LowCardinality(T).
+//! - JSON, as `DecodedColumn::String`, when the query sets
+//!   `output_format_native_write_json_as_string=1` -- which `TcpClient`
+//!   does by default.
 //!
 //! Out of v1 scope (encoded as `DecodedColumn::Unsupported(type_name)`):
-//! Variant, Dynamic, JSON, Time / Time64, BFloat16, geo types. These
+//! Variant, Dynamic, path-serialised JSON, Time / Time64, BFloat16, geo types. These
 //! survive the block-skip path without misaligning the stream pointer
 //! because [`crate::native::columns::read_column`] consumes their wire
 //! bytes; the decoder tags them Unsupported so the cursor surfaces a
@@ -317,15 +320,20 @@ impl DecodedBlock {
         self.columns.get(index)
     }
 
-    /// Every value of column `name`, converted to `T`. The header block
-    /// yields an empty vector, so this flat-maps across a whole result
-    /// set without filtering.
+    /// Every value of column `name`, converted to `T`. The header block and
+    /// the server's trailing empty block both yield an empty vector, so this
+    /// flat-maps across a whole result set without filtering.
     ///
     /// # Errors
     ///
-    /// [`Error::SchemaMismatch`] if the block declares no column `name`,
-    /// or if the column's wire type does not read as `T`.
+    /// [`Error::SchemaMismatch`] if a block that declares columns does not
+    /// declare `name`, or if the column's wire type does not read as `T`.
     pub fn column_as<T: FromColumn>(&self, name: &str) -> Result<Vec<T>> {
+        // A result set ends with a block that declares nothing and carries
+        // nothing (`TCPHandler.cpp`, `sendData(state, {})`).
+        if self.schema.is_empty() {
+            return Ok(Vec::new());
+        }
         let index = self
             .schema
             .iter()
@@ -723,6 +731,24 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 // Wire-compatible with the inner type T.
                 decode_column(r, inner, num_rows, server_revision, depth + 1).await
             }
+            ColumnType::NewJson => {
+                // A zero-row block carries no bytes for the column at all,
+                // the serialization version included.
+                if n == 0 {
+                    return Ok(DecodedColumn::String(Vec::new()));
+                }
+                let version = r.read_u64_le().await?;
+                if version != columns::JSON_SERIALIZATION_STRING {
+                    // The path-based serialisations are consumed, not materialised.
+                    let _consumed = columns::read_json_body(r, n, version).await?;
+                    return Ok(DecodedColumn::Unsupported("NewJson".to_string()));
+                }
+                let mut buf = Vec::with_capacity(n);
+                for _ in 0..n {
+                    buf.push(r.read_string().await?);
+                }
+                Ok(DecodedColumn::String(buf))
+            }
             // Everything else falls back to the `read_column`
             // path so the wire bytes are consumed (the stream pointer
             // stays aligned), but the rows aren't materialised into a
@@ -841,7 +867,7 @@ mod tests {
     use super::*;
     use crate::native::columns::ColumnType;
     use crate::native::encode::{ColumnSchema, encode_columns};
-    use crate::native::io::ClickHouseWrite;
+    use crate::native::io::{ClickHouseBytesWrite, ClickHouseWrite};
     use std::io::Cursor;
 
     // Inlined to keep these decoder tests buildable in default (no-`tcp`)
@@ -881,6 +907,38 @@ mod tests {
         }
         assert_eq!(block.schema[0], ("n".to_string(), "UInt64".to_string()));
         assert_eq!(block.num_rows, 5);
+    }
+
+    /// The serialization the server picks under
+    /// `output_format_native_write_json_as_string=1`: u64 version 1, then one
+    /// length-prefixed document per row.
+    #[tokio::test]
+    async fn json_column_reads_as_string() {
+        let docs = [r#"{"a":1}"#, r#"{"b":"x"}"#];
+        let mut body: Vec<u8> = Vec::new();
+        body.put_string(b"j");
+        body.put_string(b"JSON");
+        body.push(0); // custom-serialization flag
+        body.extend_from_slice(&1u64.to_le_bytes());
+        for doc in docs {
+            body.put_string(doc.as_bytes());
+        }
+
+        let block = decode_via_cursor(body, docs.len() as u64).await;
+        assert_eq!(block.column_as::<String>("j").unwrap(), docs);
+    }
+
+    /// A zero-row block carries no column bytes at all, so the JSON arm must
+    /// not reach for a serialization version that is not on the wire.
+    #[tokio::test]
+    async fn json_header_block_consumes_no_column_bytes() {
+        let mut body: Vec<u8> = Vec::new();
+        body.put_string(b"j");
+        body.put_string(b"JSON");
+        body.push(0);
+
+        let block = decode_via_cursor(body, 0).await;
+        assert!(block.column_as::<String>("j").unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1666,6 +1724,19 @@ mod tests {
             num_rows: 0,
         };
         assert!(block.column("c").is_none());
+        assert!(block.column_as::<u64>("c").unwrap().is_empty());
+    }
+
+    /// The server ends every result set with a block that declares no
+    /// columns, so a `column_as` sweep over the whole set must not read it
+    /// as a schema mismatch.
+    #[test]
+    fn trailing_empty_block_yields_no_values() {
+        let block = DecodedBlock {
+            columns: Vec::new(),
+            schema: Vec::new(),
+            num_rows: 0,
+        };
         assert!(block.column_as::<u64>("c").unwrap().is_empty());
     }
 

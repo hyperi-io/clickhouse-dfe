@@ -508,10 +508,10 @@ mod tests {
     }
 
     /// Every type the encoder writes has to parse as a Native block header,
-    /// or the TCP sink cannot declare the column. JSON is the known gap.
+    /// or the TCP sink cannot declare the column.
     #[cfg(feature = "tcp")]
     #[test]
-    fn native_headers_cover_the_encoder_types_except_json() {
+    fn native_headers_cover_every_encoder_type() {
         let ok = [
             ("a", "UInt64"),
             ("b", "Nullable(String)"),
@@ -523,6 +523,7 @@ mod tests {
             ("h", "Enum8('a' = 1)"),
             ("i", "FixedString(16)"),
             ("j", "IPv6"),
+            ("k", "JSON"),
         ];
         for (name, ty) in ok {
             let headers = vec![(name.to_string(), ty.to_string())];
@@ -532,12 +533,11 @@ mod tests {
             );
         }
 
+        // The encoder already writes JSON as a length-prefixed string, so the
+        // block declares the column as String and the server casts it back.
         let json = vec![("data".to_string(), "JSON".to_string())];
         let native = ColumnSchema::from_headers(&json).unwrap();
-        let rows = vec![vec![2u8, b'{', b'}']];
-        assert!(
-            encode_columns(&rows, &native, 0).is_err(),
-            "JSON over Native is not encodable yet -- the encoder must reject it"
-        );
+        let block = encode_columns(&[vec![2u8, b'{', b'}']], &native, 0).unwrap();
+        assert_eq!(block.as_slice(), b"\x04data\x06String\x02{}");
     }
 }
