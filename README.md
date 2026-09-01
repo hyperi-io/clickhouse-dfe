@@ -13,8 +13,10 @@ until 1.0.
 The TCP transport is in -- connection actor, deadpool pool, retry, TLS trust and
 the Native-format wire codec.
 
-Typed `fetch::<T>()` and `insert::<T>()` over TCP are not -- they need two small
-upstream re-exports of the RowBinary row serialiser and deserialiser.
+Reads over TCP are column-typed: `client.query(sql).fetch_blocks()`, then values
+by column name off each block. Row-typed `fetch::<T>()` and `insert::<T>()` are
+not in -- they need two small upstream re-exports of the RowBinary row serialiser
+and deserialiser.
 
 ## Layers
 

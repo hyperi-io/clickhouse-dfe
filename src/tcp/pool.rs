@@ -697,43 +697,11 @@ mod tests {
     // and that a refused endpoint is skipped within one pass (failover).
 
     // `Manager` provides `create`, which these tests call directly on
-    // the real manager (not via the pool); `DBMS_TCP_PROTOCOL_VERSION`
-    // + `ServerHello` are already imported at the module-test top.
-    use crate::native::io::{ClickHouseRead, ClickHouseWrite};
+    // the real manager (not via the pool); the server side of the
+    // handshake is scripted in `crate::tcp::mock`.
     use crate::tcp::connect::ConnectKind;
-    use crate::tcp::protocol::ServerPacketId;
+    use crate::tcp::mock::serve_one_handshake;
     use deadpool::managed::Manager as _;
-    use tokio::io::AsyncWriteExt as _;
-
-    /// Drive the server side of one handshake on an accepted socket:
-    /// consume the client Hello (8 fields), emit a valid ServerHello,
-    /// then consume the addendum quota-key string. Mirrors the
-    /// hand-rolled server in `handshake.rs`'s roundtrip test.
-    async fn serve_one_handshake(mut sock: TcpStream) {
-        // Client Hello: packet id, name, major, minor, revision,
-        // database, user, password.
-        let _ = sock.read_var_uint().await;
-        let _ = sock.read_utf8_string().await;
-        let _ = sock.read_var_uint().await;
-        let _ = sock.read_var_uint().await;
-        let _ = sock.read_var_uint().await;
-        let _ = sock.read_utf8_string().await;
-        let _ = sock.read_utf8_string().await;
-        let _ = sock.read_utf8_string().await;
-        // ServerHello reply (revision well above the timezone /
-        // display_name / version_patch gates, so write all three).
-        let _ = sock.write_var_uint(ServerPacketId::Hello as u64).await;
-        let _ = sock.write_string("mock-ch".as_bytes()).await;
-        let _ = sock.write_var_uint(25).await;
-        let _ = sock.write_var_uint(4).await;
-        let _ = sock.write_var_uint(DBMS_TCP_PROTOCOL_VERSION).await;
-        let _ = sock.write_string("Etc/UTC".as_bytes()).await;
-        let _ = sock.write_string("mock".as_bytes()).await;
-        let _ = sock.write_var_uint(7).await;
-        let _ = sock.flush().await;
-        // Addendum quota-key (revision is above the addendum gate).
-        let _ = sock.read_utf8_string().await;
-    }
 
     /// Bind a loopback listener and spawn a task that accepts up to
     /// `accepts` connections, each tagged with its 0-based endpoint
@@ -748,11 +716,11 @@ mod tests {
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
             for _ in 0..accepts {
-                let Ok((sock, _)) = listener.accept().await else {
+                let Ok((mut sock, _)) = listener.accept().await else {
                     break;
                 };
                 order.lock().unwrap().push(idx);
-                serve_one_handshake(sock).await;
+                serve_one_handshake(&mut sock).await;
             }
         });
         addr

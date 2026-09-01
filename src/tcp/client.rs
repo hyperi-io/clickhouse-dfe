@@ -9,7 +9,9 @@
 //! - No JWT / access-token arm -- the TCP protocol has no JWT auth path.
 //! - No shared HTTP transport -- a consumer wanting both keeps a
 //!   `clickhouse::Client` alongside a `TcpClient`.
-//! - The row surface is untyped: RowBinary bytes in, `DecodedBlock` out.
+//! - Reads are column-typed, not row-typed: RowBinary bytes in,
+//!   `DecodedBlock` out, values by column name via
+//!   [`crate::native::FromColumn`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,6 +23,7 @@ use crate::tcp::client_ext::{
 use crate::tcp::cursor::TcpRawCursor;
 use crate::tcp::handshake::HandshakeConfig;
 use crate::tcp::pool::{ConnectKindConfig, NativePool, PoolConfig, TcpClientConfig, build_pool};
+use crate::tcp::query::TcpQuery;
 use crate::tcp::retry::RetryPolicy;
 
 /// Setting names ClickHouse itself defines, as protocol-level string
@@ -254,6 +257,12 @@ impl TcpClient {
         conn.ping().await
     }
 
+    /// Stage `sql` for [`TcpQuery::execute`] or
+    /// [`TcpQuery::fetch_blocks`].
+    pub fn query(&self, sql: &str) -> TcpQuery<'_> {
+        TcpQuery::new(self, sql)
+    }
+
     /// Run a statement that does not stream rows (DDL, `SET`,
     /// `INSERT ... VALUES`, a mutation). Auto-retry is opt-in via
     /// `idempotent` -- see [`execute_query_via_pool`].
@@ -271,9 +280,9 @@ impl TcpClient {
 
     /// Open a streaming SELECT, yielding decoded Native blocks.
     ///
-    /// This is the untyped surface. A typed `fetch::<T>()` needs
-    /// upstream's `pub(crate)` RowBinary deserialiser and is not
-    /// available yet.
+    /// Row-typed `fetch::<T>()` needs upstream's `pub(crate)` RowBinary
+    /// deserialiser and is not available yet; read columns by name off
+    /// each [`crate::native::DecodedBlock`] instead.
     pub async fn execute_stream(&self, query_id: &str, query: &str) -> Result<TcpRawCursor> {
         execute_stream_via_pool(
             &self.pool,

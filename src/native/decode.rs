@@ -308,6 +308,138 @@ pub struct DecodedBlock {
     pub num_rows: u64,
 }
 
+impl DecodedBlock {
+    /// The column the server announced under `name`. `None` for a column
+    /// the block does not declare, and for the header block, which
+    /// declares its columns and carries no values.
+    pub fn column(&self, name: &str) -> Option<&DecodedColumn> {
+        let index = self.schema.iter().position(|(n, _)| n == name)?;
+        self.columns.get(index)
+    }
+
+    /// Every value of column `name`, converted to `T`. The header block
+    /// yields an empty vector, so this flat-maps across a whole result
+    /// set without filtering.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SchemaMismatch`] if the block declares no column `name`,
+    /// or if the column's wire type does not read as `T`.
+    pub fn column_as<T: FromColumn>(&self, name: &str) -> Result<Vec<T>> {
+        let index = self
+            .schema
+            .iter()
+            .position(|(n, _)| n == name)
+            .ok_or_else(|| {
+                Error::SchemaMismatch(format!("tcp: block declares no column '{name}'"))
+            })?;
+        match self.columns.get(index) {
+            Some(column) => T::from_column(column, name, &self.schema[index].1),
+            None => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Typed read of one [`DecodedColumn`].
+///
+/// Implemented for the wire types ClickHouse system tables use for
+/// schema metadata. Anything else goes through [`DecodedBlock::column`]
+/// and matches on the variant directly.
+pub trait FromColumn: Sized {
+    /// Convert every value in `column`. `name` and `type_name` come from
+    /// the block schema and appear in the mismatch error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::SchemaMismatch`] if `column` holds a different wire type,
+    /// or [`Error::InvalidUtf8Encoding`] if a `String` column carries
+    /// bytes that are not UTF-8.
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>>;
+}
+
+fn wrong_type(name: &str, type_name: &str, expected: &str) -> Error {
+    Error::SchemaMismatch(format!(
+        "tcp: column '{name}' is {type_name}, which does not read as {expected}"
+    ))
+}
+
+impl FromColumn for String {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        match column {
+            DecodedColumn::String(values) => values
+                .iter()
+                .map(|v| Ok(std::str::from_utf8(v)?.to_owned()))
+                .collect(),
+            _ => Err(wrong_type(name, type_name, "String")),
+        }
+    }
+}
+
+/// Raw `String` bytes -- ClickHouse does not guarantee UTF-8.
+impl FromColumn for Vec<u8> {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        match column {
+            DecodedColumn::String(values) => Ok(values.clone()),
+            _ => Err(wrong_type(name, type_name, "String")),
+        }
+    }
+}
+
+impl FromColumn for u64 {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        match column {
+            DecodedColumn::UInt64(values) => Ok(values.clone()),
+            _ => Err(wrong_type(name, type_name, "UInt64")),
+        }
+    }
+}
+
+impl FromColumn for u8 {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        match column {
+            DecodedColumn::UInt8(values) => Ok(values.clone()),
+            _ => Err(wrong_type(name, type_name, "UInt8")),
+        }
+    }
+}
+
+impl FromColumn for i64 {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        match column {
+            DecodedColumn::Int64(values) => Ok(values.clone()),
+            _ => Err(wrong_type(name, type_name, "Int64")),
+        }
+    }
+}
+
+/// `Bool` is UInt8 on the wire; any non-zero byte is true.
+impl FromColumn for bool {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        match column {
+            DecodedColumn::UInt8(values) => Ok(values.iter().map(|&b| b != 0).collect()),
+            _ => Err(wrong_type(name, type_name, "Bool")),
+        }
+    }
+}
+
+impl FromColumn for Option<String> {
+    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
+        let DecodedColumn::Nullable { mask, child } = column else {
+            return Err(wrong_type(name, type_name, "Nullable(String)"));
+        };
+        let DecodedColumn::String(values) = child.as_ref() else {
+            return Err(wrong_type(name, type_name, "Nullable(String)"));
+        };
+        mask.iter()
+            .zip(values)
+            .map(|(&is_null, v)| match is_null {
+                0 => Ok(Some(std::str::from_utf8(v)?.to_owned())),
+                _ => Ok(None),
+            })
+            .collect()
+    }
+}
+
 /// Read one Native-format data block body off the wire.
 ///
 /// Stream pointer position on entry MUST be immediately after the
@@ -1414,6 +1546,127 @@ mod tests {
             }
             other => panic!("expected Nullable, got {other:?}"),
         }
+    }
+
+    /// One-column block with the given declared type and decoded values.
+    fn block_of(type_name: &str, column: DecodedColumn) -> DecodedBlock {
+        let num_rows = column.row_count() as u64;
+        DecodedBlock {
+            columns: vec![column],
+            schema: vec![("c".to_string(), type_name.to_string())],
+            num_rows,
+        }
+    }
+
+    fn strings(values: &[&str]) -> DecodedColumn {
+        DecodedColumn::String(values.iter().map(|s| s.as_bytes().to_vec()).collect())
+    }
+
+    #[test]
+    fn column_as_string() {
+        let block = block_of("String", strings(&["id", "", "\u{1F600}"]));
+        assert_eq!(
+            block.column_as::<String>("c").unwrap(),
+            vec!["id", "", "\u{1F600}"]
+        );
+    }
+
+    #[test]
+    fn column_as_string_rejects_non_utf8() {
+        let block = block_of("String", DecodedColumn::String(vec![vec![0xff, 0xfe]]));
+        let err = block.column_as::<String>("c").unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidUtf8Encoding(_)),
+            "expected a UTF-8 error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn column_as_raw_bytes() {
+        let block = block_of("String", DecodedColumn::String(vec![vec![0xff, 0x00]]));
+        assert_eq!(
+            block.column_as::<Vec<u8>>("c").unwrap(),
+            vec![vec![0xffu8, 0x00]]
+        );
+    }
+
+    #[test]
+    fn column_as_u64() {
+        let block = block_of("UInt64", DecodedColumn::UInt64(vec![0, 1, u64::MAX]));
+        assert_eq!(block.column_as::<u64>("c").unwrap(), vec![0, 1, u64::MAX]);
+    }
+
+    #[test]
+    fn column_as_u8() {
+        let block = block_of("UInt8", DecodedColumn::UInt8(vec![0, 1, 255]));
+        assert_eq!(block.column_as::<u8>("c").unwrap(), vec![0u8, 1, 255]);
+    }
+
+    #[test]
+    fn column_as_i64() {
+        let block = block_of("Int64", DecodedColumn::Int64(vec![i64::MIN, -1, 0]));
+        assert_eq!(
+            block.column_as::<i64>("c").unwrap(),
+            vec![i64::MIN, -1, 0i64]
+        );
+    }
+
+    #[test]
+    fn column_as_bool_treats_any_nonzero_as_true() {
+        let block = block_of("Bool", DecodedColumn::UInt8(vec![0, 1, 7]));
+        assert_eq!(
+            block.column_as::<bool>("c").unwrap(),
+            vec![false, true, true]
+        );
+    }
+
+    #[test]
+    fn column_as_nullable_string() {
+        let block = block_of(
+            "Nullable(String)",
+            DecodedColumn::Nullable {
+                mask: vec![0, 1, 0],
+                child: Box::new(strings(&["a", "", "b"])),
+            },
+        );
+        assert_eq!(
+            block.column_as::<Option<String>>("c").unwrap(),
+            vec![Some("a".to_string()), None, Some("b".to_string())]
+        );
+    }
+
+    #[test]
+    fn column_as_names_the_column_and_both_types_on_mismatch() {
+        let block = block_of("UInt64", DecodedColumn::UInt64(vec![1]));
+        let err = block.column_as::<String>("c").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("'c'"), "message must name the column: {msg}");
+        assert!(
+            msg.contains("UInt64"),
+            "message must name the wire type: {msg}"
+        );
+        assert!(
+            msg.contains("String"),
+            "message must name the read type: {msg}"
+        );
+    }
+
+    #[test]
+    fn column_as_rejects_an_undeclared_column() {
+        let block = block_of("UInt64", DecodedColumn::UInt64(vec![1]));
+        let err = block.column_as::<u64>("missing").unwrap_err();
+        assert!(err.to_string().contains("'missing'"), "{err}");
+    }
+
+    #[test]
+    fn header_block_declares_columns_but_yields_no_values() {
+        let block = DecodedBlock {
+            columns: Vec::new(),
+            schema: vec![("c".to_string(), "UInt64".to_string())],
+            num_rows: 0,
+        };
+        assert!(block.column("c").is_none());
+        assert!(block.column_as::<u64>("c").unwrap().is_empty());
     }
 
     #[tokio::test]

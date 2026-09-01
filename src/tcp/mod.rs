@@ -20,6 +20,8 @@
 //! - [`pool`] -- `TcpConnectionManager` + `NativePool` (deadpool managed
 //!   pool) with poison-on-error recycle; the only construction site for
 //!   `ConnectionHandle`s outside tests.
+//! - [`query`] -- `TcpQuery`, the `sql` -> `execute` / `fetch_blocks`
+//!   builder over [`client::TcpClient`].
 //!
 //! Wire-format primitives (varint, length-prefixed string, fixed-width
 //! LE) come from [`crate::native::io`]; this module does not duplicate
@@ -37,8 +39,11 @@ pub mod connect;
 pub mod connection_actor;
 pub mod cursor;
 pub mod handshake;
+#[cfg(test)]
+pub(crate) mod mock;
 pub mod pool;
 pub(crate) mod protocol;
+pub mod query;
 pub(crate) mod reader;
 pub mod retry;
 pub(crate) mod transport;
@@ -52,5 +57,6 @@ pub use self::client_ext::TcpInsertSession;
 pub use self::cursor::TcpRawCursor;
 pub use self::handshake::HandshakeConfig;
 pub use self::protocol::ServerHello;
+pub use self::query::TcpQuery;
 pub use self::retry::RetryPolicy;
 pub use self::transport::MaybeTlsStream;

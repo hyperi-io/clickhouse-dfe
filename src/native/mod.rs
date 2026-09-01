@@ -76,4 +76,4 @@ pub use encode::{ColumnSchema, encode_columns};
 // re-exported here.
 #[allow(unused_imports)]
 pub(crate) use decode::decode_block;
-pub use decode::{DecodedBlock, DecodedColumn};
+pub use decode::{DecodedBlock, DecodedColumn, FromColumn};

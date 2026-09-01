@@ -1429,6 +1429,7 @@ async fn reader_loop(
 mod tests {
     use super::*;
     use crate::native::io::ClickHouseWrite;
+    use crate::tcp::mock::{write_schema_block, write_uint64_payload_block};
     use crate::tcp::protocol::{ClientPacketId, DBMS_TCP_PROTOCOL_VERSION, ServerPacketId};
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
@@ -1799,36 +1800,6 @@ mod tests {
     // INSERT lifecycle (BeginInsert / SendInsertBlock / FinishInsert)
     // -----------------------------------------------------------------
 
-    /// Write a Data packet with `num_rows = 0` and the supplied
-    /// `(name, type_name)` pairs as the schema body. Matches the byte
-    /// shape the encoder produces (and the live server emits) for the
-    /// custom-serialization revision the test harness uses.
-    async fn write_schema_block(server: &mut TcpStream, columns: &[(&str, &str)]) {
-        server
-            .write_var_uint(ServerPacketId::Data as u64)
-            .await
-            .unwrap();
-        server.write_string(b"").await.unwrap(); // table_name
-        // Block info field pairs + terminator.
-        server.write_var_uint(1).await.unwrap();
-        AsyncWriteExt::write_u8(server, 0).await.unwrap();
-        server.write_var_uint(2).await.unwrap();
-        server.write_i32_le(-1).await.unwrap();
-        server.write_var_uint(0).await.unwrap();
-        server.write_var_uint(columns.len() as u64).await.unwrap();
-        server.write_var_uint(0).await.unwrap(); // num_rows
-        for (name, ty) in columns {
-            server.write_string(name.as_bytes()).await.unwrap();
-            server.write_string(ty.as_bytes()).await.unwrap();
-            // Custom-serialization flag (the test harness uses
-            // DBMS_TCP_PROTOCOL_VERSION, which is above the gate, so
-            // the encoder emits this byte and the actor's reader
-            // consumes it).
-            AsyncWriteExt::write_u8(server, 0).await.unwrap();
-        }
-        server.flush().await.unwrap();
-    }
-
     /// Write a single server Exception packet with the supplied code +
     /// message, and nothing after it. This is the realistic terminal
     /// shape: a real server sends NO EndOfStream after a query
@@ -2021,36 +1992,6 @@ mod tests {
     // -----------------------------------------------------------------
     // ExecuteStream (streaming SELECT)
     // -----------------------------------------------------------------
-
-    /// Write a Data packet with one UInt64 column (n rows) for the
-    /// streaming-SELECT tests. The encoder shape mirrors the
-    /// server-side `SendData()` path: Data id, table_name, block info,
-    /// num_columns, num_rows, then per-column (name, type_name,
-    /// custom_ser_flag) + n u64 values.
-    async fn write_uint64_payload_block(server: &mut TcpStream, values: &[u64]) {
-        server
-            .write_var_uint(ServerPacketId::Data as u64)
-            .await
-            .unwrap();
-        server.write_string(b"").await.unwrap(); // table_name
-        // Block info field pairs + terminator.
-        server.write_var_uint(1).await.unwrap();
-        AsyncWriteExt::write_u8(server, 0).await.unwrap();
-        server.write_var_uint(2).await.unwrap();
-        server.write_i32_le(-1).await.unwrap();
-        server.write_var_uint(0).await.unwrap();
-        server.write_var_uint(1).await.unwrap(); // num_columns
-        server.write_var_uint(values.len() as u64).await.unwrap(); // num_rows
-        // Column header: name, type_name, custom_ser_flag.
-        server.write_string(b"n").await.unwrap();
-        server.write_string(b"UInt64").await.unwrap();
-        AsyncWriteExt::write_u8(server, 0).await.unwrap();
-        // Column body: n x u64 LE.
-        for v in values {
-            server.write_u64_le(*v).await.unwrap();
-        }
-        server.flush().await.unwrap();
-    }
 
     #[tokio::test]
     async fn execute_stream_yields_schema_then_payload_then_eos() {
