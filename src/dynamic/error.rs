@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   dfe-loader
-// File:      src/clickhouse_ext/error.rs
+// Project:   clickhouse-dfe
+// File:      src/dynamic/error.rs
 // Purpose:   DynamicError for schema-driven inserts
 // Language:  Rust
 //
@@ -11,46 +11,53 @@
 
 //! Error types for dynamic (schema-driven) inserts.
 
-use std::fmt;
-
 /// Errors specific to dynamic schema-driven inserts.
-#[derive(Debug)]
+///
+/// `#[non_exhaustive]`: a caller matching on this must carry a `_` arm. The
+/// variants stay constructible so a consumer can build one in its own tests.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DynamicError {
     /// Column type string could not be parsed.
-    UnsupportedType { column: String, type_str: String },
+    #[error("unsupported type '{type_str}' for column '{column}'")]
+    UnsupportedType {
+        /// Column the type was declared on.
+        column: String,
+        /// The type string as `system.columns` reported it.
+        type_str: String,
+    },
     /// Value could not be encoded for the target column type.
-    EncodingError { column: String, message: String },
-    /// Schema mismatch detected -- server rejected the insert.
-    SchemaMismatch { table: String, message: String },
-    /// Schema fetch from system.columns failed.
-    SchemaFetch {
+    #[error("encoding error for column '{column}': {message}")]
+    EncodingError {
+        /// Column the value belonged to; empty for a whole-row failure.
+        column: String,
+        /// What the encoder could not do.
+        message: String,
+    },
+    /// Schema mismatch detected -- server rejected the insert. Retriable once
+    /// the cached schema is invalidated.
+    #[error("schema mismatch for table '{table}': {message}")]
+    SchemaMismatch {
+        /// Fully qualified `database.table`.
         table: String,
+        /// The server's rejection text.
+        message: String,
+    },
+    /// Schema fetch from `system.columns` failed. Retriable: a cold cache
+    /// after a restart hits this on a transport blip.
+    #[error("failed to fetch schema for '{table}': {source}")]
+    SchemaFetch {
+        /// Fully qualified `database.table`.
+        table: String,
+        /// The query failure, kept typed so a caller can classify it.
+        #[source]
         source: clickhouse::error::Error,
     },
-    /// Table has no columns (or does not exist).
-    EmptySchema { table: String },
+    /// Table has no columns (or does not exist). Retriable against a cluster
+    /// that is still replicating the DDL.
+    #[error("table '{table}' has no columns or does not exist")]
+    EmptySchema {
+        /// Fully qualified `database.table`.
+        table: String,
+    },
 }
-
-impl fmt::Display for DynamicError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnsupportedType { column, type_str } => {
-                write!(f, "unsupported type '{type_str}' for column '{column}'")
-            }
-            Self::EncodingError { column, message } => {
-                write!(f, "encoding error for column '{column}': {message}")
-            }
-            Self::SchemaMismatch { table, message } => {
-                write!(f, "schema mismatch for table '{table}': {message}")
-            }
-            Self::SchemaFetch { table, source } => {
-                write!(f, "failed to fetch schema for '{table}': {source}")
-            }
-            Self::EmptySchema { table } => {
-                write!(f, "table '{table}' has no columns or does not exist")
-            }
-        }
-    }
-}
-
-impl std::error::Error for DynamicError {}

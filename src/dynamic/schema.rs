@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   dfe-loader
-// File:      src/clickhouse_ext/schema.rs
+// Project:   clickhouse-dfe
+// File:      src/dynamic/schema.rs
 // Purpose:   system.columns schema fetch + TTL cache for dynamic inserts
 // Language:  Rust
 //
@@ -17,7 +17,11 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// tokio's Instant: `tokio::time::pause()` cannot drive `std`'s, and outside a
+// runtime this one falls through to the std clock anyway.
+use tokio::time::Instant;
 
 use clickhouse::Client;
 
@@ -28,6 +32,7 @@ use super::parsed_type::TypeTag;
 /// Resolved schema for a single table -- an ordered list of columns plus a
 /// name index for O(1) lookup during encoding.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DynamicSchema {
     /// Fully qualified table name (database.table).
     pub table: String,
@@ -100,11 +105,12 @@ struct SysColumn {
     default_kind: String,
 }
 
-/// Quote `value` as a string literal via upstream's identifier escaper -- what
-/// it writes between the delimiters escapes `'` too, so this is exactly what
-/// `Query::bind` produces. The literal has to be in the SQL text: the native
-/// protocol carries `{name:Type}` parameters in a wire section the TCP writer
-/// does not emit (code 456, `Substitution 'x' is not set`).
+/// Quote `value` as a string literal via upstream's escaper -- what it writes
+/// between the delimiters escapes `'` too, so this is exactly what
+/// `Query::bind` produces.
+///
+/// Upstream's `sql::escape` module is `pub(crate)` as of 0.15.2, so `_priv` is
+/// the only public route to it.
 fn quote_literal(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len() + 2);
     let _ = clickhouse::_priv::sql_escape_identifier(value, &mut escaped);
@@ -112,6 +118,10 @@ fn quote_literal(value: &str) -> String {
 }
 
 /// The `system.columns` projection a schema is read from, on either transport.
+///
+/// The literals are in the SQL text because the native protocol carries
+/// `{name:Type}` parameters in a wire section the TCP writer does not emit
+/// (code 456, `Substitution 'x' is not set`).
 pub(crate) fn system_columns_sql(database: &str, table: &str) -> String {
     format!(
         "SELECT name, type AS col_type, default_kind FROM system.columns \
@@ -125,7 +135,7 @@ pub(crate) fn system_columns_sql(database: &str, table: &str) -> String {
 pub(crate) fn schema_from_system_columns(
     full_table: String,
     rows: impl IntoIterator<Item = (String, String, String)>,
-) -> Result<DynamicSchema, DynamicError> {
+) -> Result<Arc<DynamicSchema>, DynamicError> {
     let columns: Vec<ColumnDef> = rows
         .into_iter()
         .map(|(name, col_type, default_kind)| {
@@ -135,12 +145,13 @@ pub(crate) fn schema_from_system_columns(
     if columns.is_empty() {
         return Err(DynamicError::EmptySchema { table: full_table });
     }
-    Ok(DynamicSchema::from_columns(full_table, columns))
+    Ok(Arc::new(DynamicSchema::from_columns(full_table, columns)))
 }
 
 /// Fetch a table's schema from `system.columns` over HTTP.
 ///
-/// Columns come back in declaration order.
+/// Columns come back in declaration order. Shared rather than owned, so the
+/// caller can hand the same schema to the cache and to an insert.
 ///
 /// # Errors
 ///
@@ -151,7 +162,7 @@ pub async fn fetch_dynamic_schema(
     client: &Client,
     database: &str,
     table: &str,
-) -> Result<DynamicSchema, DynamicError> {
+) -> Result<Arc<DynamicSchema>, DynamicError> {
     let full_table = format!("{database}.{table}");
 
     let rows = client
@@ -171,13 +182,17 @@ pub async fn fetch_dynamic_schema(
 }
 
 /// TTL-based schema cache, safe to share across insert tasks via `Arc`.
+///
+/// A `std::sync::RwLock` and not an async one: a lookup is one hash probe per
+/// batch and a write is rare, so the guard is never held across an await.
+#[non_exhaustive]
 pub struct DynamicSchemaCache {
     inner: RwLock<HashMap<String, CacheEntry>>,
     ttl: Duration,
 }
 
 struct CacheEntry {
-    schema: DynamicSchema,
+    schema: Arc<DynamicSchema>,
     fetched_at: Instant,
 }
 
@@ -192,12 +207,15 @@ impl DynamicSchemaCache {
     }
 
     /// Return the cached schema if present and still fresh.
+    ///
+    /// Shared, not cloned: a schema carries a `ParsedType` tree per column and
+    /// a consumer opens a fresh insert per flush per table.
     #[must_use]
-    pub fn get(&self, table: &str) -> Option<DynamicSchema> {
+    pub fn get(&self, table: &str) -> Option<Arc<DynamicSchema>> {
         let guard = self.inner.read().ok()?;
         guard.get(table).and_then(|e| {
             if e.fetched_at.elapsed() < self.ttl {
-                Some(e.schema.clone())
+                Some(Arc::clone(&e.schema))
             } else {
                 None
             }
@@ -205,7 +223,7 @@ impl DynamicSchemaCache {
     }
 
     /// Insert or refresh a table's schema.
-    pub fn insert(&self, table: &str, schema: DynamicSchema) {
+    pub fn insert(&self, table: &str, schema: Arc<DynamicSchema>) {
         if let Ok(mut guard) = self.inner.write() {
             guard.insert(
                 table.to_string(),
@@ -249,6 +267,10 @@ mod tests {
 
     fn col(name: &str, type_str: &str, default_kind: &str) -> ColumnDef {
         ColumnDef::with_default_kind(name, type_str, default_kind)
+    }
+
+    fn shared(table: &str, columns: Vec<ColumnDef>) -> Arc<DynamicSchema> {
+        Arc::new(DynamicSchema::from_columns(table, columns))
     }
 
     #[test]
@@ -300,44 +322,70 @@ mod tests {
     #[test]
     fn cache_insert_get_invalidate() {
         let cache = DynamicSchemaCache::new(Duration::from_secs(300));
-        let schema = DynamicSchema::from_columns("db.t", vec![col("id", "UInt64", "")]);
         assert!(cache.get("db.t").is_none());
-        cache.insert("db.t", schema);
+        cache.insert("db.t", shared("db.t", vec![col("id", "UInt64", "")]));
         assert!(cache.get("db.t").is_some());
         cache.invalidate("db.t");
         assert!(cache.get("db.t").is_none());
     }
 
+    /// Two readers get the same allocation, not two deep copies of the tree.
     #[test]
-    fn cache_respects_ttl() {
-        // Generous margins: a 1ms TTL flaked under concurrent test load because
-        // the scheduler could deschedule this thread for >1ms between insert and
-        // the freshness assertion, expiring the entry early. A 100ms TTL keeps
-        // the "present immediately after insert" check reliable, and a 250ms
-        // sleep is comfortably past expiry without racing scheduler jitter.
-        let cache = DynamicSchemaCache::new(Duration::from_millis(100));
-        let schema = DynamicSchema::from_columns("db.t", vec![col("id", "UInt64", "")]);
-        cache.insert("db.t", schema);
-        assert!(cache.get("db.t").is_some());
-        std::thread::sleep(Duration::from_millis(250));
-        assert!(cache.get("db.t").is_none());
+    fn cache_hands_out_a_shared_schema() {
+        let cache = DynamicSchemaCache::new(Duration::from_secs(300));
+        cache.insert("db.t", shared("db.t", vec![col("id", "UInt64", "")]));
+        let first = cache.get("db.t").expect("just inserted");
+        let second = cache.get("db.t").expect("still cached");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cache_respects_ttl() {
+        let ttl = Duration::from_secs(300);
+        let cache = DynamicSchemaCache::new(ttl);
+        cache.insert("db.t", shared("db.t", vec![col("id", "UInt64", "")]));
+
+        // Every wait is driven explicitly; nothing here sleeps for real.
+        tokio::time::advance(ttl - Duration::from_secs(1)).await;
+        assert!(cache.get("db.t").is_some(), "still inside the TTL");
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(cache.get("db.t").is_none(), "past the TTL");
     }
 
     #[test]
     fn cache_invalidate_all() {
         let cache = DynamicSchemaCache::new(Duration::from_secs(300));
-        cache.insert(
-            "db.t1",
-            DynamicSchema::from_columns("db.t1", vec![col("id", "UInt64", "")]),
-        );
-        cache.insert(
-            "db.t2",
-            DynamicSchema::from_columns("db.t2", vec![col("id", "UInt64", "")]),
-        );
+        cache.insert("db.t1", shared("db.t1", vec![col("id", "UInt64", "")]));
+        cache.insert("db.t2", shared("db.t2", vec![col("id", "UInt64", "")]));
         assert!(cache.get("db.t1").is_some());
         assert!(cache.get("db.t2").is_some());
         cache.invalidate_all();
         assert!(cache.get("db.t1").is_none());
         assert!(cache.get("db.t2").is_none());
+    }
+
+    #[test]
+    fn an_empty_projection_is_an_empty_schema_error() {
+        let err = schema_from_system_columns("db.gone".to_string(), Vec::new())
+            .expect_err("no columns means no such table");
+        assert!(matches!(err, DynamicError::EmptySchema { .. }), "{err:?}");
+    }
+
+    /// The projection is built from escaped literals, so a table name carrying
+    /// a quote cannot close the string and append SQL of its own.
+    #[test]
+    fn system_columns_sql_is_injection_safe() {
+        let sql = system_columns_sql("db", "t'; DROP TABLE users; --");
+        // The quote is escaped, so the literal never closes and the injected
+        // text stays inside it as data.
+        assert!(sql.contains(r"table = 't\'; DROP TABLE users; --'"), "{sql}");
+        assert!(sql.ends_with("ORDER BY position"), "{sql}");
+        assert!(sql.contains("database = 'db'"), "{sql}");
+        // A backslash is escaped too, so it cannot escape the closing quote.
+        assert!(
+            system_columns_sql("db", r"t\").contains(r"'t\\'"),
+            "{}",
+            system_columns_sql("db", r"t\")
+        );
     }
 }

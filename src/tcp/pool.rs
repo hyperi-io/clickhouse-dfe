@@ -157,21 +157,32 @@ impl managed::Manager for TcpConnectionManager {
     }
 
     async fn recycle(&self, obj: &mut ConnectionHandle, metrics: &Metrics) -> RecycleResult<Error> {
-        // Drop connections older than max_lifetime (deadpool tracks the
-        // creation time in `Metrics`, so no per-handle timestamp needed).
-        if let Some(max) = self.max_lifetime
-            && metrics.created.elapsed() >= max
-        {
-            close_refused(obj).await;
-            return Err(RecycleError::message("connection exceeded max_lifetime"));
-        }
-        if obj.is_alive() {
-            Ok(())
-        } else {
-            close_refused(obj).await;
-            Err(RecycleError::message("connection poisoned"))
+        // deadpool tracks the creation time in `Metrics`, so the handle
+        // carries no timestamp of its own.
+        match recycle_refusal(self.max_lifetime, metrics.created.elapsed(), obj.is_alive()) {
+            Some(reason) => {
+                close_refused(obj).await;
+                Err(RecycleError::message(reason))
+            }
+            None => Ok(()),
         }
     }
+}
+
+/// Why a recycled connection is refused, or `None` to reuse it.
+///
+/// Pure, and the pool tests' mock manager calls this same function, so a
+/// decision changed here changes what those tests observe -- a mock with its
+/// own copy of the rule would keep passing while production drifted.
+fn recycle_refusal(
+    max_lifetime: Option<Duration>,
+    created_elapsed: Duration,
+    is_alive: bool,
+) -> Option<&'static str> {
+    if max_lifetime.is_some_and(|max| created_elapsed >= max) {
+        return Some("connection exceeded max_lifetime");
+    }
+    (!is_alive).then_some("connection poisoned")
 }
 
 /// Shut the actor behind a refused handle down and wait for it, so the
@@ -454,9 +465,8 @@ mod tests {
 
     /// Mock manager: each `create` returns a freshly fabricated
     /// handle and bumps a counter so the test can assert how many
-    /// distinct handles the pool has produced. `recycle` mirrors the
-    /// real manager's logic so the pool's drop-poisoned behaviour
-    /// is exercised against the real contract.
+    /// distinct handles the pool has produced. `recycle` delegates to the
+    /// production [`recycle_refusal`], so these tests cover it.
     struct TestManager {
         creates: Arc<AtomicUsize>,
         max_lifetime: Option<Duration>,
@@ -485,16 +495,11 @@ mod tests {
             obj: &mut ConnectionHandle,
             metrics: &Metrics,
         ) -> RecycleResult<Error> {
-            // Mirror the real manager: age check, then liveness.
-            if let Some(max) = self.max_lifetime
-                && metrics.created.elapsed() >= max
-            {
-                return Err(RecycleError::message("connection exceeded max_lifetime"));
-            }
-            if obj.is_alive() {
-                Ok(())
-            } else {
-                Err(RecycleError::message("connection poisoned"))
+            // The production decision itself, not a copy of it. Only the
+            // actor shutdown is skipped: a fabricated handle has no actor.
+            match recycle_refusal(self.max_lifetime, metrics.created.elapsed(), obj.is_alive()) {
+                Some(reason) => Err(RecycleError::message(reason)),
+                None => Ok(()),
             }
         }
     }
@@ -584,6 +589,29 @@ mod tests {
             2,
             "connection older than max_lifetime should be dropped and re-created"
         );
+    }
+
+    /// The refusal rule itself, including the boundary the pool tests
+    /// cannot hit precisely: age is refused at `>= max`, not `> max`, and
+    /// age outranks liveness so an aged-but-alive connection still goes.
+    #[test]
+    fn recycle_refusal_covers_age_then_liveness() {
+        let ms = Duration::from_millis;
+        let cases: [(Option<Duration>, Duration, bool, Option<&str>); 6] = [
+            (None, ms(10_000), true, None),
+            (None, ms(0), false, Some("connection poisoned")),
+            (Some(ms(10)), ms(9), true, None),
+            (Some(ms(10)), ms(10), true, Some("connection exceeded max_lifetime")),
+            (Some(ms(10)), ms(11), false, Some("connection exceeded max_lifetime")),
+            (Some(ms(10)), ms(9), false, Some("connection poisoned")),
+        ];
+        for (max, elapsed, alive, want) in cases {
+            assert_eq!(
+                recycle_refusal(max, elapsed, alive),
+                want,
+                "max={max:?} elapsed={elapsed:?} alive={alive}"
+            );
+        }
     }
 
     /// `max_size` must cap concurrent acquires: once `max_size`

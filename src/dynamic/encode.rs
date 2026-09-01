@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   dfe-loader
-// File:      src/clickhouse_ext/encode.rs
+// Project:   clickhouse-dfe
+// File:      src/dynamic/encode.rs
 // Purpose:   Dynamic Map<String, Value> to RowBinary encoder
 // Language:  Rust
 //
@@ -12,37 +12,40 @@
 //! Dynamic RowBinary encoder.
 //!
 //! Turns a runtime-shaped `serde_json::Map<String, Value>` plus its resolved
-//! ClickHouse column schema into RowBinary wire bytes. [`DynamicRow::encode`]
-//! returns exactly what crosses the wire, so every column's encoding is
+//! ClickHouse column schema into RowBinary wire bytes. [`DynamicRow::encode_into`]
+//! appends exactly what crosses the wire, so every column's encoding is
 //! testable at the byte level with no server.
 //!
 //! # Coercions
 //!
-//! This encoder folds in the DFE coercions that ClickHouse's JSONEachRow path
-//! cannot do server-side: epoch magnitude detection (ms/us/ns) and ISO-8601
-//! 'T'-separator handling for date/time types, hyphen-less UUID hex, and
-//! integer-to-dotted IPv4. All timestamps are treated as UTC; non-zero
-//! timezone offsets on datetime strings are rejected rather than silently
-//! dropped.
+//! Coercions ClickHouse's JSONEachRow path cannot do server-side: epoch
+//! magnitude detection (ms/us/ns) and ISO-8601 'T'-separator handling for
+//! date/time types, hyphen-less UUID hex, and integer-to-dotted IPv4. All
+//! timestamps are UTC; a non-zero timezone offset is rejected, never dropped.
+//!
+//! A coercion that would lose information is an error, not a silent write: an
+//! out-of-range integer, a decimal past its backing width, an impossible
+//! calendar day and a non-ASCII datetime string all fail the row.
 
 use std::borrow::Cow;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use serde_json::{Map, Value};
 
+use crate::native::io::ClickHouseBytesWrite;
+
 use super::error::DynamicError;
 use super::parsed_type::{ParsedType, TypeTag};
 
 /// A single resolved column for a dynamic insert.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct ColumnDef {
     /// Column name, used to look up the value in the row map.
     pub name: String,
-    /// Parsed ClickHouse type, drives wire encoding.
+    /// Parsed ClickHouse type. Drives wire encoding, and its `raw` is the type
+    /// string declared in the Native block header.
     pub ty: ParsedType,
-    /// Canonical ClickHouse type string, declared in the Native block header
-    /// so the server decodes the column as it was encoded.
-    pub type_string: String,
     /// Default kind from system.columns: "", "DEFAULT", "MATERIALIZED",
     /// "ALIAS", "EPHEMERAL". Empty for columns without a server-side default.
     pub default_kind: String,
@@ -55,16 +58,12 @@ impl ColumnDef {
     /// Build a column from a name and a ClickHouse type string. The column is
     /// treated as required (no server-side default).
     ///
-    /// The type string is parsed once here; `type_string` keeps the original
-    /// canonical form for the insert header.
+    /// The type string is parsed once here and kept verbatim on `ty.raw`.
     #[must_use]
     pub fn new(name: impl Into<String>, type_string: impl Into<String>) -> Self {
-        let type_string = type_string.into();
-        let ty = ParsedType::parse(&type_string);
         Self {
             name: name.into(),
-            ty,
-            type_string,
+            ty: ParsedType::parse(&type_string.into()),
             default_kind: String::new(),
             has_default: false,
         }
@@ -91,6 +90,7 @@ impl ColumnDef {
 /// Runtime-dynamic row: a borrowed JSON object plus the resolved column
 /// schema it is encoded against, with optional raw passthrough for one named
 /// JSON column.
+#[non_exhaustive]
 pub struct DynamicRow<'a> {
     row: &'a Map<String, Value>,
     columns: &'a [ColumnDef],
@@ -127,16 +127,31 @@ impl<'a> DynamicRow<'a> {
         }
     }
 
-    /// Encode this row to RowBinary wire bytes.
+    /// Append this row's RowBinary wire bytes to `buf`.
+    ///
+    /// The batching primitive: one arena is reused across a whole block, so a
+    /// million-row block is one allocation run rather than a million.
+    ///
+    /// On error `buf` holds a partial row; the caller must truncate it back to
+    /// the length it passed in, or drop the block.
     ///
     /// # Errors
     /// Returns [`DynamicError`] if any column value cannot be encoded for its
     /// target type.
+    pub fn encode_into(&self, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
+        for col in self.columns {
+            self.encode_column(col, buf)?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::encode_into`] into a fresh `Vec`.
+    ///
+    /// # Errors
+    /// As [`Self::encode_into`].
     pub fn encode(&self) -> Result<Vec<u8>, DynamicError> {
         let mut buf = Vec::with_capacity(256);
-        for col in self.columns {
-            self.encode_column(col, &mut buf)?;
-        }
+        self.encode_into(&mut buf)?;
         Ok(buf)
     }
 
@@ -152,7 +167,7 @@ impl<'a> DynamicRow<'a> {
             if col.ty.nullable {
                 buf.push(0);
             }
-            write_string(bytes, buf);
+            buf.put_string(bytes);
             return Ok(());
         }
         let value = self.row.get(&col.name).unwrap_or(&Value::Null);
@@ -178,8 +193,7 @@ fn encode_value(
         }
         buf.push(0);
     } else if value.is_null() {
-        write_default(pt, buf);
-        return Ok(());
+        return write_default(pt, col, buf);
     }
 
     encode_typed(value, pt, col, buf)
@@ -203,7 +217,7 @@ fn encode_typed(
     match tag {
         TypeTag::String => {
             let s = value_to_str(value);
-            write_string(s.as_bytes(), buf);
+            buf.put_string(s.as_bytes());
         }
         TypeTag::FixedString => {
             let s = value_to_str(value);
@@ -221,14 +235,18 @@ fn encode_typed(
         TypeTag::Bool => {
             buf.push(u8::from(as_bool(value, col)?));
         }
+        // Every narrowing goes through `try_from`: a value the column cannot
+        // hold fails the row instead of being written modulo the width.
         TypeTag::UInt8 => {
-            buf.push(as_u64(value, col)? as u8);
+            buf.push(narrow::<u8>(as_u64(value, col)?, col, "UInt8")?);
         }
         TypeTag::UInt16 => {
-            buf.extend_from_slice(&(as_u64(value, col)? as u16).to_le_bytes());
+            let v = narrow::<u16>(as_u64(value, col)?, col, "UInt16")?;
+            buf.extend_from_slice(&v.to_le_bytes());
         }
         TypeTag::UInt32 => {
-            buf.extend_from_slice(&(as_u64(value, col)? as u32).to_le_bytes());
+            let v = narrow::<u32>(as_u64(value, col)?, col, "UInt32")?;
+            buf.extend_from_slice(&v.to_le_bytes());
         }
         TypeTag::UInt64 => {
             buf.extend_from_slice(&as_u64(value, col)?.to_le_bytes());
@@ -240,10 +258,12 @@ fn encode_typed(
             buf.extend_from_slice(&as_u256_le(value, col)?);
         }
         TypeTag::Int8 => {
-            buf.extend_from_slice(&(as_i64(value, col)? as i8).to_le_bytes());
+            let v = narrow::<i8>(as_i64(value, col)?, col, "Int8")?;
+            buf.extend_from_slice(&v.to_le_bytes());
         }
         TypeTag::Int16 => {
-            buf.extend_from_slice(&(as_i64(value, col)? as i16).to_le_bytes());
+            let v = narrow::<i16>(as_i64(value, col)?, col, "Int16")?;
+            buf.extend_from_slice(&v.to_le_bytes());
         }
         TypeTag::Enum8 => {
             let v = enum_discriminant(value, &pt.raw, col)?;
@@ -256,7 +276,8 @@ fn encode_typed(
             buf.extend_from_slice(&v.to_le_bytes());
         }
         TypeTag::Int32 => {
-            buf.extend_from_slice(&(as_i64(value, col)? as i32).to_le_bytes());
+            let v = narrow::<i32>(as_i64(value, col)?, col, "Int32")?;
+            buf.extend_from_slice(&v.to_le_bytes());
         }
         TypeTag::Int64 => {
             buf.extend_from_slice(&as_i64(value, col)?.to_le_bytes());
@@ -268,7 +289,14 @@ fn encode_typed(
             buf.extend_from_slice(&as_i256_le(value, col)?);
         }
         TypeTag::Float32 => {
-            buf.extend_from_slice(&(as_f64(value, col)? as f32).to_le_bytes());
+            let wide = as_f64(value, col)?;
+            #[allow(clippy::cast_possible_truncation)]
+            let narrow = wide as f32;
+            // f64 -> f32 rounds; only an overflow to infinity loses the value.
+            if narrow.is_infinite() && wide.is_finite() {
+                return Err(enc_err(col, "Float32 value out of range"));
+            }
+            buf.extend_from_slice(&narrow.to_le_bytes());
         }
         TypeTag::Float64 => {
             buf.extend_from_slice(&as_f64(value, col)?.to_le_bytes());
@@ -315,8 +343,8 @@ fn encode_typed(
             buf.extend_from_slice(&backing.to_le_bytes());
         }
         TypeTag::Decimal256 => {
-            // Decimal256 backing is a 256-bit signed integer; the loader's
-            // f64-scaled magnitudes fit in i128, so sign-extend to 32 bytes.
+            // The backing is 256-bit signed, but this encoder scales through
+            // i128, so anything past i128 is rejected rather than wrapped.
             let scale = pt.scale.unwrap_or(0);
             let backing = decimal_backing_i128(value, scale, col)?;
             buf.extend_from_slice(&i128_to_i256_le(backing));
@@ -339,29 +367,24 @@ fn encode_typed(
             encode_map(value, kt, vt, col, buf)?;
         }
         TypeTag::JSON => {
-            // JSON wire form is a length-prefixed String of the JSON text. A
-            // Value::String is written verbatim (its content is the JSON);
-            // other values are re-serialised to compact JSON text.
-            // Missing values and empty strings become {}: the column's JSON
-            // parser rejects the text `null` and empty input (code 117), and
-            // JSON cannot be Nullable.
+            // JSON goes on the wire as a length-prefixed String of JSON text. A
+            // Value::String is already that text, so it is written verbatim.
+            // Missing and empty become `{}`: the column's JSON parser rejects
+            // the text `null` and empty input (code 117), and JSON cannot be
+            // Nullable.
             let json_bytes = match value {
                 Value::Null => Cow::Borrowed("{}".as_bytes()),
                 Value::String(s) if s.is_empty() => Cow::Borrowed("{}".as_bytes()),
                 Value::String(s) => Cow::Borrowed(s.as_bytes()),
                 _ => Cow::Owned(value.to_string().into_bytes()),
             };
-            write_string(&json_bytes, buf);
+            buf.put_string(&json_bytes);
         }
-        // Geo Point and any type the parser left as Unknown are not part of
-        // the supported dynamic-insert surface. Tuple/Variant/Dynamic/Nested
-        // were not handled by the source encoder either; reject explicitly so
-        // a schema using them fails loudly instead of writing wrong bytes.
-        TypeTag::Point | TypeTag::Tuple | TypeTag::Unknown => {
-            return Err(DynamicError::UnsupportedType {
-                column: col.to_string(),
-                type_str: pt.raw.clone(),
-            });
+        // Geo, Variant, Dynamic, Tuple and anything the parser did not
+        // recognise have no encoding here. Reject rather than write bytes the
+        // server would read as a different value.
+        TypeTag::Point | TypeTag::Variant | TypeTag::Dynamic | TypeTag::Unknown => {
+            return Err(unsupported(col, pt));
         }
     }
     Ok(())
@@ -371,24 +394,11 @@ fn encode_typed(
 // Wire helpers
 // ---------------------------------------------------------------------------
 
-fn write_string(bytes: &[u8], buf: &mut Vec<u8>) {
-    write_varint(bytes.len() as u64, buf);
-    buf.extend_from_slice(bytes);
-}
-
-fn write_varint(mut value: u64, buf: &mut Vec<u8>) {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            buf.push(byte);
-            break;
-        }
-        buf.push(byte | 0x80);
-    }
-}
-
-fn write_default(pt: &ParsedType, buf: &mut Vec<u8>) {
+/// The zero value for a non-Nullable column the row did not supply.
+///
+/// A type this encoder cannot write is rejected here too: a column is
+/// unsupported whether or not the row happens to carry a value for it.
+fn write_default(pt: &ParsedType, col: &str, buf: &mut Vec<u8>) -> Result<(), DynamicError> {
     // A bare `Decimal(P, S)` has no fixed_byte_size by base name; resolve it.
     if pt.base == "Decimal" {
         let size = match decimal_tag_for_precision(pt.precision.unwrap_or(38)) {
@@ -398,20 +408,27 @@ fn write_default(pt: &ParsedType, buf: &mut Vec<u8>) {
             _ => 16,
         };
         buf.resize(buf.len() + size, 0);
-        return;
+        return Ok(());
     }
-    // JSON's no-value is the empty object: the column parser rejects empty
-    // input (code 117) and JSON cannot be Nullable.
-    if pt.tag == TypeTag::JSON {
-        write_string(b"{}", buf);
-        return;
+    match pt.tag {
+        // JSON's no-value is the empty object: the column parser rejects empty
+        // input (code 117) and JSON cannot be Nullable.
+        TypeTag::JSON => {
+            buf.put_string(b"{}");
+            return Ok(());
+        }
+        TypeTag::Point | TypeTag::Variant | TypeTag::Dynamic | TypeTag::Unknown => {
+            return Err(unsupported(col, pt));
+        }
+        _ => {}
     }
     if let Some(size) = pt.fixed_byte_size() {
         buf.resize(buf.len() + size, 0);
     } else {
         // Variable-length default: empty string / array / map.
-        write_varint(0, buf);
+        buf.put_var_uint(0);
     }
+    Ok(())
 }
 
 fn enc_err(col: &str, msg: &str) -> DynamicError {
@@ -419,6 +436,20 @@ fn enc_err(col: &str, msg: &str) -> DynamicError {
         column: col.to_string(),
         message: msg.to_string(),
     }
+}
+
+fn unsupported(col: &str, pt: &ParsedType) -> DynamicError {
+    DynamicError::UnsupportedType {
+        column: col.to_string(),
+        type_str: pt.raw.clone(),
+    }
+}
+
+/// Narrow a wide integer to the column's width, erroring when it does not fit.
+fn narrow<T>(value: impl TryInto<T>, col: &str, type_name: &str) -> Result<T, DynamicError> {
+    value
+        .try_into()
+        .map_err(|_| enc_err(col, &format!("{type_name} value out of range")))
 }
 
 // ---------------------------------------------------------------------------
@@ -567,20 +598,71 @@ fn decimal_tag_for_precision(precision: u8) -> TypeTag {
 }
 
 /// Compute the backing integer for a `Decimal(P, S)` by scaling the value by
-/// `10^scale`. Mirrors the loader's f64-based scaling; the concrete width is
-/// applied by the caller.
+/// `10^scale`. The concrete width is applied by the caller.
+///
+/// Scaling runs on the decimal TEXT, in i128, so a `Decimal128(38, 10)` keeps
+/// all 38 digits; f64 only has 15-17 and would round them away. A JSON number
+/// is stringified first, because serde_json's `Display` is the shortest text
+/// that round-trips the value.
 fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, DynamicError> {
-    let factor = 10f64.powi(i32::from(scale));
-    let f = match value {
-        Value::Number(n) => n.as_f64().ok_or_else(|| enc_err(col, "invalid decimal"))?,
-        Value::String(s) => s
-            .trim()
-            .parse::<f64>()
-            .map_err(|_| enc_err(col, "string not parseable as decimal"))?,
-        Value::Bool(b) => f64::from(u8::from(*b)),
+    let text: Cow<'_, str> = match value {
+        Value::Number(n) => Cow::Owned(n.to_string()),
+        Value::String(s) => Cow::Borrowed(s.trim()),
+        Value::Bool(b) => Cow::Borrowed(if *b { "1" } else { "0" }),
         _ => return Err(enc_err(col, "expected decimal number")),
     };
-    Ok((f * factor).round() as i128)
+    if let Some(backing) = decimal_from_text(&text, scale) {
+        return Ok(backing);
+    }
+    // Exponent forms and magnitudes past i128 fall back to f64 scaling, which
+    // is lossy but still better than refusing the row.
+    let f = text
+        .parse::<f64>()
+        .map_err(|_| enc_err(col, "not parseable as a decimal"))?;
+    let scaled = f * 10f64.powi(i32::from(scale));
+    if !scaled.is_finite() {
+        return Err(enc_err(col, "decimal out of range after scaling"));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    Ok(scaled.round() as i128)
+}
+
+/// Scale a plain `[+-]?digits[.digits]` literal by `10^scale` in i128, rounding
+/// the first dropped fractional digit half-up as ClickHouse does.
+///
+/// `None` for anything that is not that shape (an exponent, a non-digit) or
+/// that overflows i128, leaving the caller to decide.
+fn decimal_from_text(text: &str, scale: u8) -> Option<i128> {
+    let (negative, digits) = match text.as_bytes().first()? {
+        b'-' => (true, &text[1..]),
+        b'+' => (false, &text[1..]),
+        _ => (false, text),
+    };
+    let (int_part, frac_part) = digits.split_once('.').unwrap_or((digits, ""));
+    if int_part.is_empty() && frac_part.is_empty() {
+        return None;
+    }
+    if !int_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if !frac_part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+
+    let mut acc: i128 = if int_part.is_empty() {
+        0
+    } else {
+        int_part.parse().ok()?
+    };
+    let frac = frac_part.as_bytes();
+    for i in 0..usize::from(scale) {
+        let digit = i128::from(frac.get(i).map_or(0, |b| b - b'0'));
+        acc = acc.checked_mul(10)?.checked_add(digit)?;
+    }
+    if frac.get(usize::from(scale)).is_some_and(|&b| b >= b'5') {
+        acc = acc.checked_add(1)?;
+    }
+    if negative { acc.checked_neg() } else { Some(acc) }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,17 +670,32 @@ fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, Dyn
 // ---------------------------------------------------------------------------
 
 /// Scale a numeric epoch value down to whole seconds, detecting ms/us/ns by
-/// magnitude. Matches the loader's coercer thresholds.
+/// magnitude. Magnitude is taken absolute, so a pre-1970 millisecond epoch
+/// scales the same way a post-1970 one does.
 fn epoch_to_seconds(ts: i64) -> i64 {
-    if ts > 1_000_000_000_000_000_000 {
-        ts / 1_000_000_000
-    } else if ts > 1_000_000_000_000_000 {
-        ts / 1_000_000
-    } else if ts > 1_000_000_000_000 {
-        ts / 1_000
-    } else {
-        ts
+    match ts.unsigned_abs() {
+        m if m > 1_000_000_000_000_000_000 => ts / 1_000_000_000,
+        m if m > 1_000_000_000_000_000 => ts / 1_000_000,
+        m if m > 1_000_000_000_000 => ts / 1_000,
+        _ => ts,
     }
+}
+
+/// Days in `month` of `year`, proleptic Gregorian.
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+/// Reject a date that does not exist -- `2026-02-31` would otherwise roll
+/// forward to `2026-03-03` and store a day nobody wrote.
+fn check_calendar_day(year: i32, month: u32, day: u32) -> bool {
+    (1..=12).contains(&month) && day >= 1 && day <= days_in_month(year, month)
 }
 
 /// Resolve a JSON value to whole epoch seconds (UTC). Accepts a date/datetime
@@ -627,10 +724,11 @@ fn to_epoch_seconds(value: &Value, col: &str) -> Result<i64, DynamicError> {
 /// Resolve a JSON value to days since 1970-01-01 (UTC). Accepts a date string,
 /// a numeric-string epoch, or a number (with magnitude detection).
 fn to_epoch_days(value: &Value, col: &str) -> Result<i32, DynamicError> {
-    // A bare "YYYY-MM-DD" has no time component; parse it directly.
+    // A bare "YYYY-MM-DD" has no time component; parse it directly. The ASCII
+    // check is what makes the byte indexing below safe on a `&str`.
     if let Value::String(s) = value {
         let s = s.trim();
-        if s.len() == 10 && s.as_bytes().get(4) == Some(&b'-') {
+        if s.len() == 10 && s.is_ascii() && s.as_bytes()[4] == b'-' {
             let year: i32 = s[0..4]
                 .parse()
                 .map_err(|_| enc_err(col, "invalid Date year"))?;
@@ -640,7 +738,7 @@ fn to_epoch_days(value: &Value, col: &str) -> Result<i32, DynamicError> {
             let day: u32 = s[8..10]
                 .parse()
                 .map_err(|_| enc_err(col, "invalid Date day"))?;
-            if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            if !check_calendar_day(year, month, day) {
                 return Err(enc_err(col, "invalid Date components"));
             }
             let days = civil_days_from_epoch(year, month, day);
@@ -686,6 +784,11 @@ fn parse_datetime_str(s: &str) -> Result<(i64, u32), String> {
     let len = bytes.len();
 
     if len < 19 {
+        return Err("invalid DateTime string".into());
+    }
+    // Every index below is a byte offset into `s`; without this a multibyte
+    // char inside a 19-byte string would split a char and panic.
+    if !s.is_ascii() {
         return Err("invalid DateTime string".into());
     }
     let sep = bytes[10];
@@ -755,7 +858,7 @@ fn parse_datetime_str(s: &str) -> Result<(i64, u32), String> {
         .parse()
         .map_err(|_| "invalid second".to_string())?;
 
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 59 {
+    if !check_calendar_day(year, month, day) || hour > 23 || min > 59 || sec > 59 {
         return Err("invalid DateTime string".into());
     }
 
@@ -799,14 +902,16 @@ fn enum_discriminant(value: &Value, type_str: &str, col: &str) -> Result<i64, Dy
 
 /// Look up `name` in an `Enum8(...)`/`Enum16(...)` definition, returning its
 /// integer discriminant. Members look like `'name' = 1` separated by commas.
+///
+/// The split is quote-aware: a member label may itself contain a comma, as in
+/// `Enum8('a,b' = 1)`.
 fn enum_member_value(type_str: &str, name: &str) -> Option<i64> {
     let open = type_str.find('(')?;
     let close = type_str.rfind(')')?;
     if open >= close {
         return None;
     }
-    let inner = &type_str[open + 1..close];
-    for member in inner.split(',') {
+    for member in split_enum_members(&type_str[open + 1..close]) {
         let (label, num) = member.split_once('=')?;
         let label = label.trim().trim_matches('\'').trim_matches('"');
         if label == name {
@@ -814,6 +919,32 @@ fn enum_member_value(type_str: &str, name: &str) -> Option<i64> {
         }
     }
     None
+}
+
+/// Split an enum member list on the commas that sit outside a quoted label.
+fn split_enum_members(inner: &str) -> Vec<&str> {
+    let mut members = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0;
+    let mut escaped = false;
+    for (i, c) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' && quote.is_some() {
+            escaped = true;
+        } else if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+        } else if c == '\'' || c == '"' {
+            quote = Some(c);
+        } else if c == ',' {
+            members.push(&inner[start..i]);
+            start = i + 1;
+        }
+    }
+    members.push(&inner[start..]);
+    members
 }
 
 // ---------------------------------------------------------------------------
@@ -840,7 +971,7 @@ fn encode_ipv4(value: &Value, col: &str, buf: &mut Vec<u8>) -> Result<(), Dynami
     if let Value::Number(n) = value
         && let Some(u) = n.as_u64()
     {
-        let addr = Ipv4Addr::from(u as u32);
+        let addr = Ipv4Addr::from(narrow::<u32>(u, col, "IPv4")?);
         buf.extend_from_slice(&u32::from(addr).to_le_bytes());
         return Ok(());
     }
@@ -873,7 +1004,7 @@ fn encode_array(
         Value::Array(a) => a,
         _ => return Err(enc_err(col, "expected array")),
     };
-    write_varint(arr.len() as u64, buf);
+    buf.put_var_uint(arr.len() as u64);
     for item in arr {
         encode_value(item, elem, col, buf)?;
     }
@@ -882,7 +1013,7 @@ fn encode_array(
 
 fn encode_map(
     value: &Value,
-    _key: &ParsedType,
+    key: &ParsedType,
     val: &ParsedType,
     col: &str,
     buf: &mut Vec<u8>,
@@ -891,10 +1022,16 @@ fn encode_map(
         Value::Object(m) => m,
         _ => return Err(enc_err(col, "expected object for Map")),
     };
-    write_varint(obj.len() as u64, buf);
-    // ClickHouse Map keys are String on this path; write the key text directly.
+    // A JSON object key is text, so `String` (and `LowCardinality(String)`,
+    // which is the bare String on this path) is the only key type that can be
+    // written from it. Anything else is rejected rather than written as a
+    // length-prefixed string the server would read as a different type.
+    if key.tag != TypeTag::String || key.nullable {
+        return Err(unsupported(col, key));
+    }
+    buf.put_var_uint(obj.len() as u64);
     for (k, v) in obj {
-        write_string(k.as_bytes(), buf);
+        buf.put_string(k.as_bytes());
         encode_value(v, val, col, buf)?;
     }
     Ok(())
@@ -1408,8 +1545,7 @@ mod tests {
         );
         let json_str = r#"{"key":"value","num":42}"#;
         let mut expected = Vec::new();
-        write_varint(json_str.len() as u64, &mut expected);
-        expected.extend_from_slice(json_str.as_bytes());
+        expected.put_string(json_str);
         assert_eq!(bytes, expected);
     }
 
@@ -1418,8 +1554,7 @@ mod tests {
         let payload = r#"{"event":"login","user":"alice"}"#;
         let bytes = enc(json!({"data": payload}), &[("data", "JSON")]);
         let mut expected = Vec::new();
-        write_varint(payload.len() as u64, &mut expected);
-        expected.extend_from_slice(payload.as_bytes());
+        expected.put_string(payload);
         assert_eq!(bytes, expected);
     }
 
@@ -1450,8 +1585,7 @@ mod tests {
         let bytes = enc(json!({"t": {"env": "prod"}}), &[("t", "Nullable(JSON)")]);
         let json_str = r#"{"env":"prod"}"#;
         let mut expected = vec![0u8];
-        write_varint(json_str.len() as u64, &mut expected);
-        expected.extend_from_slice(json_str.as_bytes());
+        expected.put_string(json_str);
         assert_eq!(bytes, expected);
     }
 
@@ -1472,8 +1606,7 @@ mod tests {
         let mut expected = Vec::new();
         expected.extend_from_slice(&1u32.to_le_bytes());
         expected.push(0); // not null
-        write_varint(raw.len() as u64, &mut expected);
-        expected.extend_from_slice(raw);
+        expected.put_string(raw);
         assert_eq!(bytes, expected);
     }
 
@@ -1539,22 +1672,167 @@ mod tests {
         );
     }
 
-    // ---- varint ----
+    #[test]
+    fn dynamic_is_unsupported() {
+        let e = enc_err_of(json!({"d": 1}), &[("d", "Dynamic")]);
+        assert!(
+            matches!(e, DynamicError::UnsupportedType { .. }),
+            "got: {e:?}"
+        );
+    }
+
+    /// A column the encoder cannot write is unsupported for the whole insert,
+    /// so the absent-value default path has to reject it too.
+    #[test]
+    fn an_unsupported_column_errors_whether_or_not_the_row_has_it() {
+        for ty in ["Point", "Variant(UInt8, String)", "Dynamic", "NotAType"] {
+            let with_value = enc_err_of(json!({"c": 1}), &[("c", ty)]);
+            assert!(
+                matches!(with_value, DynamicError::UnsupportedType { .. }),
+                "{ty} with a value: {with_value:?}"
+            );
+            let without_value = enc_err_of(json!({}), &[("c", ty)]);
+            assert!(
+                matches!(without_value, DynamicError::UnsupportedType { .. }),
+                "{ty} with no value: {without_value:?}"
+            );
+        }
+    }
+
+    // ---- Range and precision ----
+
+    /// A value the column cannot hold fails the row; it is never written
+    /// modulo the width.
+    #[test]
+    fn integer_widths_reject_out_of_range_rather_than_truncating() {
+        for (ty, value) in [
+            ("UInt8", json!(300)),
+            ("UInt16", json!(70_000)),
+            ("UInt32", json!(5_000_000_000u64)),
+            ("Int8", json!(200)),
+            ("Int8", json!(-200)),
+            ("Int16", json!(40_000)),
+            ("Int32", json!(3_000_000_000u64)),
+        ] {
+            let e = enc_err_of(json!({ "x": value }), &[("x", ty)]);
+            assert!(
+                matches!(e, DynamicError::EncodingError { .. }),
+                "{ty} must reject: {e:?}"
+            );
+            assert!(format!("{e}").contains("out of range"), "{ty}: {e}");
+        }
+        // The widest value each column CAN hold still encodes.
+        assert_eq!(enc(json!({"x": 255}), &[("x", "UInt8")]), vec![255]);
+        assert_eq!(
+            enc(json!({"x": -128}), &[("x", "Int8")]),
+            (-128i8).to_le_bytes()
+        );
+    }
+
+    /// The full 38 digits reach the wire, which f64 scaling cannot carry.
+    #[test]
+    fn decimal128_keeps_all_38_significant_digits() {
+        let text = "1234567890123456789012345678.1234567890";
+        let expected: i128 = 12_345_678_901_234_567_890_123_456_781_234_567_890;
+        assert_eq!(
+            enc(json!({ "d": text }), &[("d", "Decimal128(38, 10)")]),
+            expected.to_le_bytes()
+        );
+
+        // Half-up on the first dropped fractional digit, and a sign.
+        assert_eq!(
+            enc(json!({"d": "1.005"}), &[("d", "Decimal64(18, 2)")]),
+            101i64.to_le_bytes()
+        );
+        assert_eq!(
+            enc(json!({"d": "-1.005"}), &[("d", "Decimal64(18, 2)")]),
+            (-101i64).to_le_bytes()
+        );
+        // A JSON float is stringified first, so 123.45 scales exactly.
+        assert_eq!(
+            enc(json!({"d": 123.45}), &[("d", "Decimal(18, 2)")]),
+            12_345i64.to_le_bytes()
+        );
+    }
+
+    /// A 19-byte string can carry a multibyte char, so the parser's byte
+    /// indexing has to reject it rather than split a char boundary.
+    #[test]
+    fn datetime_string_rejects_non_ascii_without_panicking() {
+        for ty in ["DateTime", "DateTime64(3)", "Date", "Date32"] {
+            for value in ["abc\u{e9}12345T00:00:00", "2026-01-0\u{e9}", "\u{4e2d}"] {
+                let e = enc_err_of(json!({ "ts": value }), &[("ts", ty)]);
+                assert!(
+                    matches!(e, DynamicError::EncodingError { .. }),
+                    "{ty} / {value:?}: {e:?}"
+                );
+            }
+        }
+    }
 
     #[test]
-    fn varint_boundaries() {
-        let mut buf = Vec::new();
-        write_varint(0, &mut buf);
-        assert_eq!(buf, vec![0]);
-        buf.clear();
-        write_varint(127, &mut buf);
-        assert_eq!(buf, vec![127]);
-        buf.clear();
-        write_varint(128, &mut buf);
-        assert_eq!(buf, vec![0x80, 0x01]);
-        buf.clear();
-        write_varint(300, &mut buf);
-        assert_eq!(buf, vec![0xAC, 0x02]);
+    fn an_impossible_calendar_day_is_rejected() {
+        for (ty, value) in [
+            ("Date", "2026-02-31"),
+            ("Date", "2026-04-31"),
+            ("Date32", "2025-02-29"),
+            ("DateTime", "2026-02-30 00:00:00"),
+            ("DateTime64(3)", "2026-13-01 00:00:00"),
+        ] {
+            let e = enc_err_of(json!({ "d": value }), &[("d", ty)]);
+            assert!(
+                matches!(e, DynamicError::EncodingError { .. }),
+                "{ty} / {value}: {e:?}"
+            );
+        }
+        // 2024 is a leap year, so the 29th of February exists.
+        let days = civil_days_from_epoch(2024, 2, 29) as u16;
+        assert_eq!(
+            enc(json!({"d": "2024-02-29"}), &[("d", "Date")]),
+            days.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn map_with_a_non_string_key_is_rejected() {
+        for ty in [
+            "Map(UInt32, String)",
+            "Map(Int64, String)",
+            "Map(FixedString(4), String)",
+            "Map(UUID, String)",
+        ] {
+            let e = enc_err_of(json!({"m": {"1": "a"}}), &[("m", ty)]);
+            assert!(
+                matches!(e, DynamicError::UnsupportedType { .. }),
+                "{ty}: {e:?}"
+            );
+        }
+        // LowCardinality(String) keys are the bare String on this path.
+        let bytes = enc(
+            json!({"m": {"a": 1}}),
+            &[("m", "Map(LowCardinality(String), UInt32)")],
+        );
+        assert_eq!(bytes, enc(json!({"m": {"a": 1}}), &[("m", "Map(String, UInt32)")]));
+    }
+
+    #[test]
+    fn enum_member_labels_may_contain_a_comma() {
+        assert_eq!(
+            enc(json!({"e": "a,b"}), &[("e", "Enum8('a,b' = 1, 'c' = 2)")]),
+            vec![1]
+        );
+        assert_eq!(
+            enc(json!({"e": "c"}), &[("e", "Enum8('a,b' = 1, 'c' = 2)")]),
+            vec![2]
+        );
+    }
+
+    /// Magnitude detection reads the absolute value, so a pre-1970 timestamp
+    /// is scaled down from milliseconds rather than taken as raw seconds.
+    #[test]
+    fn a_pre_epoch_millisecond_timestamp_scales_like_a_post_epoch_one() {
+        assert_eq!(epoch_to_seconds(-1_600_000_000_000), -1_600_000_000);
+        assert_eq!(epoch_to_seconds(1_600_000_000_000), 1_600_000_000);
     }
 
     // ---- civil days ----
@@ -1564,5 +1842,124 @@ mod tests {
         assert_eq!(civil_days_from_epoch(1970, 1, 1), 0);
         assert_eq!(civil_days_from_epoch(2026, 4, 7), 20_550);
         assert_eq!(civil_days_from_epoch(1969, 12, 31), -1);
+    }
+
+    // ---- Arena ----
+
+    /// The batching primitive: N rows into one buffer are byte-identical to N
+    /// separate `encode()` calls concatenated.
+    #[test]
+    fn encode_into_appends_without_disturbing_earlier_rows() {
+        let columns = [ColumnDef::new("id", "UInt32"), ColumnDef::new("s", "String")];
+        let rows = [json!({"id": 1, "s": "a"}), json!({"id": 2, "s": "bb"})];
+
+        let mut arena = Vec::new();
+        let mut ends = Vec::new();
+        let mut concatenated = Vec::new();
+        for row in &rows {
+            let obj = row.as_object().unwrap().clone();
+            DynamicRow::new(&obj, &columns)
+                .encode_into(&mut arena)
+                .unwrap();
+            ends.push(arena.len());
+            concatenated.extend_from_slice(&DynamicRow::new(&obj, &columns).encode().unwrap());
+        }
+
+        assert_eq!(arena, concatenated);
+        assert_eq!(ends.len(), 2);
+        assert_eq!(&arena[..ends[0]], &[1, 0, 0, 0, 1, b'a']);
+        assert_eq!(&arena[ends[0]..ends[1]], &[2, 0, 0, 0, 2, b'b', b'b']);
+    }
+
+    proptest::proptest! {
+        /// The encoder never panics: whatever JSON meets whatever type string,
+        /// the answer is bytes or a `DynamicError`.
+        #[test]
+        fn encoding_any_value_against_any_type_never_panics(
+            value in arbitrary_value(),
+            ty in proptest::sample::select(TYPE_STRINGS),
+        ) {
+            let columns = [ColumnDef::new("c", ty)];
+            let mut row = Map::new();
+            row.insert("c".to_string(), value);
+            let mut buf = Vec::new();
+            let _ = DynamicRow::new(&row, &columns).encode_into(&mut buf);
+        }
+    }
+
+    /// Every type string the parser has a branch for, plus the shapes that
+    /// exercise the rejection paths.
+    const TYPE_STRINGS: &[&str] = &[
+        "String",
+        "FixedString(4)",
+        "UInt8",
+        "UInt16",
+        "UInt32",
+        "UInt64",
+        "UInt128",
+        "UInt256",
+        "Int8",
+        "Int16",
+        "Int32",
+        "Int64",
+        "Int128",
+        "Int256",
+        "Float32",
+        "Float64",
+        "Bool",
+        "Date",
+        "Date32",
+        "DateTime",
+        "DateTime64(3)",
+        "DateTime64(9, 'UTC')",
+        "Decimal(38, 10)",
+        "Decimal32(2)",
+        "Decimal64(4)",
+        "Decimal128(8)",
+        "Decimal256(8)",
+        "UUID",
+        "IPv4",
+        "IPv6",
+        "Enum8('a' = 1, 'b' = 2)",
+        "Enum16('x' = 100)",
+        "Array(UInt32)",
+        "Array(Nullable(String))",
+        "Map(String, UInt32)",
+        "Map(UInt32, String)",
+        "JSON",
+        "Nullable(String)",
+        "Nullable(DateTime64(3))",
+        "LowCardinality(Nullable(String))",
+        "Point",
+        "Tuple(UInt8, UInt8)",
+        "Variant(UInt8, String)",
+        "Dynamic",
+        "SomeTypeFromTheFuture",
+    ];
+
+    /// A bounded `serde_json::Value`: depth, collection size and string length
+    /// are all capped so a case stays cheap to encode.
+    fn arbitrary_value() -> impl proptest::strategy::Strategy<Value = Value> {
+        use proptest::prelude::*;
+
+        let text = proptest::collection::vec(any::<char>(), 0..12)
+            .prop_map(|chars| chars.into_iter().collect::<String>());
+        let leaf = prop_oneof![
+            Just(Value::Null),
+            any::<bool>().prop_map(Value::Bool),
+            any::<i64>().prop_map(|n| Value::Number(n.into())),
+            any::<u64>().prop_map(|n| Value::Number(n.into())),
+            (-1e18f64..1e18).prop_filter_map("representable in JSON", |f| {
+                serde_json::Number::from_f64(f).map(Value::Number)
+            }),
+            text.clone().prop_map(Value::String),
+        ];
+        leaf.prop_recursive(3, 24, 4, move |inner| {
+            prop_oneof![
+                proptest::collection::vec(inner.clone(), 0..4).prop_map(Value::Array),
+                proptest::collection::vec((text.clone(), inner), 0..4)
+                    .prop_map(|pairs| Value::Object(pairs.into_iter().collect())),
+            ]
+        })
     }
 }

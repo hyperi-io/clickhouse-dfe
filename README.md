@@ -32,16 +32,17 @@ Every layer is a feature. Take what you need and pay for nothing else.
 |---|---|
 | `tcp` | Native TCP transport -- connection actor, deadpool pool, retry, Native-format wire codec |
 | `tls` | rustls trust for the TCP transport (implies `tcp`) |
-| `lz4` | LZ4 block compression, on both transports |
-| `zstd` | Zstd block compression, on both transports |
-| `dynamic` | Runtime-schema insert from `serde_json::Map` rows -- `FORMAT RowBinary` over HTTP, `FORMAT Native` over TCP |
+| `lz4` | LZ4 compression for the HTTP transport, forwarded to upstream. The TCP handshake negotiates no compression |
+| `zstd` | Zstd compression for the HTTP transport, forwarded to upstream. The TCP handshake negotiates no compression |
+| `dynamic` | Runtime-schema insert from `serde_json::Map` rows -- `FORMAT RowBinary` over HTTP, `FORMAT Native` over TCP (implies `ext`) |
 | `unified` | One client over HTTP `clickhouse::Client` and our `TcpClient` (implies `tcp`) |
-| `ext` | Extension traits on `clickhouse::Client` -- ping, kill query, query id, session id, roles, typed server exceptions |
-| `inserter` | Background-actor inserter layer |
+| `ext` | Extension traits on `clickhouse::Client` -- ping, kill query, query id, session id, role, typed server exceptions |
+| `inserter` | Forwards `clickhouse/inserter`, which a consumer of this crate cannot enable on the upstream dependency any other way |
 | `full` | All of the above |
 
-Default is `tcp` plus `lz4`, which is what a ClickHouse server negotiates out
-of the box.
+Default is `tcp` plus `lz4`. `lz4` affects the HTTP path only -- the TCP
+handshake sends no compression, so a default build that uses only the native
+transport pays nothing for it.
 
 ```toml
 [dependencies]

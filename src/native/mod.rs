@@ -12,7 +12,7 @@
 //! - [`encode`]: INSERT-block encoder, shared by the HTTP and TCP transports.
 //! - `decode`: SELECT-block decoder producing the typed column buffers
 //!   [`DecodedBlock`] carries.
-//! - [`sparse`]: sparse-column wire format (offset list + non-default values).
+//! - `sparse`: sparse-column wire format (offset list + non-default values).
 //! - [`io`]: varint and length-prefixed-string helpers over
 //!   [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] and [`bytes::BufMut`].
 //!
@@ -32,7 +32,7 @@ pub mod columns;
 pub(crate) mod decode;
 pub mod encode;
 pub mod io;
-pub mod sparse;
+pub(crate) mod sparse;
 
 pub use columns::ColumnType;
 pub use decode::{DecodedBlock, DecodedColumn, FromColumn};

@@ -1,3 +1,11 @@
+// Project:   clickhouse-dfe
+// File:      src/error.rs
+// Purpose:   Crate error enum, upstream mapping and retry classification
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
 //! Contains [`Error`] and corresponding [`Result`].
 
 use serde::{de, ser};
@@ -85,6 +93,12 @@ pub enum Error {
     SchemaMismatch(String),
     #[error("unsupported: {0}")]
     Unsupported(String),
+    /// A dynamic-insert failure, kept typed so a caller can tell a stale
+    /// schema (re-fetch and retry) from a permanent rejection.
+    #[cfg(feature = "dynamic")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "dynamic")))]
+    #[error(transparent)]
+    Dynamic(#[from] crate::dynamic::DynamicError),
     #[error("{0}")]
     Other(BoxedError),
 }
@@ -138,11 +152,11 @@ impl From<Error> for io::Error {
 
 impl From<io::Error> for Error {
     fn from(error: io::Error) -> Self {
-        // TODO: after MSRV 1.79 replace with `io::Error::downcast`.
-        if error.get_ref().is_some_and(|r| r.is::<Error>()) {
-            *error.into_inner().unwrap().downcast::<Error>().unwrap()
-        } else {
-            Self::Other(error.into())
+        // Unwraps an `Error` this crate boxed on the way out, so a round trip
+        // through `io::Error` keeps the variant.
+        match error.downcast::<Self>() {
+            Ok(inner) => inner,
+            Err(other) => Self::Other(other.into()),
         }
     }
 }
@@ -151,17 +165,13 @@ impl Error {
     /// Conservative retriability classification.
     ///
     /// Returns `true` for errors that *might* succeed on retry --
-    /// transport-level (`Network`, `TimedOut`, `Transient`, `Connect`)
-    /// and a known set of transient server-side codes (timeouts,
-    /// simultaneous-query limits, parts-count overruns, Keeper hiccups).
+    /// transport-level (`Network`, `TimedOut`, `Transient`, `Connect`),
+    /// a known set of transient server-side codes, and the dynamic-insert
+    /// failures that clear once the schema is re-read.
     ///
-    /// Returns `false` for everything else, including unknown
-    /// server codes. The classification is intentionally
-    /// conservative -- callers wanting more aggressive retry should
-    /// match on the underlying variant. The full mapping lives in
-    /// [`is_retriable_code`][Self::is_retriable_code]; PRs welcome
-    /// to extend it as production experience shows what's actually
-    /// transient.
+    /// Returns `false` for everything else, including unknown server codes:
+    /// a caller wanting a more aggressive retry should match on the variant.
+    /// The code table is [`is_retriable_code`][Self::is_retriable_code].
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
@@ -170,17 +180,23 @@ impl Error {
             // here rather than on their message text.
             Self::Network(_) | Self::TimedOut | Self::Transient(_) | Self::Connect(_) => true,
             Self::ServerException { code, .. } => Self::is_retriable_code(*code),
+            // A stale, missing or unreadable schema is fixed by re-reading it;
+            // an unsupported type or a bad value is not.
+            #[cfg(feature = "dynamic")]
+            Self::Dynamic(e) => matches!(
+                e,
+                crate::dynamic::DynamicError::SchemaFetch { .. }
+                    | crate::dynamic::DynamicError::SchemaMismatch { .. }
+                    | crate::dynamic::DynamicError::EmptySchema { .. }
+            ),
             _ => false,
         }
     }
 
     /// ClickHouse error codes considered transient for retry. See
     /// `src/Common/ErrorCodes.cpp` upstream for the canonical list.
-    /// Conservative -- false negatives are expected; false positives
-    /// should be rare. Source-of-truth comments in this table use
-    /// the upstream macro name. The table is production-experience
-    /// driven; PRs extending it with new operationally-transient
-    /// codes are welcome.
+    /// Conservative -- false negatives are expected, false positives
+    /// should be rare. Each entry names its upstream macro.
     #[must_use]
     pub fn is_retriable_code(code: i32) -> bool {
         matches!(
@@ -229,12 +245,6 @@ impl Error {
             // KEEPER_EXCEPTION (replicated-metadata hiccup)
             999
         )
-    }
-
-    /// Record this `Error` against the current `tracing::Span` with the
-    /// supplied context message.
-    pub fn record_in_current_span(&self, msg: &str) {
-        tracing::debug!(error=%self, "{msg}");
     }
 }
 
@@ -294,27 +304,81 @@ mod tests {
     #[test]
     fn is_retriable_for_transport_errors() {
         assert!(Error::TimedOut.is_retriable());
-        // Network variant needs a BoxedError construction; use a
-        // simple io::Error round-trip to build one.
-        let net_err: Error = io::Error::new(io::ErrorKind::ConnectionReset, "reset").into();
-        // io::Error -> Error::Custom path; not a Network variant.
-        // Just verify Custom is NOT retriable to lock in the
-        // conservative classification.
-        assert!(!net_err.is_retriable());
+        assert!(Error::Transient("pool acquire timed out".into()).is_retriable());
+        assert!(Error::Connect("no address for host".into()).is_retriable());
+        // A foreign `io::Error` lands in `Other`, which stays terminal.
+        let foreign: Error = io::Error::new(io::ErrorKind::ConnectionReset, "reset").into();
+        assert!(!foreign.is_retriable());
     }
 
     #[test]
     fn is_retriable_code_defaults_unknown_to_not_retriable() {
-        // Conservative default: anything outside the documented
-        // retriable set is NOT retriable. New ClickHouse versions
-        // can ship new codes; until our table is updated, callers
-        // see them as terminal -- safer than masking real failures
-        // under a retry loop.
+        // A ClickHouse release can ship codes this table has never seen; until
+        // it is extended, a caller sees them as terminal rather than looping.
         for &code in &[0i32, 1, 12345, 99999, i32::MAX] {
             assert!(
                 !Error::is_retriable_code(code),
                 "unknown code {code} should default to NOT retriable"
             );
         }
+    }
+
+    /// The consumer branches on this to decide between re-reading the schema
+    /// and dead-lettering the batch, so the split has to hold.
+    #[cfg(feature = "dynamic")]
+    #[test]
+    fn dynamic_schema_failures_are_retriable_but_bad_data_is_not() {
+        use crate::dynamic::DynamicError;
+
+        let retriable = [
+            DynamicError::EmptySchema {
+                table: "db.t".into(),
+            },
+            DynamicError::SchemaMismatch {
+                table: "db.t".into(),
+                message: "drift".into(),
+            },
+            DynamicError::SchemaFetch {
+                table: "db.t".into(),
+                source: clickhouse::error::Error::TimedOut,
+            },
+        ];
+        for e in retriable {
+            assert!(Error::from(e).is_retriable());
+        }
+
+        let terminal = [
+            DynamicError::UnsupportedType {
+                column: "c".into(),
+                type_str: "Point".into(),
+            },
+            DynamicError::EncodingError {
+                column: "c".into(),
+                message: "UInt8 value out of range".into(),
+            },
+        ];
+        for e in terminal {
+            assert!(!Error::from(e).is_retriable());
+        }
+    }
+
+    /// `#[error(transparent)]`, so the wrapper adds no prefix and `source()`
+    /// reaches the original query failure.
+    #[cfg(feature = "dynamic")]
+    #[test]
+    fn dynamic_errors_pass_through_display_and_source() {
+        use std::error::Error as _;
+
+        let err = Error::from(crate::dynamic::DynamicError::SchemaFetch {
+            table: "db.t".into(),
+            source: clickhouse::error::Error::TimedOut,
+        });
+        assert_eq!(
+            err.to_string(),
+            "failed to fetch schema for 'db.t': timeout expired"
+        );
+        // `transparent` forwards `source()`, so the query failure is reachable.
+        let source = err.source().expect("the query failure is the source");
+        assert_eq!(source.to_string(), "timeout expired");
     }
 }

@@ -1,3 +1,11 @@
+// Project:   clickhouse-dfe
+// File:      src/tls.rs
+// Purpose:   Trust description to a rustls ClientConfig for the TCP transport
+// Language:  Rust
+//
+// License:   Apache-2.0
+// Copyright: (c) 2026 HYPERI PTY LIMITED
+
 //! TLS trust configuration for the TCP transport.
 //!
 //! This module turns a trust description (OS native roots, the compiled
@@ -7,6 +15,9 @@
 //! server cert is verified against one pool; CA files are loaded
 //! `AppendCertsFromPEM`-style (best-effort, all certs in the file,
 //! error only if none parse).
+//!
+//! Resolution fails closed: an empty trust store is an error rather than a
+//! config that falls back to broad trust.
 //!
 //! [`ClientConfig`]: rustls::ClientConfig
 
@@ -22,6 +33,7 @@ use crate::error::{Error, Result};
 /// Declarative trust description, resolved to a [`rustls::ClientConfig`]
 /// at transport-build time.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct TlsTrust {
     /// Load OS native roots (rustls-native-certs).
     pub native_roots: bool,
@@ -52,6 +64,7 @@ impl Default for TlsTrust {
 /// What the Client carries: either a caller-built config (Go's
 /// `Options.TLS` analog) or a declarative trust we resolve ourselves.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum TlsConfigSource {
     Explicit(Arc<rustls::ClientConfig>),
     Trust(TlsTrust),
@@ -86,11 +99,10 @@ fn build_root_store(trust: &TlsTrust) -> Result<RootCertStore> {
 
     if !trust.exclusive {
         if trust.native_roots {
-            // Best-effort: take what the OS store yields, tolerate
-            // partial errors as long as we end up non-empty (webpki net).
+            // Best-effort: an OS store that yields nothing is not fatal here,
+            // because the empty-store check below is the fail-closed gate.
             let result = rustls_native_certs::load_native_certs();
-            let (added, _ignored) = store.add_parsable_certificates(result.certs);
-            let _ = added;
+            let _ = store.add_parsable_certificates(result.certs);
         }
         if trust.webpki_roots {
             store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -141,26 +153,6 @@ pub fn build_client_config(src: &TlsConfigSource) -> Result<Arc<rustls::ClientCo
     }
 }
 
-/// A `ClientConfig` that trusts NO roots -- used to fail closed when a
-/// trust was configured but could not be resolved (never silently fall
-/// back to default/broad trust). An empty `RootCertStore` rejects every
-/// server certificate at handshake time.
-pub fn build_failclosed_config() -> Arc<rustls::ClientConfig> {
-    let roots = RootCertStore::empty();
-    // A provider build failure must still not fall back to broad trust,
-    // so the recovery path also trusts nothing.
-    build_config_with_roots(roots).unwrap_or_else(|_| {
-        let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-        Arc::new(
-            rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .expect("rustls safe default protocol versions")
-                .with_root_certificates(RootCertStore::empty())
-                .with_no_client_auth(),
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -168,20 +160,21 @@ mod tests {
     // A syntactically valid self-signed cert (parses as a cert; never
     // verified here -- these tests check store assembly, not chains, so
     // expiry is irrelevant). Generated once for the suite.
-    const TEST_CA_PEM: &str = include_str!("../tests/resources/test_ca.pem");
+    const TEST_CA_PEM: &str = include_str!("testdata/test_ca.pem");
 
-    fn write_tmp(name: &str, body: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("ch_rs_tls_tests");
-        std::fs::create_dir_all(&dir).unwrap();
-        let p = dir.join(name);
+    /// The `TempDir` must outlive the path, so it is returned with it: two
+    /// suite runs on one host get separate directories and neither leaks.
+    fn write_tmp(name: &str, body: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(name);
         std::fs::write(&p, body).unwrap();
-        p
+        (dir, p)
     }
 
     #[test]
     fn add_pem_file_adds_all_certs_in_bundle() {
         let bundle = format!("{TEST_CA_PEM}\n{TEST_CA_PEM}");
-        let path = write_tmp("bundle.pem", &bundle);
+        let (_dir, path) = write_tmp("bundle.pem", &bundle);
         let mut store = RootCertStore::empty();
         add_pem_file_certs(&mut store, &path).unwrap();
         assert_eq!(store.len(), 2, "both concatenated certs must be added");
@@ -192,7 +185,7 @@ mod tests {
         let mixed = format!(
             "-----BEGIN CERTIFICATE-----\nbm90YWNlcnQ=\n-----END CERTIFICATE-----\n{TEST_CA_PEM}"
         );
-        let path = write_tmp("mixed.pem", &mixed);
+        let (_dir, path) = write_tmp("mixed.pem", &mixed);
         let mut store = RootCertStore::empty();
         add_pem_file_certs(&mut store, &path).unwrap();
         assert_eq!(store.len(), 1, "valid cert added, junk block skipped");
@@ -200,7 +193,7 @@ mod tests {
 
     #[test]
     fn add_pem_file_errors_on_zero_certs() {
-        let path = write_tmp("empty.pem", "not a pem at all\n");
+        let (_dir, path) = write_tmp("empty.pem", "not a pem at all\n");
         let mut store = RootCertStore::empty();
         let err = match add_pem_file_certs(&mut store, &path) {
             Ok(_) => panic!("zero-cert file must error"),
@@ -221,7 +214,7 @@ mod tests {
 
     #[test]
     fn build_root_store_augment_includes_extra() {
-        let path = write_tmp("root.pem", TEST_CA_PEM);
+        let (_dir, path) = write_tmp("root.pem", TEST_CA_PEM);
         let trust = TlsTrust {
             native_roots: false, // keep test hermetic (no OS dependency)
             webpki_roots: true,
@@ -237,7 +230,7 @@ mod tests {
 
     #[test]
     fn build_root_store_exclusive_only_extra() {
-        let path = write_tmp("only.pem", TEST_CA_PEM);
+        let (_dir, path) = write_tmp("only.pem", TEST_CA_PEM);
         let trust = TlsTrust {
             native_roots: true,
             webpki_roots: true,
@@ -263,5 +256,36 @@ mod tests {
             Err(e) => e,
         };
         assert!(format!("{err}").contains("no explicit CA files"));
+    }
+
+    /// Fail closed: a trust that resolves to nothing is an error, never a
+    /// config that quietly trusts whatever the platform defaults to.
+    #[test]
+    fn a_trust_that_resolves_to_no_roots_errors() {
+        let trust = TlsTrust {
+            native_roots: false,
+            webpki_roots: false,
+            extra_roots: Vec::new(),
+            extra_intermediates: Vec::new(),
+            exclusive: false,
+        };
+        let err = match build_client_config(&TlsConfigSource::Trust(trust)) {
+            Ok(_) => panic!("an empty trust store must error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err}").contains("trust store is empty"), "{err}");
+    }
+
+    /// A caller-built config is handed back as-is, not rebuilt from our rules.
+    #[test]
+    fn explicit_config_passes_through_unchanged() {
+        let (_dir, path) = write_tmp("explicit.pem", TEST_CA_PEM);
+        let mut roots = RootCertStore::empty();
+        add_pem_file_certs(&mut roots, &path).unwrap();
+        let built = build_config_with_roots(roots).unwrap();
+
+        let out = build_client_config(&TlsConfigSource::Explicit(built.clone())).unwrap();
+
+        assert!(Arc::ptr_eq(&built, &out));
     }
 }

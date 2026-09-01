@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   dfe-loader
-// File:      src/clickhouse_ext/parsed_type.rs
+// Project:   clickhouse-dfe
+// File:      src/dynamic/parsed_type.rs
 // Purpose:   Runtime ClickHouse type-string parser (ParsedType)
 // Language:  Rust
 //
@@ -15,9 +15,6 @@
 //! `ParsedType` AST. Handles Nullable, LowCardinality, Array, Map,
 //! DateTime64(precision, timezone), Decimal(precision, scale), FixedString(n),
 //! Enum8/Enum16, and all scalar types.
-//!
-//! Lifted from the HyperI DFE Loader project -- generic enough for any
-//! clickhouse-rs user with dynamic schemas.
 
 use std::fmt;
 
@@ -25,6 +22,7 @@ use std::fmt;
 /// on the encode hot path. Resolved once at schema-fetch time, used on
 /// every row thereafter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum TypeTag {
     String,
     FixedString,
@@ -58,10 +56,11 @@ pub enum TypeTag {
     Enum16,
     Array,
     Map,
-    Tuple,
     Point,
     JSON,
-    /// Forward compat -- unknown types encode as String.
+    Variant,
+    Dynamic,
+    /// A type name this parser does not recognise; the encoder rejects it.
     Unknown,
 }
 
@@ -102,9 +101,10 @@ impl TypeTag {
             "Enum16" => Self::Enum16,
             "Array" => Self::Array,
             "Map" => Self::Map,
-            "Tuple" => Self::Tuple,
             "Point" => Self::Point,
             "JSON" | "Object" => Self::JSON,
+            "Variant" => Self::Variant,
+            "Dynamic" => Self::Dynamic,
             _ => Self::Unknown,
         }
     }
@@ -130,9 +130,11 @@ impl TypeTag {
 /// assert_eq!(t.precision, Some(3));
 /// assert_eq!(t.timezone.as_deref(), Some("UTC"));
 /// ```
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ParsedType {
-    /// Original type string from ClickHouse.
+    /// Original type string from ClickHouse, verbatim -- what the Native block
+    /// header declares.
     pub raw: String,
     /// Base type name (e.g., "String", "Int64", "DateTime64").
     pub base: String,
@@ -269,6 +271,19 @@ impl ParsedType {
             return result;
         }
 
+        // Variant(T1, ...) and Dynamic / Dynamic(max_types=N): tagged so the
+        // encoder names them in its rejection instead of calling them unknown.
+        if type_str.starts_with("Variant(") {
+            result.base = "Variant".to_string();
+            result.tag = TypeTag::Variant;
+            return result;
+        }
+        if type_str == "Dynamic" || type_str.starts_with("Dynamic(") {
+            result.base = "Dynamic".to_string();
+            result.tag = TypeTag::Dynamic;
+            return result;
+        }
+
         // Simple type — `type_str` is the owned, unwrapped `String` and is not
         // used after this, so move it rather than clone.
         result.base = type_str;
@@ -277,20 +292,17 @@ impl ParsedType {
     }
 
     fn unwrap_wrapper(type_str: &str, wrapper: &str) -> (String, bool) {
-        let prefix = format!("{wrapper}(");
-        if let Some(rest) = type_str.strip_prefix(&prefix)
-            && let Some(inner) = rest.strip_suffix(')')
-        {
-            return (inner.to_string(), true);
+        match Self::extract_wrapper(type_str, wrapper) {
+            Some(inner) => (inner, true),
+            None => (type_str.to_string(), false),
         }
-        (type_str.to_string(), false)
     }
 
     fn extract_wrapper(type_str: &str, wrapper: &str) -> Option<String> {
-        let prefix = format!("{wrapper}(");
         type_str
-            .strip_prefix(&prefix)
-            .and_then(|rest| rest.strip_suffix(')'))
+            .strip_prefix(wrapper)?
+            .strip_prefix('(')?
+            .strip_suffix(')')
             .map(std::string::ToString::to_string)
     }
 
@@ -337,9 +349,11 @@ impl ParsedType {
         None
     }
 
-    /// Get the type category for coercion/encoding decisions.
+    /// Coercion category for the base type, for a caller deciding how to shape
+    /// a value before handing it over.
     ///
-    /// Maps ClickHouse types to categories. Unknown types map to "String".
+    /// A name this parser does not recognise falls back to `"String"` here; the
+    /// encoder still rejects it rather than writing bytes for it.
     #[must_use]
     pub fn category(&self) -> &str {
         match self.base.as_str() {
@@ -357,7 +371,6 @@ impl ParsedType {
             "IPv6" => "IPv6",
             "Array" => "Array",
             "Map" => "Map",
-            "Tuple" => "Tuple",
             "JSON" | "Object" => "JSON",
             "Variant" => "Variant",
             "Dynamic" => "Dynamic",
@@ -416,21 +429,6 @@ impl ParsedType {
 impl fmt::Display for ParsedType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.raw)
-    }
-}
-
-/// DFE extension trait for `ParsedType` -- adds `coercer_category()` alias.
-///
-/// The fork's `category()` and this `coercer_category()` return the same values.
-/// This alias exists for backward compatibility with existing DFE coercer code.
-pub trait ParsedTypeExt {
-    /// Get the coercer category for this type (alias for `category()`).
-    fn coercer_category(&self) -> &str;
-}
-
-impl ParsedTypeExt for ParsedType {
-    fn coercer_category(&self) -> &str {
-        self.category()
     }
 }
 
@@ -605,89 +603,44 @@ mod tests {
         assert_eq!(t.to_string(), "LowCardinality(Nullable(String))");
     }
 
-    // ---- Ported from dfe-loader/src/clickhouse/types.rs (coercer_category parity) ----
-
     #[test]
-    fn test_coercer_categories() {
-        assert_eq!(ParsedType::parse("String").coercer_category(), "String");
-        assert_eq!(ParsedType::parse("Int64").coercer_category(), "Int");
-        assert_eq!(ParsedType::parse("UInt32").coercer_category(), "UInt");
-        assert_eq!(ParsedType::parse("Float64").coercer_category(), "Float");
-        assert_eq!(ParsedType::parse("Bool").coercer_category(), "Bool");
-        assert_eq!(ParsedType::parse("DateTime").coercer_category(), "DateTime");
-        assert_eq!(ParsedType::parse("UUID").coercer_category(), "UUID");
-        assert_eq!(ParsedType::parse("IPv4").coercer_category(), "IPv4");
-        assert_eq!(ParsedType::parse("JSON").coercer_category(), "JSON");
-        assert_eq!(
-            ParsedType::parse("SomeNewType").coercer_category(),
-            "String"
-        );
+    fn category_date_types() {
+        assert_eq!(ParsedType::parse("Date").category(), "Date");
+        assert_eq!(ParsedType::parse("Date32").category(), "Date");
     }
 
     #[test]
-    fn coercer_category_date_types() {
-        assert_eq!(ParsedType::parse("Date").coercer_category(), "Date");
-        assert_eq!(ParsedType::parse("Date32").coercer_category(), "Date");
+    fn category_decimal_types() {
+        assert_eq!(ParsedType::parse("Decimal(18, 4)").category(), "Decimal");
+        assert_eq!(ParsedType::parse("Decimal32(2)").category(), "Decimal");
+        assert_eq!(ParsedType::parse("Decimal64(4)").category(), "Decimal");
+        assert_eq!(ParsedType::parse("Decimal128(8)").category(), "Decimal");
     }
 
     #[test]
-    fn coercer_category_decimal_types() {
-        assert_eq!(
-            ParsedType::parse("Decimal(18, 4)").coercer_category(),
-            "Decimal"
-        );
-        assert_eq!(
-            ParsedType::parse("Decimal32(2)").coercer_category(),
-            "Decimal"
-        );
-        assert_eq!(
-            ParsedType::parse("Decimal64(4)").coercer_category(),
-            "Decimal"
-        );
-        assert_eq!(
-            ParsedType::parse("Decimal128(8)").coercer_category(),
-            "Decimal"
-        );
-    }
-
-    #[test]
-    fn coercer_category_int_widths() {
+    fn category_int_widths() {
         for t in ["Int8", "Int16", "Int32", "Int64", "Int128", "Int256"] {
-            assert_eq!(
-                ParsedType::parse(t).coercer_category(),
-                "Int",
-                "Failed for {t}"
-            );
+            assert_eq!(ParsedType::parse(t).category(), "Int", "Failed for {t}");
         }
     }
 
     #[test]
-    fn coercer_category_uint_widths() {
+    fn category_uint_widths() {
         for t in ["UInt8", "UInt16", "UInt32", "UInt64", "UInt128", "UInt256"] {
-            assert_eq!(
-                ParsedType::parse(t).coercer_category(),
-                "UInt",
-                "Failed for {t}"
-            );
+            assert_eq!(ParsedType::parse(t).category(), "UInt", "Failed for {t}");
         }
     }
 
     #[test]
-    fn coercer_category_nullable_preserves_inner() {
-        assert_eq!(
-            ParsedType::parse("Nullable(Int64)").coercer_category(),
-            "Int"
-        );
-        assert_eq!(
-            ParsedType::parse("Nullable(UUID)").coercer_category(),
-            "UUID"
-        );
+    fn category_nullable_preserves_inner() {
+        assert_eq!(ParsedType::parse("Nullable(Int64)").category(), "Int");
+        assert_eq!(ParsedType::parse("Nullable(UUID)").category(), "UUID");
     }
 
     #[test]
-    fn coercer_category_lc_preserves_inner() {
+    fn category_lc_preserves_inner() {
         assert_eq!(
-            ParsedType::parse("LowCardinality(String)").coercer_category(),
+            ParsedType::parse("LowCardinality(String)").category(),
             "String"
         );
     }
@@ -701,7 +654,39 @@ mod tests {
     #[test]
     fn parse_enum_type() {
         let t = ParsedType::parse("Enum8('a' = 1, 'b' = 2)");
-        assert_eq!(t.coercer_category(), "Enum");
+        assert_eq!(t.category(), "Enum");
+    }
+
+    #[test]
+    fn variant_and_dynamic_get_their_own_tags() {
+        let v = ParsedType::parse("Variant(UInt8, String)");
+        assert_eq!(v.base, "Variant");
+        assert_eq!(v.tag, TypeTag::Variant);
+        assert_eq!(v.category(), "Variant");
+
+        for raw in ["Dynamic", "Dynamic(max_types=8)"] {
+            let d = ParsedType::parse(raw);
+            assert_eq!(d.base, "Dynamic", "failed for {raw}");
+            assert_eq!(d.tag, TypeTag::Dynamic, "failed for {raw}");
+        }
+    }
+
+    /// The Native block header is written from `raw`, so the parser must hand
+    /// back exactly what the server said, wrappers and spacing included.
+    #[test]
+    fn parse_preserves_the_raw_type_string() {
+        for raw in [
+            "LowCardinality(Nullable(String))",
+            "DateTime64(6, 'Australia/Sydney')",
+            "Map(String, Array(UInt64))",
+            "Enum8('a' = 1, 'b' = 2)",
+            "SomeTypeFromTheFuture(1, 2)",
+        ] {
+            assert_eq!(ParsedType::parse(raw).raw, raw);
+            assert_eq!(ParsedType::parse(raw).to_string(), raw);
+        }
+        // `parse` trims, so `raw` is the trimmed form and not the input.
+        assert_eq!(ParsedType::parse("  UInt8  ").raw, "UInt8");
     }
 
     #[test]
@@ -719,6 +704,6 @@ mod tests {
         let t = ParsedType::parse("FixedString(16)");
         assert_eq!(t.base, "FixedString");
         assert!(t.is_string());
-        assert_eq!(t.coercer_category(), "String");
+        assert_eq!(t.category(), "String");
     }
 }

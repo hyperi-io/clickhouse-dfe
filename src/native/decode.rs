@@ -373,9 +373,12 @@ impl DecodedBlock {
 
 /// Typed read of one [`DecodedColumn`].
 ///
-/// Implemented for the wire types `ClickHouse` system tables use for
-/// schema metadata. Anything else goes through [`DecodedBlock::column`]
-/// and matches on the variant directly.
+/// Implemented for every scalar backing the decoder produces, for
+/// `Option<T>` wherever `T` has a route, and for `String` / `Vec<u8>`
+/// (which also carry `JSON`, `Variant` and `Dynamic` document text).
+/// Composites -- `Array`, `Map`, `Tuple`, `LowCardinality` -- have no
+/// flat Rust shape, so they go through [`DecodedBlock::column`] and match
+/// on the variant directly.
 pub trait FromColumn: Sized {
     /// Convert every value in `column`. `name` and `type_name` come from
     /// the block schema and appear in the mismatch error.
@@ -417,30 +420,85 @@ impl FromColumn for Vec<u8> {
     }
 }
 
-impl FromColumn for u64 {
-    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
-        match column {
-            DecodedColumn::UInt64(values) => Ok(values.clone()),
-            _ => Err(wrong_type(name, type_name, "UInt64")),
-        }
-    }
+/// One impl per Rust type, listing every `DecodedColumn` variant that has
+/// that backing. A `ClickHouse` type is not always its own variant --
+/// `Date` is `UInt16`, `IPv4` is `UInt32`, a `Decimal(P, S)` is its backing
+/// integer -- so a route reads the backing and the caller applies the
+/// meaning, with the scale and timezone available from
+/// [`DecodedBlock::column`].
+///
+/// Each row names its own binder because a `pat_param` fragment is opaque:
+/// an identifier bound inside it belongs to the call site, so a `values`
+/// written in this macro's body would not be the same one.
+macro_rules! from_column_backing {
+    ($(
+        $(#[$meta:meta])*
+        $rust:ty, $bind:ident, $label:literal { $( $pattern:pat_param ),+ $(,)? }
+    )*) => {
+        $(
+            $(#[$meta])*
+            impl FromColumn for $rust {
+                fn from_column(
+                    column: &DecodedColumn,
+                    name: &str,
+                    type_name: &str,
+                ) -> Result<Vec<Self>> {
+                    match column {
+                        $( $pattern )|+ => Ok($bind.clone()),
+                        _ => Err(wrong_type(name, type_name, $label)),
+                    }
+                }
+            }
+        )*
+    };
 }
 
-impl FromColumn for u8 {
-    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
-        match column {
-            DecodedColumn::UInt8(values) => Ok(values.clone()),
-            _ => Err(wrong_type(name, type_name, "UInt8")),
-        }
+from_column_backing! {
+    u8, values, "UInt8" { DecodedColumn::UInt8(values) }
+    /// `Date` is days since the epoch on a `UInt16` backing.
+    u16, values, "UInt16" {
+        DecodedColumn::UInt16(values),
+        DecodedColumn::Date(values),
     }
-}
-
-impl FromColumn for i64 {
-    fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
-        match column {
-            DecodedColumn::Int64(values) => Ok(values.clone()),
-            _ => Err(wrong_type(name, type_name, "Int64")),
-        }
+    /// `DateTime` (epoch seconds) and `IPv4` share the `UInt32` backing.
+    u32, values, "UInt32" {
+        DecodedColumn::UInt32(values),
+        DecodedColumn::DateTime(values),
+        DecodedColumn::Ipv4(values),
+    }
+    u64, values, "UInt64" { DecodedColumn::UInt64(values) }
+    u128, values, "UInt128" { DecodedColumn::UInt128(values) }
+    i8, values, "Int8" { DecodedColumn::Int8(values) }
+    i16, values, "Int16" { DecodedColumn::Int16(values) }
+    /// `Date32` is signed days since the epoch; `Decimal32` its backing.
+    i32, values, "Int32" {
+        DecodedColumn::Int32(values),
+        DecodedColumn::Date32(values),
+        DecodedColumn::Decimal32 { values, .. },
+    }
+    /// `DateTime64` ticks and `Decimal64` backings are both `Int64`.
+    i64, values, "Int64" {
+        DecodedColumn::Int64(values),
+        DecodedColumn::DateTime64 { values, .. },
+        DecodedColumn::Decimal64 { values, .. },
+    }
+    i128, values, "Int128" {
+        DecodedColumn::Int128(values),
+        DecodedColumn::Decimal128 { values, .. },
+    }
+    f32, values, "Float32" { DecodedColumn::Float32(values) }
+    f64, values, "Float64" { DecodedColumn::Float64(values) }
+    /// 256-bit values have no native Rust type; the raw little-endian
+    /// blocks are handed back unchanged.
+    [u8; 32], values, "a 256-bit column" {
+        DecodedColumn::Int256(values),
+        DecodedColumn::UInt256(values),
+        DecodedColumn::Decimal256 { values, .. },
+    }
+    /// `UUID` and `IPv6` are both 16 raw wire bytes.
+    [u8; 16], values, "a 16-byte column" {
+        DecodedColumn::Uuid(values),
+        DecodedColumn::Ipv6(values),
     }
 }
 
@@ -454,21 +512,21 @@ impl FromColumn for bool {
     }
 }
 
-impl FromColumn for Option<String> {
+/// Any route that works on `T` works on `Nullable(T)`.
+///
+/// The Native wire carries a value for every row, null slots included, so
+/// the child converts whole and the mask then selects.
+impl<T: FromColumn> FromColumn for Option<T> {
     fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
         let DecodedColumn::Nullable { mask, child } = column else {
-            return Err(wrong_type(name, type_name, "Nullable(String)"));
+            return Err(wrong_type(name, type_name, "a Nullable column"));
         };
-        let DecodedColumn::String(values) = child.as_ref() else {
-            return Err(wrong_type(name, type_name, "Nullable(String)"));
-        };
-        mask.iter()
+        let values = T::from_column(child, name, type_name)?;
+        Ok(mask
+            .iter()
             .zip(values)
-            .map(|(&is_null, v)| match is_null {
-                0 => Ok(Some(std::str::from_utf8(v)?.to_owned())),
-                _ => Ok(None),
-            })
-            .collect()
+            .map(|(&is_null, v)| if is_null == 0 { Some(v) } else { None })
+            .collect())
     }
 }
 
@@ -1813,6 +1871,232 @@ mod tests {
         );
     }
 
+    /// Every scalar the decoder can produce must have a `column_as` route.
+    /// The Docker type matrix reads its columns this way, so a type that
+    /// decodes but cannot be read back is a hole the matrix cannot cover.
+    /// Split by group only to stay under the function-length lint.
+    #[test]
+    fn column_as_covers_every_numeric_scalar() {
+        assert_eq!(
+            block_of("UInt8", DecodedColumn::UInt8(vec![7]))
+                .column_as::<u8>("c")
+                .unwrap(),
+            vec![7u8]
+        );
+        assert_eq!(
+            block_of("UInt16", DecodedColumn::UInt16(vec![7]))
+                .column_as::<u16>("c")
+                .unwrap(),
+            vec![7u16]
+        );
+        assert_eq!(
+            block_of("UInt32", DecodedColumn::UInt32(vec![7]))
+                .column_as::<u32>("c")
+                .unwrap(),
+            vec![7u32]
+        );
+        assert_eq!(
+            block_of("UInt64", DecodedColumn::UInt64(vec![7]))
+                .column_as::<u64>("c")
+                .unwrap(),
+            vec![7u64]
+        );
+        assert_eq!(
+            block_of("UInt128", DecodedColumn::UInt128(vec![7]))
+                .column_as::<u128>("c")
+                .unwrap(),
+            vec![7u128]
+        );
+        assert_eq!(
+            block_of("Int8", DecodedColumn::Int8(vec![-7]))
+                .column_as::<i8>("c")
+                .unwrap(),
+            vec![-7i8]
+        );
+        assert_eq!(
+            block_of("Int16", DecodedColumn::Int16(vec![-7]))
+                .column_as::<i16>("c")
+                .unwrap(),
+            vec![-7i16]
+        );
+        assert_eq!(
+            block_of("Int32", DecodedColumn::Int32(vec![-7]))
+                .column_as::<i32>("c")
+                .unwrap(),
+            vec![-7i32]
+        );
+        assert_eq!(
+            block_of("Int64", DecodedColumn::Int64(vec![-7]))
+                .column_as::<i64>("c")
+                .unwrap(),
+            vec![-7i64]
+        );
+        assert_eq!(
+            block_of("Int128", DecodedColumn::Int128(vec![-7]))
+                .column_as::<i128>("c")
+                .unwrap(),
+            vec![-7i128]
+        );
+        assert_eq!(
+            block_of("Float32", DecodedColumn::Float32(vec![1.5]))
+                .column_as::<f32>("c")
+                .unwrap(),
+            vec![1.5f32]
+        );
+        assert_eq!(
+            block_of("Float64", DecodedColumn::Float64(vec![1.5]))
+                .column_as::<f64>("c")
+                .unwrap(),
+            vec![1.5f64]
+        );
+    }
+
+    /// Types whose Rust shape is their backing, not a type of their own.
+    #[test]
+    fn column_as_covers_types_carried_on_another_backing() {
+        assert_eq!(
+            block_of("Date", DecodedColumn::Date(vec![19_000]))
+                .column_as::<u16>("c")
+                .unwrap(),
+            vec![19_000u16]
+        );
+        assert_eq!(
+            block_of("Date32", DecodedColumn::Date32(vec![-1]))
+                .column_as::<i32>("c")
+                .unwrap(),
+            vec![-1i32]
+        );
+        assert_eq!(
+            block_of("DateTime", DecodedColumn::DateTime(vec![1_700_000_000]))
+                .column_as::<u32>("c")
+                .unwrap(),
+            vec![1_700_000_000u32]
+        );
+        assert_eq!(
+            block_of("IPv4", DecodedColumn::Ipv4(vec![0x0100_007f]))
+                .column_as::<u32>("c")
+                .unwrap(),
+            vec![0x0100_007fu32]
+        );
+        assert_eq!(
+            block_of(
+                "DateTime64(3)",
+                DecodedColumn::DateTime64 {
+                    precision: 3,
+                    timezone: None,
+                    values: vec![1_700_000_000_000],
+                }
+            )
+            .column_as::<i64>("c")
+            .unwrap(),
+            vec![1_700_000_000_000i64]
+        );
+        assert_eq!(
+            block_of(
+                "Decimal(9, 2)",
+                DecodedColumn::Decimal32 {
+                    precision: 9,
+                    scale: 2,
+                    values: vec![12_345],
+                }
+            )
+            .column_as::<i32>("c")
+            .unwrap(),
+            vec![12_345i32]
+        );
+        assert_eq!(
+            block_of(
+                "Decimal(18, 2)",
+                DecodedColumn::Decimal64 {
+                    precision: 18,
+                    scale: 2,
+                    values: vec![12_345],
+                }
+            )
+            .column_as::<i64>("c")
+            .unwrap(),
+            vec![12_345i64]
+        );
+        assert_eq!(
+            block_of(
+                "Decimal(38, 2)",
+                DecodedColumn::Decimal128 {
+                    precision: 38,
+                    scale: 2,
+                    values: vec![12_345],
+                }
+            )
+            .column_as::<i128>("c")
+            .unwrap(),
+            vec![12_345i128]
+        );
+    }
+
+    /// 256-bit and 16-byte columns come back as their raw wire blocks; the
+    /// last two cases pin `Bool` and the `Nullable` blanket.
+    #[test]
+    fn column_as_covers_wide_bool_and_nullable_columns() {
+        assert_eq!(
+            block_of(
+                "Decimal(76, 2)",
+                DecodedColumn::Decimal256 {
+                    precision: 76,
+                    scale: 2,
+                    values: vec![[9u8; 32]],
+                }
+            )
+            .column_as::<[u8; 32]>("c")
+            .unwrap(),
+            vec![[9u8; 32]]
+        );
+        assert_eq!(
+            block_of("Int256", DecodedColumn::Int256(vec![[1u8; 32]]))
+                .column_as::<[u8; 32]>("c")
+                .unwrap(),
+            vec![[1u8; 32]]
+        );
+        assert_eq!(
+            block_of("UInt256", DecodedColumn::UInt256(vec![[2u8; 32]]))
+                .column_as::<[u8; 32]>("c")
+                .unwrap(),
+            vec![[2u8; 32]]
+        );
+        assert_eq!(
+            block_of("UUID", DecodedColumn::Uuid(vec![[3u8; 16]]))
+                .column_as::<[u8; 16]>("c")
+                .unwrap(),
+            vec![[3u8; 16]]
+        );
+        assert_eq!(
+            block_of("IPv6", DecodedColumn::Ipv6(vec![[4u8; 16]]))
+                .column_as::<[u8; 16]>("c")
+                .unwrap(),
+            vec![[4u8; 16]]
+        );
+
+        // Bool shares the UInt8 backing; any non-zero byte is true.
+        assert_eq!(
+            block_of("Bool", DecodedColumn::UInt8(vec![0, 1, 2]))
+                .column_as::<bool>("c")
+                .unwrap(),
+            vec![false, true, true]
+        );
+
+        // Nullable routes through whatever route the child has.
+        assert_eq!(
+            block_of(
+                "Nullable(UInt64)",
+                DecodedColumn::Nullable {
+                    mask: vec![0, 1],
+                    child: Box::new(DecodedColumn::UInt64(vec![9, 0])),
+                }
+            )
+            .column_as::<Option<u64>>("c")
+            .unwrap(),
+            vec![Some(9u64), None]
+        );
+    }
+
     #[test]
     fn column_as_names_the_column_and_both_types_on_mismatch() {
         let block = block_of("UInt64", DecodedColumn::UInt64(vec![1]));
@@ -2027,9 +2311,42 @@ mod tests {
         body
     }
 
+    /// A runner that writes its counterexample to a file rather than only to
+    /// the log, so a CI failure is reproducible. `Direct` and not `WithSource`
+    /// because these run through `TestRunner`, which has no `source_file`.
+    fn persisting_runner() -> proptest::test_runner::TestRunner {
+        use proptest::test_runner::{Config, FileFailurePersistence, TestRunner};
+        TestRunner::new(Config {
+            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+                "proptest-regressions/native-decode.txt",
+            ))),
+            ..Config::default()
+        })
+    }
+
+    /// Assert what a successful decode must satisfy: one column per schema
+    /// entry, and every column exactly `rows` long. A decoder that fabricated
+    /// rows the wire never backed would fail the second. `Unsupported` is
+    /// exempt because it deliberately reports zero rows (`:314-316`).
+    fn assert_block_is_consistent(
+        block: &DecodedBlock,
+        rows: u64,
+    ) -> Result<(), proptest::test_runner::TestCaseError> {
+        use proptest::prelude::*;
+        prop_assert_eq!(block.schema.len(), block.columns.len());
+        for column in &block.columns {
+            if matches!(column, DecodedColumn::Unsupported(_)) {
+                continue;
+            }
+            let got = u64::try_from(column.row_count()).expect("row count fits u64");
+            prop_assert_eq!(got, rows);
+        }
+        Ok(())
+    }
+
     /// Truncated and byte-flipped block bodies, at row and column counts drawn
-    /// from the generator. Every input must either decode or error; none may
-    /// panic, hang, or commit memory the wire never backs.
+    /// from the generator. Every input must either decode or error, and no
+    /// input may panic.
     #[test]
     fn decode_block_survives_truncation_and_garbage() {
         use proptest::prelude::*;
@@ -2039,7 +2356,7 @@ mod tests {
             .expect("a current-thread runtime");
         let body = valid_block_body();
 
-        let mut runner = proptest::test_runner::TestRunner::default();
+        let mut runner = persisting_runner();
         let strategy = (
             0..=body.len(),
             any::<u8>(),
@@ -2059,7 +2376,7 @@ mod tests {
                     decode_block(&mut Cursor::new(wire), columns, rows, REV).await
                 });
                 if let Ok(block) = outcome {
-                    prop_assert_eq!(block.schema.len(), block.columns.len());
+                    assert_block_is_consistent(&block, rows)?;
                 }
                 Ok(())
             })
@@ -2075,7 +2392,7 @@ mod tests {
             .build()
             .expect("a current-thread runtime");
 
-        let mut runner = proptest::test_runner::TestRunner::default();
+        let mut runner = persisting_runner();
         let strategy = (
             proptest::collection::vec(any::<u8>(), 0..=PROP_MAX_WIRE_BYTES),
             1..=PROP_MAX_ROWS,
@@ -2087,7 +2404,7 @@ mod tests {
                     decode_block(&mut Cursor::new(wire), columns, rows, REV).await
                 });
                 if let Ok(block) = outcome {
-                    prop_assert_eq!(block.schema.len(), block.columns.len());
+                    assert_block_is_consistent(&block, rows)?;
                 }
                 Ok(())
             })

@@ -13,6 +13,7 @@ edition = "2024"
 # Upstream's MSRV. Keep in step with rust-toolchain.toml.
 rust-version = "1.89.0"
 description = "HyperI extensions for the official ClickHouse Rust client: TCP transport, dynamic inserts, unified client"
+authors = ["HYPERI PTY LIMITED <dev@hyperi.io>"]
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/clickhouse-dfe"
 publish = true
@@ -38,9 +39,13 @@ tls = [
 # Block compression is upstream's; this crate negotiates `None` on TCP.
 lz4 = ["clickhouse/lz4"]
 zstd = ["clickhouse/zstd"]
-dynamic = ["dep:serde_json"]
+# `ext` carries the server-exception parser the insert-error classifier reads
+# the ClickHouse error code out of.
+dynamic = ["dep:serde_json", "ext"]
 unified = ["tcp"]
 ext = []
+# No module of its own -- it forwards `clickhouse/inserter`, which a consumer
+# of this crate cannot enable on the upstream dependency any other way.
 inserter = ["clickhouse/inserter"]
 full = [
     "tcp",
@@ -91,6 +96,7 @@ tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
 serde_json = ">=1.0.149, <2"
 dotenvy = ">=0.15.7, <0.16"
 static_assertions = ">=1.1, <2"
+tempfile = ">=3.24, <4"
 proptest = { version = ">=1.11.0, <2", default-features = false, features = ["std", "bit-set"] }
 
 # Upstream's lint set plus `unsafe_code = "deny"`.

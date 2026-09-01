@@ -1,8 +1,11 @@
 # clickhouse-dfe docs
 
-This is the docs index, and it is deliberately thin while the crate is being
-built out. The working plan that drives the stages lives outside this repo at
-`clickhouse-rs/.hyperi-ai/plans/2026-09-01-clickhouse-dfe.md`, and the design
-rationale for each layer goes in code comments at the point of use so that a
-file cherry-picked upstream carries its reasoning with it. A proper docs pass
-lands once the TCP and dynamic layers are in place.
+Start at the [README](../README.md): it is the crate's front page, the feature
+table and the quick start, and it is what renders on docs.rs.
+
+Design rationale lives in code comments at the point of use, so a file
+cherry-picked into another repository carries its reasoning with it. That is
+deliberate -- this index stays thin rather than duplicating what the source
+already says and would drift from.
+
+Per-layer notes land here as each grows past what a comment can carry.

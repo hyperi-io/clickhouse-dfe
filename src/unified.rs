@@ -28,6 +28,7 @@ const JSON_AS_STRING: &str = "output_format_native_write_json_as_string";
 
 /// Which wire protocol a [`UnifiedClient`] answers on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     Http,
     Tcp,
@@ -36,6 +37,7 @@ pub enum Transport {
 /// A ClickHouse client over either transport, cloned as cheaply as the inner
 /// client. Configure that inner client with its own builder.
 #[derive(Clone)]
+#[non_exhaustive]
 pub enum UnifiedClient {
     Http(Client),
     Tcp(TcpClient),
@@ -46,6 +48,27 @@ impl UnifiedClient {
         match self {
             Self::Http(_) => Transport::Http,
             Self::Tcp(_) => Transport::Tcp,
+        }
+    }
+
+    /// The inner HTTP client, for the operations only HTTP has -- notably
+    /// `insert_formatted_with`, since the native protocol accepts no format
+    /// but Native. `None` on the TCP arm.
+    #[must_use]
+    pub fn as_http(&self) -> Option<&Client> {
+        match self {
+            Self::Http(client) => Some(client),
+            Self::Tcp(_) => None,
+        }
+    }
+
+    /// The inner TCP client, for the operations only the native protocol has.
+    /// `None` on the HTTP arm.
+    #[must_use]
+    pub fn as_tcp(&self) -> Option<&TcpClient> {
+        match self {
+            Self::Tcp(client) => Some(client),
+            Self::Http(_) => None,
         }
     }
 
@@ -96,7 +119,8 @@ impl UnifiedClient {
     ///
     /// # Errors
     ///
-    /// TCP only: the schema query failing, or the table having no columns.
+    /// TCP only: [`crate::Error::Dynamic`] if the schema query fails or the
+    /// table has no columns. Both are retriable once the cache is cold.
     #[cfg(feature = "dynamic")]
     #[cfg_attr(docsrs, doc(cfg(feature = "dynamic")))]
     pub async fn dynamic_insert(
@@ -108,37 +132,39 @@ impl UnifiedClient {
         use crate::dynamic::DynamicInsert;
         use crate::dynamic::schema::{schema_from_system_columns, system_columns_sql};
 
-        match self {
-            Self::Http(client) => Ok(DynamicInsert::http(client.clone(), database, table, cache)),
-            Self::Tcp(client) => {
-                let full = format!("{database}.{table}");
-                let schema = match cache.get(&full) {
-                    Some(cached) => cached,
-                    None => {
-                        let columns = self
-                            .fetch_columns(&system_columns_sql(database, table))
-                            .await?;
-                        let rows = columns
-                            .get::<String>("name")?
-                            .into_iter()
-                            .zip(columns.get::<String>("col_type")?)
-                            .zip(columns.get::<String>("default_kind")?)
-                            .map(|((name, col_type), kind)| (name, col_type, kind));
-                        let fetched = schema_from_system_columns(full.clone(), rows)
-                            .map_err(|e| crate::Error::Other(Box::new(e)))?;
-                        cache.insert(&full, fetched.clone());
-                        fetched
-                    }
-                };
-                Ok(DynamicInsert::tcp(client.clone(), database, table, schema))
+        let client = match self {
+            Self::Http(client) => {
+                return Ok(DynamicInsert::http(client.clone(), database, table, cache));
             }
-        }
+            Self::Tcp(client) => client,
+        };
+
+        let full = format!("{database}.{table}");
+        let schema = match cache.get(&full) {
+            Some(cached) => cached,
+            None => {
+                let columns = self
+                    .fetch_columns(&system_columns_sql(database, table))
+                    .await?;
+                let rows = columns
+                    .get::<String>("name")?
+                    .into_iter()
+                    .zip(columns.get::<String>("col_type")?)
+                    .zip(columns.get::<String>("default_kind")?)
+                    .map(|((name, col_type), kind)| (name, col_type, kind));
+                let fetched = schema_from_system_columns(full.clone(), rows)?;
+                cache.insert(&full, std::sync::Arc::clone(&fetched));
+                fetched
+            }
+        };
+        Ok(DynamicInsert::tcp(client.clone(), database, table, schema))
     }
 }
 
 /// A whole result set, column-oriented. Blocks are held as the server sent
 /// them and flattened on read.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct Columns {
     blocks: Vec<DecodedBlock>,
 }
@@ -455,6 +481,58 @@ mod tests {
         assert_eq!(columns.get::<String>("name").unwrap(), NAMES);
 
         let _sock = server.await.unwrap();
+    }
+
+    /// The server splits a result set into blocks of its own choosing, so a
+    /// read has to concatenate them in the order they arrived.
+    #[tokio::test]
+    async fn get_flattens_values_across_blocks_in_server_order() {
+        let (client, server) = scripted(|mut sock: TcpStream| async move {
+            write_schema_block(&mut sock, &[("name", "String")]).await;
+            write_string_payload_block(&mut sock, &[("name", &["a", "b"])]).await;
+            write_string_payload_block(&mut sock, &[("name", &["c"])]).await;
+            write_string_payload_block(&mut sock, &[("name", &["d", "e"])]).await;
+            end_of_stream(&mut sock).await;
+            sock
+        })
+        .await;
+
+        let columns = client.fetch_columns("SELECT name").await.unwrap();
+
+        assert_eq!(columns.rows(), 5);
+        assert_eq!(columns.get::<String>("name").unwrap(), ["a", "b", "c", "d", "e"]);
+
+        let _sock = server.await.unwrap();
+    }
+
+    /// A ping is only useful if a server rejection reaches the caller rather
+    /// than reading as a healthy round trip.
+    #[tokio::test]
+    async fn ping_surfaces_a_server_rejection() {
+        let mock = Mock::new();
+        // 60 = UNKNOWN_TABLE, returned the way the server returns one.
+        mock.add(handlers::exception(60));
+        let client = UnifiedClient::Http(Client::default().with_url(mock.url()));
+
+        let err = client.ping().await.expect_err("the mock rejects");
+
+        assert!(
+            matches!(err, crate::Error::BadResponse(_)),
+            "a rejection must not read as success: {err:?}"
+        );
+    }
+
+    /// The transport-specific escape hatches: each arm hands back its own
+    /// client and nothing else.
+    #[test]
+    fn as_http_and_as_tcp_expose_only_their_own_arm() {
+        let http = UnifiedClient::Http(Client::default());
+        assert!(http.as_http().is_some());
+        assert!(http.as_tcp().is_none());
+
+        let tcp = UnifiedClient::Tcp(TcpClient::new("127.0.0.1:9000"));
+        assert!(tcp.as_tcp().is_some());
+        assert!(tcp.as_http().is_none());
     }
 
     #[cfg(feature = "dynamic")]

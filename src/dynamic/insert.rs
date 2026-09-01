@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: BUSL-1.1
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   dfe-loader
-// File:      src/clickhouse_ext/insert.rs
+// Project:   clickhouse-dfe
+// File:      src/dynamic/insert.rs
 // Purpose:   DynamicInsert adapter over the clickhouse-rs RowBinary/Native sinks
 // Language:  Rust
 //
@@ -13,16 +13,16 @@
 //!
 //! [`DynamicInsert`] encodes each `Map<String, Value>` against a
 //! [`DynamicSchema`] and ships the rows through one of two sinks, both fed the
-//! same [`DynamicRow::encode`] bytes:
+//! same [`DynamicRow::encode_into`] bytes:
 //!
 //! - HTTP -- `Client::insert_formatted_with(... FORMAT RowBinary)`, written
 //!   row-wise. The schema is read from `system.columns` on the first write and
 //!   cached.
 //! - TCP (`tcp` feature) -- `TcpClient::insert_native(... FORMAT Native)`, with
 //!   the rows transposed into columnar blocks by
-//!   [`crate::native::encode_columns`]. The caller supplies the schema, because
-//!   reading `system.columns` over TCP needs a typed cursor the crate does not
-//!   have yet.
+//!   [`crate::native::encode_columns`]. The schema is supplied by the caller,
+//!   which [`crate::unified::UnifiedClient::dynamic_insert`] reads over the
+//!   same TCP connection before opening the insert.
 //!
 //! On a schema-mismatch error the HTTP path invalidates the cached schema so
 //! the next insert re-fetches.
@@ -47,8 +47,17 @@ use crate::tcp::{TcpClient, TcpInsertSession};
 /// columns on the wire.
 const JSON_AS_STRING_SETTING: &str = "input_format_binary_read_json_as_string";
 
+/// Flush a TCP block once it reaches this many encoded bytes, whichever of
+/// bytes or rows comes first. The row cap alone lets a wide row buffer a
+/// gigabyte before the first send.
+#[cfg(feature = "tcp")]
+const BLOCK_FLUSH_BYTES: usize = 1 << 20;
+
 /// Backtick-quote a SQL identifier using upstream's own escaper, so an
 /// identifier is quoted the same way here and in `clickhouse::Client`.
+///
+/// Upstream's `sql::escape` module is `pub(crate)` as of 0.15.2, so `_priv` is
+/// the only public route to it.
 fn escape_ident(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 2);
     let _ = clickhouse::_priv::sql_escape_identifier(name, &mut out);
@@ -74,8 +83,54 @@ enum OpenSink {
         /// Native block headers for the insert columns, parsed once.
         native: Vec<ColumnSchema>,
         /// RowBinary rows held for the next Native block.
-        block: Vec<Vec<u8>>,
+        block: RowBlock,
     },
+}
+
+/// Rows buffered for the next Native block, with the row buffers recycled
+/// between blocks.
+///
+/// [`crate::native::encode_columns`] transposes from `&[Vec<u8>]`, so each row
+/// stays its own `Vec`; `spare` hands the emptied ones back on the next block
+/// so a steady-state insert allocates once, not once per row.
+#[cfg(feature = "tcp")]
+#[derive(Default)]
+struct RowBlock {
+    rows: Vec<Vec<u8>>,
+    spare: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+#[cfg(feature = "tcp")]
+impl RowBlock {
+    fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Encode one row into a recycled buffer. A row that fails to encode
+    /// returns its buffer to the pool and leaves the block unchanged.
+    fn push(&mut self, row: &DynamicRow<'_>) -> Result<(), DynamicError> {
+        let mut buf = self.spare.pop().unwrap_or_default();
+        buf.clear();
+        if let Err(e) = row.encode_into(&mut buf) {
+            self.spare.push(buf);
+            return Err(e);
+        }
+        self.bytes += buf.len();
+        self.rows.push(buf);
+        Ok(())
+    }
+
+    /// Whether the block has hit either flush trigger.
+    fn is_full(&self, row_cap: u64) -> bool {
+        self.bytes >= BLOCK_FLUSH_BYTES || self.rows.len() as u64 >= row_cap
+    }
+
+    /// Take the rows for a send, keeping their buffers for the next block.
+    fn recycle(&mut self) {
+        self.spare.append(&mut self.rows);
+        self.bytes = 0;
+    }
 }
 
 /// The open INSERT: the column subset fixed by the first row, and the sink
@@ -91,11 +146,12 @@ struct Active {
 /// schema fetched from `system.columns`. As simple to drive as JSONEachRow,
 /// but binary on the wire so the server skips JSON parsing.
 #[must_use = "a DynamicInsert must be finished with `.end().await` to commit the rows"]
+#[non_exhaustive]
 pub struct DynamicInsert {
     backend: Backend,
     database: String,
     table: String,
-    schema: Option<DynamicSchema>,
+    schema: Option<Arc<DynamicSchema>>,
     active: Option<Active>,
     rows_written: u64,
 }
@@ -123,10 +179,15 @@ impl DynamicInsert {
     }
 
     /// Insert over the native protocol against a caller-supplied schema.
-    /// There is nothing to fetch or cache here: `system.columns` is only
-    /// readable over HTTP until the typed TCP cursor lands.
+    /// Nothing is fetched or cached here -- the caller resolved the schema
+    /// before opening the insert.
     #[cfg(feature = "tcp")]
-    pub fn tcp(client: TcpClient, database: &str, table: &str, schema: DynamicSchema) -> Self {
+    pub fn tcp(
+        client: TcpClient,
+        database: &str,
+        table: &str,
+        schema: Arc<DynamicSchema>,
+    ) -> Self {
         Self {
             backend: Backend::Tcp(client),
             database: database.to_string(),
@@ -152,7 +213,7 @@ impl DynamicInsert {
                 Some(cached) => cached,
                 None => {
                     let fetched = fetch_dynamic_schema(client, &self.database, &self.table).await?;
-                    cache.insert(&full, fetched.clone());
+                    cache.insert(&full, Arc::clone(&fetched));
                     fetched
                 }
             },
@@ -218,19 +279,19 @@ impl DynamicInsert {
                 let sql = format!("INSERT INTO {target} ({cols_sql}) FORMAT Native");
                 let headers: Vec<(String, String)> = columns
                     .iter()
-                    .map(|c| (c.name.clone(), c.type_string.clone()))
+                    .map(|c| (c.name.clone(), c.ty.raw.clone()))
                     .collect();
                 let native =
-                    ColumnSchema::from_headers(&headers).map_err(|e| classify_error(&full, &e))?;
+                    ColumnSchema::from_headers(&headers).map_err(|e| classify_error(&full, e))?;
                 // Empty query id: the server allocates one.
                 let session = client
                     .insert_native("", &sql)
                     .await
-                    .map_err(|e| classify_error(&full, &e))?;
+                    .map_err(|e| classify_error(&full, e))?;
                 OpenSink::Tcp {
                     session,
                     native,
-                    block: Vec::new(),
+                    block: RowBlock::default(),
                 }
             }
         };
@@ -250,10 +311,10 @@ impl DynamicInsert {
         self.write(row, &[], None).await
     }
 
-    /// Like [`write_map`][Self::write_map], but the named columns are written
-    /// from pre-encoded raw bytes (e.g. the original payload for `_json`),
-    /// avoiding a re-serialise. Only the first raw column is threaded through
-    /// the encoder's zero-copy passthrough; any others fall back to the row map.
+    /// Like [`write_map`][Self::write_map], but `raw` names one column written
+    /// from pre-encoded bytes (e.g. the original payload for `_json`), skipping
+    /// a re-serialise. The column is included in the INSERT even when the row
+    /// map does not carry it.
     ///
     /// # Errors
     ///
@@ -261,11 +322,9 @@ impl DynamicInsert {
     pub async fn write_map_with_raw(
         &mut self,
         row: &Map<String, Value>,
-        raw_columns: &[(&str, &[u8])],
+        raw: (&str, &[u8]),
     ) -> Result<(), DynamicError> {
-        let raw_names: Vec<&str> = raw_columns.iter().map(|(n, _)| *n).collect();
-        self.write(row, &raw_names, raw_columns.first().copied())
-            .await
+        self.write(row, &[raw.0], Some(raw)).await
     }
 
     async fn write(
@@ -287,22 +346,21 @@ impl DynamicInsert {
                     message: "insert sink not initialised".to_string(),
                 })?;
 
-        let bytes = match raw {
+        let dynamic_row = match raw {
             Some((json_col, raw_bytes)) => DynamicRow::with_raw(row, columns, raw_bytes, json_col),
             None => DynamicRow::new(row, columns),
-        }
-        .encode()?;
+        };
 
         match sink {
-            OpenSink::Http(insert) => insert.write_buffered(&bytes),
+            OpenSink::Http(insert) => insert.write_buffered(&dynamic_row.encode()?),
             #[cfg(feature = "tcp")]
             OpenSink::Tcp {
                 session,
                 native,
                 block,
             } => {
-                block.push(bytes);
-                if block.len() as u64 >= TcpClient::DEFAULT_INSERT_BLOCK_ROWS {
+                block.push(&dynamic_row)?;
+                if block.is_full(TcpClient::DEFAULT_INSERT_BLOCK_ROWS) {
                     send_block(session, native, block, &full).await?;
                 }
             }
@@ -326,7 +384,7 @@ impl DynamicInsert {
             None => Ok(()),
             Some(active) => match active.sink {
                 OpenSink::Http(mut insert) => {
-                    insert.end().await.map_err(|e| classify_error(&full, &e))
+                    insert.end().await.map_err(|e| classify_error(&full, e))
                 }
                 #[cfg(feature = "tcp")]
                 OpenSink::Tcp {
@@ -337,7 +395,7 @@ impl DynamicInsert {
                     Ok(()) => session
                         .finish()
                         .await
-                        .map_err(|e| classify_error(&full, &e)),
+                        .map_err(|e| classify_error(&full, e)),
                     Err(e) => {
                         session.abort();
                         Err(e)
@@ -377,7 +435,7 @@ impl DynamicInsert {
     /// The resolved schema, if it has been loaded.
     #[must_use]
     pub fn schema(&self) -> Option<&DynamicSchema> {
-        self.schema.as_ref()
+        self.schema.as_deref()
     }
 }
 
@@ -386,20 +444,20 @@ impl DynamicInsert {
 async fn send_block(
     session: &TcpInsertSession,
     native: &[ColumnSchema],
-    block: &mut Vec<Vec<u8>>,
+    block: &mut RowBlock,
     full_table: &str,
 ) -> Result<(), DynamicError> {
     if block.is_empty() {
         return Ok(());
     }
-    let bytes = encode_columns(block, native, session.server_revision)
-        .map_err(|e| classify_error(full_table, &e))?;
-    let rows = block.len() as u64;
-    block.clear();
+    let bytes = encode_columns(&block.rows, native, session.server_revision)
+        .map_err(|e| classify_error(full_table, e))?;
+    let rows = block.rows.len() as u64;
+    block.recycle();
     session
         .send_block(bytes, native.len() as u64, rows)
         .await
-        .map_err(|e| classify_error(full_table, &e))
+        .map_err(|e| classify_error(full_table, e))
 }
 
 /// Choose the columns to include in the INSERT: every column present in the
@@ -421,21 +479,58 @@ fn select_columns(
         .collect()
 }
 
-/// Classify a transport error as a schema mismatch (cached schema is stale) or
-/// a generic encoding/transport error. Schema mismatch covers explicit
-/// column/type errors and the data-format errors that indicate schema drift.
-fn classify_error(full_table: &str, e: &impl std::fmt::Display) -> DynamicError {
-    let msg = e.to_string();
-    let mismatch = msg.contains("UNKNOWN_IDENTIFIER")
-        || msg.contains("NO_SUCH_COLUMN")
-        || msg.contains("THERE_IS_NO_COLUMN")
-        || msg.contains("TYPE_MISMATCH")
-        || msg.contains("ILLEGAL_COLUMN")
-        || msg.contains("CANNOT_PARSE")
-        || msg.contains("cannot parse")
-        || msg.contains("INCORRECT_DATA")
-        || msg.contains("incorrect data")
-        || msg.contains("Code: 117");
+/// ClickHouse error codes that say the cached schema no longer matches the
+/// table, so re-fetching it and retrying is the right response. Names are the
+/// upstream `ErrorCodes.cpp` ones.
+const SCHEMA_DRIFT_CODES: &[i32] = &[
+    6,   // CANNOT_PARSE_TEXT
+    8,   // THERE_IS_NO_COLUMN
+    16,  // NO_SUCH_COLUMN_IN_TABLE
+    26,  // CANNOT_PARSE_QUOTED_STRING
+    27,  // CANNOT_PARSE_INPUT_ASSERTION_FAILED
+    41,  // CANNOT_PARSE_DATETIME
+    44,  // ILLEGAL_COLUMN
+    47,  // UNKNOWN_IDENTIFIER
+    53,  // TYPE_MISMATCH
+    117, // INCORRECT_DATA
+];
+
+/// Classify a sink error as schema drift (the cached schema is stale) or a
+/// generic encoding/transport failure.
+///
+/// The code is read structurally wherever the error carries one, so this does
+/// not become a second opinion on what the server's message wording means. The
+/// substrings are the fallback for a rejection that carries no code at all --
+/// a proxy page, or a body [`ServerException::parse`] declines.
+///
+/// [`ServerException::parse`]: crate::ext::ServerException::parse
+fn classify_error(full_table: &str, e: impl Into<crate::Error>) -> DynamicError {
+    let err: crate::Error = e.into();
+    let code = match &err {
+        crate::Error::ServerException { code, .. } => Some(*code),
+        crate::Error::BadResponse(body) => {
+            crate::ext::ServerException::parse(&clickhouse::error::Error::BadResponse(body.clone()))
+                .map(|exc| exc.code)
+        }
+        _ => None,
+    };
+
+    let msg = err.to_string();
+    let mismatch = match code {
+        Some(code) => SCHEMA_DRIFT_CODES.contains(&code),
+        None => {
+            msg.contains("UNKNOWN_IDENTIFIER")
+                || msg.contains("NO_SUCH_COLUMN")
+                || msg.contains("THERE_IS_NO_COLUMN")
+                || msg.contains("TYPE_MISMATCH")
+                || msg.contains("ILLEGAL_COLUMN")
+                || msg.contains("CANNOT_PARSE")
+                || msg.contains("cannot parse")
+                || msg.contains("INCORRECT_DATA")
+                || msg.contains("incorrect data")
+        }
+    };
+
     if mismatch {
         DynamicError::SchemaMismatch {
             table: full_table.to_string(),
@@ -486,17 +581,60 @@ mod tests {
         assert!(cols.iter().any(|c| c.name == "_json"));
     }
 
+    /// The code decides where the server sent one, so a reworded message does
+    /// not change the classification.
     #[test]
-    fn classify_recognises_schema_drift() {
-        let e = clickhouse::error::Error::Custom("Code: 117. DB::Exception: incorrect data".into());
+    fn classify_reads_the_error_code_not_the_message() {
+        let drift = clickhouse::error::Error::BadResponse(
+            "Code: 47. DB::Exception: Missing columns: 'nope' (UNKNOWN_IDENTIFIER) \
+             (version 26.2.4.23)"
+                .into(),
+        );
+        assert!(
+            matches!(
+                classify_error("db.t", drift),
+                DynamicError::SchemaMismatch { .. }
+            ),
+            "code 47 is schema drift"
+        );
+
+        // 241 = MEMORY_LIMIT_EXCEEDED: a real rejection, but not schema drift,
+        // so the cached schema must not be thrown away over it.
+        let not_drift = clickhouse::error::Error::BadResponse(
+            "Code: 241. DB::Exception: Memory limit exceeded (MEMORY_LIMIT_EXCEEDED)".into(),
+        );
         assert!(matches!(
-            classify_error("db.t", &e),
+            classify_error("db.t", not_drift),
+            DynamicError::EncodingError { .. }
+        ));
+
+        // A typed variant carries the code without any text to parse.
+        assert!(matches!(
+            classify_error(
+                "db.t",
+                crate::Error::ServerException {
+                    code: 117,
+                    name: None,
+                    message: "incorrect data".into(),
+                    stack_trace: None,
+                }
+            ),
+            DynamicError::SchemaMismatch { .. }
+        ));
+    }
+
+    /// A body carrying no code at all still classifies off its text.
+    #[test]
+    fn classify_falls_back_to_the_message_without_a_code() {
+        let e = clickhouse::error::Error::Custom("incorrect data".into());
+        assert!(matches!(
+            classify_error("db.t", e),
             DynamicError::SchemaMismatch { .. }
         ));
 
         let e = clickhouse::error::Error::Custom("network reset".into());
         assert!(matches!(
-            classify_error("db.t", &e),
+            classify_error("db.t", e),
             DynamicError::EncodingError { .. }
         ));
     }
@@ -539,5 +677,69 @@ mod tests {
         let native = ColumnSchema::from_headers(&json).unwrap();
         let block = encode_columns(&[vec![2u8, b'{', b'}']], &native, 0).unwrap();
         assert_eq!(block.as_slice(), b"\x04data\x06String\x02{}");
+    }
+
+    /// Bytes, not just rows: a wide row must not buffer to the row cap first.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn a_block_flushes_on_bytes_long_before_the_row_cap() {
+        let columns = [ColumnDef::new("s", "String")];
+        let wide = "x".repeat(64 * 1024);
+        let row = json!({ "s": wide }).as_object().unwrap().clone();
+
+        let mut block = RowBlock::default();
+        let mut pushed = 0u64;
+        while !block.is_full(TcpClient::DEFAULT_INSERT_BLOCK_ROWS) {
+            block
+                .push(&DynamicRow::new(&row, &columns))
+                .expect("a String column always encodes");
+            pushed += 1;
+            assert!(pushed < 1_000, "the byte trigger never fired");
+        }
+        assert!(block.bytes >= BLOCK_FLUSH_BYTES);
+        assert!(pushed < TcpClient::DEFAULT_INSERT_BLOCK_ROWS);
+    }
+
+    /// The recycled buffers come back empty, so a second block does not
+    /// inherit the first block's bytes.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn recycling_a_block_reuses_the_buffers_and_resets_the_byte_count() {
+        let columns = [ColumnDef::new("s", "String")];
+        let row = json!({"s": "abc"}).as_object().unwrap().clone();
+
+        let mut block = RowBlock::default();
+        for _ in 0..4 {
+            block.push(&DynamicRow::new(&row, &columns)).unwrap();
+        }
+        assert_eq!(block.rows.len(), 4);
+        assert_eq!(block.bytes, 4 * 4);
+
+        block.recycle();
+        assert!(block.is_empty());
+        assert_eq!(block.bytes, 0);
+        assert_eq!(block.spare.len(), 4);
+
+        block.push(&DynamicRow::new(&row, &columns)).unwrap();
+        assert_eq!(block.rows.len(), 1);
+        assert_eq!(block.rows[0], vec![3, b'a', b'b', b'c']);
+        assert_eq!(block.bytes, 4);
+    }
+
+    /// A row the encoder rejects must not leave a half-written row behind.
+    #[cfg(feature = "tcp")]
+    #[test]
+    fn a_rejected_row_leaves_the_block_unchanged() {
+        let columns = [ColumnDef::new("a", "UInt8"), ColumnDef::new("b", "UInt8")];
+        let good = json!({"a": 1, "b": 2}).as_object().unwrap().clone();
+        let bad = json!({"a": 1, "b": 300}).as_object().unwrap().clone();
+
+        let mut block = RowBlock::default();
+        block.push(&DynamicRow::new(&good, &columns)).unwrap();
+        assert!(block.push(&DynamicRow::new(&bad, &columns)).is_err());
+
+        assert_eq!(block.rows.len(), 1);
+        assert_eq!(block.bytes, 2);
+        assert_eq!(block.rows[0], vec![1, 2]);
     }
 }

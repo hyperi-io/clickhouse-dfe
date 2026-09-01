@@ -17,9 +17,8 @@
 //! ```
 
 #![cfg(all(feature = "tcp", feature = "tls", feature = "dynamic"))]
-// A panic in a live test IS the failure signal, and the helpers below sit
-// outside `#[test]` so clippy's in-test exemption does not reach them.
-#![allow(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
+// Helpers sit outside #[test], so clippy's in-test exemption misses them.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::OnceLock;
 
@@ -39,7 +38,7 @@ struct Cluster {
     user: String,
     password: String,
     database: String,
-    cluster: String,
+    name: String,
 }
 
 fn required(key: &str) -> String {
@@ -64,7 +63,7 @@ fn cluster() -> &'static Cluster {
             user: required("CLICKHOUSE_USER"),
             password: std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
             database: required("CLICKHOUSE_DATABASE"),
-            cluster: required("CLICKHOUSE_CLUSTER"),
+            name: required("CLICKHOUSE_CLUSTER"),
         }
     })
 }
@@ -89,7 +88,7 @@ fn client() -> TcpClient {
 
 async fn create_tables(client: &TcpClient, table: &str) -> Result<()> {
     let c = cluster();
-    let (db, cl) = (&c.database, &c.cluster);
+    let (db, cl) = (&c.database, &c.name);
     client
         .query(&format!(
             "CREATE TABLE {db}.{table}_local ON CLUSTER {cl} \
@@ -109,7 +108,7 @@ async fn create_tables(client: &TcpClient, table: &str) -> Result<()> {
 
 async fn drop_tables(client: &TcpClient, table: &str) {
     let c = cluster();
-    let (db, cl) = (&c.database, &c.cluster);
+    let (db, cl) = (&c.database, &c.name);
     for name in [table.to_string(), format!("{table}_local")] {
         let _ = client
             .query(&format!(
@@ -120,15 +119,15 @@ async fn drop_tables(client: &TcpClient, table: &str) {
     }
 }
 
-fn schema(table: &str) -> DynamicSchema {
-    DynamicSchema::from_columns(
+fn schema(table: &str) -> std::sync::Arc<DynamicSchema> {
+    std::sync::Arc::new(DynamicSchema::from_columns(
         table,
         vec![
             ColumnDef::new("id", "UInt64"),
             ColumnDef::new("tag", "String"),
             ColumnDef::new("doc", "JSON"),
         ],
-    )
+    ))
 }
 
 fn row(id: u64, tag: &str, doc: &Value) -> Map<String, Value> {

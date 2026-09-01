@@ -16,9 +16,8 @@
     feature = "dynamic",
     feature = "unified"
 ))]
-// A panic in a live test IS the failure signal, and the helpers below sit
-// outside `#[test]` so clippy's in-test exemption does not reach them.
-#![allow(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
+// Helpers sit outside #[test], so clippy's in-test exemption misses them.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -40,7 +39,7 @@ struct Cluster {
     user: String,
     password: String,
     database: String,
-    cluster: String,
+    name: String,
 }
 
 fn required(key: &str) -> String {
@@ -61,7 +60,7 @@ fn cluster() -> &'static Cluster {
             user: required("CLICKHOUSE_USER"),
             password: std::env::var("CLICKHOUSE_PASSWORD").unwrap_or_default(),
             database: required("CLICKHOUSE_DATABASE"),
-            cluster: required("CLICKHOUSE_CLUSTER"),
+            name: required("CLICKHOUSE_CLUSTER"),
         }
     })
 }
@@ -103,7 +102,7 @@ fn http() -> UnifiedClient {
 
 async fn create_tables(client: &UnifiedClient, table: &str, columns: &str) -> Result<()> {
     let c = cluster();
-    let (db, cl) = (&c.database, &c.cluster);
+    let (db, cl) = (&c.database, &c.name);
     client
         .execute(&format!(
             "CREATE TABLE {db}.{table}_local ON CLUSTER {cl} ({columns}) \
@@ -120,7 +119,7 @@ async fn create_tables(client: &UnifiedClient, table: &str, columns: &str) -> Re
 
 async fn drop_tables(client: &UnifiedClient, table: &str) {
     let c = cluster();
-    let (db, cl) = (&c.database, &c.cluster);
+    let (db, cl) = (&c.database, &c.name);
     for name in [table.to_string(), format!("{table}_local")] {
         let _ = client
             .execute(&format!(
@@ -246,7 +245,12 @@ async fn dynamic_insert_round_trips_on_both_transports() {
     assert_eq!(tags.len(), 10);
     assert!(tags[..5].iter().all(|t| t == "tcp"));
     assert!(tags[5..].iter().all(|t| t == "http"));
-    assert_eq!(ns, ids.iter().map(|id| -(*id as i64)).collect::<Vec<i64>>());
+    assert_eq!(
+        ns,
+        ids.iter()
+            .map(|id| -i64::try_from(*id).expect("test ids are small"))
+            .collect::<Vec<i64>>()
+    );
 }
 
 async fn insert_and_read_back(db: &str, table: &str) -> Result<(Vec<u64>, Vec<String>, Vec<i64>)> {
@@ -258,7 +262,11 @@ async fn insert_and_read_back(db: &str, table: &str) -> Result<(Vec<u64>, Vec<St
         let mut insert = client.dynamic_insert(db, &local, cache).await?;
         for i in 0..5 {
             insert
-                .write_map(&row(base + i, tag, -((base + i) as i64)))
+                .write_map(&row(
+                    base + i,
+                    tag,
+                    -i64::try_from(base + i).expect("test ids are small"),
+                ))
                 .await
                 .map_err(|e| clickhouse_dfe::Error::Custom(e.to_string()))?;
         }

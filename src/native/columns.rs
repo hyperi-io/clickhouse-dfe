@@ -1803,6 +1803,38 @@ mod tests {
                 },
                 1,
             ),
+            // Fixed-width scalars: the payload is exactly rows x declared
+            // width, so a wrong width shows up as a leftover or a short read.
+            ("Bool", vec![0, 1, 1], 3),
+            ("Int8", vec![0u8; 2], 2),
+            ("Int16", vec![0u8; 4], 2),
+            ("Int32", vec![0u8; 8], 2),
+            ("UInt16", vec![0u8; 4], 2),
+            ("UInt32", vec![0u8; 8], 2),
+            ("UInt64", vec![0u8; 16], 2),
+            ("Float32", vec![0u8; 8], 2),
+            ("BFloat16", vec![0u8; 4], 2),
+            ("Int128", vec![0u8; 32], 2),
+            ("UInt128", vec![0u8; 16], 1),
+            ("Int256", vec![0u8; 32], 1),
+            ("UInt256", vec![0u8; 64], 2),
+            ("Date32", vec![0u8; 8], 2),
+            ("DateTime", vec![0u8; 8], 2),
+            ("Time", vec![0u8; 8], 2),
+            // Enums are their index width, not the member text.
+            ("Enum8('a' = 1, 'b' = 2)", vec![1, 2], 2),
+            ("Enum16('a' = 1)", vec![1, 0], 1),
+            // Decimal width follows precision; the scale never moves it.
+            ("Decimal(9, 2)", vec![0u8; 8], 2),
+            ("Decimal(38, 2)", vec![0u8; 16], 1),
+            ("Decimal(76, 2)", vec![0u8; 32], 1),
+            // The wrapper is stripped and the inner type read in its place.
+            ("SimpleAggregateFunction(sum, UInt64)", vec![0u8; 16], 2),
+            // Top-level Tuple is column-major: the UInt8, then the String.
+            ("Tuple(UInt8, String)", vec![9, 1, b'z'], 1),
+            // Nullable(String): the mask, then a value for every row, nulls
+            // included -- row 1's placeholder is a zero-length string.
+            ("Nullable(String)", vec![0, 1, 1, b'a', 0], 2),
             ("Variant(UInt8, String)", variant_payload(), 2),
             ("Dynamic", dynamic_v2_payload(), 2),
             ("Dynamic", dynamic_v3_payload(), 2),

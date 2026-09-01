@@ -13,22 +13,36 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
 use crate::native::io::{ClickHouseRead, ClickHouseWrite};
-use crate::tcp::protocol::{DBMS_TCP_PROTOCOL_VERSION, ServerPacketId};
+use crate::tcp::protocol::{ClientPacketId, DBMS_TCP_PROTOCOL_VERSION, ServerPacketId};
+use crate::tcp::writer::CLIENT_NAME;
 
 /// Consume the client Hello (8 fields), emit a ServerHello, consume the
 /// addendum quota key -- the smallest server
 /// [`crate::tcp::connect::open_handshaken`] accepts. The advertised
 /// revision is above the timezone, display-name, version-patch and
 /// addendum gates, so all four of those fields are on the wire.
+///
+/// The three transport-invariant fields are asserted here rather than
+/// discarded: a real server that read a shifted Hello would fail the
+/// connection, and a mock that replies regardless cannot. Database, user
+/// and password vary per caller, so they are only read for framing.
 pub(crate) async fn serve_one_handshake(sock: &mut TcpStream) {
-    let _ = sock.read_var_uint().await;
-    let _ = sock.read_utf8_string().await;
-    let _ = sock.read_var_uint().await;
-    let _ = sock.read_var_uint().await;
-    let _ = sock.read_var_uint().await;
-    let _ = sock.read_utf8_string().await;
-    let _ = sock.read_utf8_string().await;
-    let _ = sock.read_utf8_string().await;
+    assert_eq!(
+        sock.read_var_uint().await.unwrap(),
+        ClientPacketId::Hello as u64,
+        "client must open with a Hello packet"
+    );
+    assert_eq!(sock.read_utf8_string().await.unwrap(), CLIENT_NAME);
+    let _major = sock.read_var_uint().await.unwrap();
+    let _minor = sock.read_var_uint().await.unwrap();
+    assert_eq!(
+        sock.read_var_uint().await.unwrap(),
+        DBMS_TCP_PROTOCOL_VERSION,
+        "client must advertise the revision this crate is built against"
+    );
+    let _database = sock.read_utf8_string().await.unwrap();
+    let _user = sock.read_utf8_string().await.unwrap();
+    let _password = sock.read_utf8_string().await.unwrap();
 
     let _ = sock.write_var_uint(ServerPacketId::Hello as u64).await;
     let _ = sock.write_string("mock-ch".as_bytes()).await;

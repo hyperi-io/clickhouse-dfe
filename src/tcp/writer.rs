@@ -495,10 +495,13 @@ mod tests {
             &ci,
         )
         .await
-        .expect_err("expected Error::Other for too-old server revision");
-        match err {
-            Error::Other(_) => {}
-            other => panic!("expected Error::Other, got {other:?}"),
-        }
+        .expect_err("expected an error for a too-old server revision");
+        // `Error::Other` alone would also match an unrelated write failure,
+        // so the message is what pins this to the revision gate.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("54429") && msg.contains("query settings"),
+            "error must name the revision gate, got: {msg}"
+        );
     }
 }

@@ -12,18 +12,29 @@
 // modules re-enable the lint where the names really are Rust or wire types.
 #![allow(clippy::doc_markdown)]
 
-// The pedantic and rustdoc lint set in Cargo.toml is enforced in `native`;
-// every other module carries the allow until its own remediation wave clears
-// it. Removing an entry here is how a module opts in.
+// The documentation and pedantic lint set in Cargo.toml is enforced in
+// `native`; a module listed here carries the allow until it is clean, and
+// removing its entry is how it opts in.
+//
+// `unwrap_used` and `expect_used` are deliberately absent: a panic in library
+// code is a defect in any module, and `clippy.toml` exempts test code. A module
+// still carrying one declares that allow beside its own `mod`.
+//
+// The docs.rs feature badge is emitted here, so a feature-gated module cannot
+// be added without being labelled.
 macro_rules! ratcheted {
-    ($($(#[$attr:meta])* $vis:vis mod $name:ident;)*) => {
+    ($(
+        $(#[cfg(feature = $feature:literal)])?
+        $(#[allow($($allow:meta),*)])?
+        $vis:vis mod $name:ident;
+    )*) => {
         $(
-            $(#[$attr])*
+            $(#[cfg(feature = $feature)])?
+            $(#[cfg_attr(docsrs, doc(cfg(feature = $feature)))])?
+            $(#[allow($($allow),*)])?
             #[allow(
                 missing_docs,
                 clippy::pedantic,
-                clippy::unwrap_used,
-                clippy::expect_used,
                 clippy::missing_errors_doc,
                 clippy::missing_panics_doc
             )]
@@ -42,7 +53,9 @@ mod worker;
 ratcheted! {
     pub mod error;
 
+    // `TcpClient::pool` still expects on a deadpool build that cannot fail.
     #[cfg(feature = "tcp")]
+    #[allow(clippy::expect_used)]
     pub mod tcp;
 
     #[cfg(feature = "tls")]
@@ -56,12 +69,15 @@ ratcheted! {
 
     #[cfg(feature = "ext")]
     pub mod ext;
-
-    #[cfg(feature = "inserter")]
-    pub mod inserter;
 }
 
 pub use error::{Error, Result};
 
 #[cfg(feature = "tcp")]
 pub use tcp::TcpClient;
+
+#[cfg(feature = "unified")]
+pub use unified::{Columns, Transport, UnifiedClient};
+
+#[cfg(feature = "ext")]
+pub use ext::{ClientExt, ServerException};

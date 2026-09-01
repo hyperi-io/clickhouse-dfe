@@ -17,6 +17,7 @@ use clickhouse::error::{Error, Result};
 
 /// A `Code: N. DB::Exception: ...` rejection out of [`Error::BadResponse`].
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ServerException {
     /// Signed on the wire; small positives in practice.
     pub code: i32,
@@ -24,6 +25,7 @@ pub struct ServerException {
     pub name: Option<String>,
     /// Body without the code prefix, the marker, the name tag and the version.
     pub message: String,
+    /// The `Stack trace:` section, when the server included one.
     pub stack_trace: Option<String>,
 }
 
