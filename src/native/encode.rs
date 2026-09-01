@@ -135,10 +135,46 @@ pub fn encode_columns(
         if has_custom_ser {
             out.push(0u8);
         }
+        write_col_prefixes(&col.col_type, &mut out);
         write_col_values(&per_col[ci], &col.col_type, &mut out)?;
     }
 
     Ok(out)
+}
+
+/// Write the serialisation prefixes for `col_type`'s whole tree, in the order
+/// the server expects them.
+///
+/// `NativeWriter.cpp:93-94` calls `serializeBinaryBulkStatePrefix` for the
+/// entire column before `serializeBinaryBulkWithMultipleStreams`, so every
+/// nested prefix precedes ALL of the column's data. Writing a prefix inline
+/// where its child sits agrees with that only when nothing precedes the child:
+/// true inside a `Tuple`, false behind an `Array`'s offsets, where the server
+/// rejects the block with "Invalid version for `SerializationLowCardinality`
+/// key column" (code 117).
+///
+/// `LowCardinality` alone is hoisted here; its prefix is the fixed version
+/// word. `Variant`, `Dynamic` and `JSON` are not encoded by this writer at
+/// all, so they have no prefix to place.
+fn write_col_prefixes(col_type: &ColumnType, out: &mut Vec<u8>) {
+    match col_type {
+        // The dictionary belongs to the data phase, so this does not recurse
+        // into the inner type.
+        ColumnType::LowCardinality(_) => out.extend_from_slice(&1u64.to_le_bytes()),
+        ColumnType::Nullable(inner)
+        | ColumnType::Array(inner)
+        | ColumnType::SimpleAggregateFunction(inner) => write_col_prefixes(inner, out),
+        ColumnType::Tuple(fields) => {
+            for field in fields {
+                write_col_prefixes(field, out);
+            }
+        }
+        ColumnType::Map(key, value) => {
+            write_col_prefixes(key, out);
+            write_col_prefixes(value, out);
+        }
+        _ => {}
+    }
 }
 
 /// Recursively write native columnar data for `values`, one `RowBinary` cell
@@ -253,7 +289,9 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
 
             let flags = HAS_ADDITIONAL_KEYS | index_type;
 
-            out.extend_from_slice(&1u64.to_le_bytes()); // version
+            // The version word is not written here: it is this column's
+            // serialisation prefix, emitted by `write_col_prefixes` ahead of
+            // all of the column's data.
             out.extend_from_slice(&flags.to_le_bytes()); // flags
             out.extend_from_slice(&(dict.len() as u64).to_le_bytes()); // dict_size
             // Dictionary type is T, never Nullable(T).

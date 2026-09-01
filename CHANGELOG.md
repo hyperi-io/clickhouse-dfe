@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Recycled connections leaked their socket and reader task; a streaming SELECT released its pool slot before the stream drained
 - Retry backoff is jittered, so connections that fail together no longer retry in lockstep
 - The pool's recycle decision is one function, so the tests exercise the production rule rather than a copy of it
+- A nested `LowCardinality` now reads and writes its serialisation prefix where the server puts it -- ahead of the enclosing column's data, not inline. `Array(LowCardinality(String))` and `Map(String, LowCardinality(Nullable(String)))` could not be read, and inserting either returned server code 117
 
 ### Removed
 

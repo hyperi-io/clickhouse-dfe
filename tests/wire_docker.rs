@@ -20,7 +20,7 @@
 //! cargo test --all-features --test wire_docker -- --include-ignored --test-threads=1
 //! ```
 
-#![cfg(all(feature = "tcp", feature = "unified"))]
+#![cfg(all(feature = "tcp", feature = "unified", feature = "dynamic"))]
 // Helpers sit outside #[test], so clippy's in-test exemption misses them.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -331,6 +331,71 @@ async fn run_case(
     } else {
         Err(format!("tcp {t} != http {h}"))
     }
+}
+
+/// The encoder faces the same prefix ordering as the decoder did. Rather than
+/// assert which way round it is, write the same row twice -- once by the
+/// server from SQL, once through this crate's encoder -- and require the two
+/// tables to read back identically.
+#[tokio::test]
+#[ignore = "needs Docker -- see the module docs"]
+async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
+    use std::sync::Arc;
+
+    use serde_json::{Map, json};
+
+    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+
+    const TYPE: &str = "Array(LowCardinality(String))";
+    let client = tcp().await;
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    for table in ["wire.lc_by_server", "wire.lc_by_encoder"] {
+        client
+            .execute(&format!(
+                "CREATE OR REPLACE TABLE {table} (c {TYPE}) \
+                 ENGINE = MergeTree ORDER BY tuple()"
+            ))
+            .await
+            .unwrap();
+    }
+    client
+        .execute("INSERT INTO wire.lc_by_server VALUES (['a', 'b', 'a'])")
+        .await
+        .unwrap();
+
+    let schema = Arc::new(DynamicSchema::from_columns(
+        "wire.lc_by_encoder",
+        vec![ColumnDef::new("c", TYPE)],
+    ));
+    let mut insert = DynamicInsert::tcp(
+        client.as_tcp().expect("the tcp arm").clone(),
+        "wire",
+        "lc_by_encoder",
+        schema,
+    );
+    let mut row = Map::new();
+    row.insert("c".to_string(), json!(["a", "b", "a"]));
+    insert.write_map(&row).await.expect("the row encodes");
+    insert.end().await.expect("the insert commits");
+
+    let by_server = client
+        .fetch_columns("SELECT c FROM wire.lc_by_server")
+        .await
+        .expect("read back what the server wrote");
+    let by_encoder = client
+        .fetch_columns("SELECT c FROM wire.lc_by_encoder")
+        .await
+        .expect("read back what this crate wrote");
+
+    assert_eq!(
+        rendered(&by_encoder, "c").unwrap(),
+        rendered(&by_server, "c").unwrap(),
+        "this crate's encoder must lay out {TYPE} the way the server does"
+    );
 }
 
 /// A result set the server splits into several blocks must read back whole
