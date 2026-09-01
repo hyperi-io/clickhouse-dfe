@@ -26,7 +26,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
 default = ["tcp", "lz4"]
-tcp = ["dep:deadpool", "dep:socket2"]
+tcp = ["dep:deadpool", "dep:socket2", "dep:backon"]
 tls = [
     "tcp",
     "dep:rustls",
@@ -68,6 +68,10 @@ tokio = { version = ">=1.50.0, <2", features = ["rt", "macros", "io-util", "sync
 deadpool = { version = ">=0.12, <0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
 # 0.6 shares the socket2 that tokio and hyper-util already resolve to.
 socket2 = { version = ">=0.6, <0.7", features = ["all"], optional = true }
+# Retry/backoff, matching scalo-rs. Jitter is the reason: a hand-rolled
+# schedule desynchronises nothing, so a pool-wide reconnect storm retries
+# in lockstep.
+backon = { version = ">=1.6.0, <2", default-features = false, features = ["std", "tokio-sleep"], optional = true }
 
 # tls
 rustls = { version = ">=0.23, <0.24", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"], optional = true }

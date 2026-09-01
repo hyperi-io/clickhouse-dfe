@@ -4,9 +4,6 @@
 //! The in-tree consumer is the TCP connection actor in
 //! `crate::tcp::connection_actor`.
 
-// Not every symbol here has an in-tree caller.
-#![allow(dead_code)]
-
 use std::future::Future;
 use std::time::Duration;
 
@@ -16,40 +13,8 @@ use tokio::time::MissedTickBehavior;
 
 use tracing::{Instrument, Span, debug, trace};
 
-/// A long-running command-driven background task.
-///
-/// Long-running command-driven background task. Futures must be `Send`;
-/// the runner is spawned on the multi-threaded tokio runtime.
-///
-/// # Example
-///
-/// ```ignore
-/// // The worker items are crate-internal; this example is illustrative only.
-/// use clickhouse_dfe::worker::{CommandWorker, spawn};
-/// use tokio::sync::oneshot;
-///
-/// enum Cmd { Increment, Get { reply: oneshot::Sender<u64> } }
-/// struct Counter { n: u64 }
-///
-/// impl CommandWorker for Counter {
-///     type Command = Cmd;
-///     fn name() -> &'static str { "counter" }
-///     fn handle(&mut self, cmd: Cmd) -> impl std::future::Future<Output = ()> + Send + '_ {
-///         async move {
-///             match cmd {
-///                 Cmd::Increment => self.n += 1,
-///                 Cmd::Get { reply } => { let _ = reply.send(self.n); }
-///             }
-///         }
-///     }
-/// }
-///
-/// # async fn run() {
-/// let control = spawn(Counter { n: 0 }, 16);
-/// control.handle().send(Cmd::Increment).await.unwrap();
-/// control.shutdown().await.unwrap();
-/// # }
-/// ```
+/// A long-running command-driven background task. Futures must be
+/// `Send`; the runner is spawned on the multi-threaded tokio runtime.
 pub(crate) trait CommandWorker: Send + 'static {
     /// Commands this worker accepts. Embed reply channels in the
     /// command variants (`oneshot::Sender<R>` for single replies,
@@ -133,10 +98,12 @@ impl<C> Clone for WorkerHandle<C> {
 
 impl<C> std::fmt::Debug for WorkerControl<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The shutdown sender and join handle are not printable and say
+        // nothing a reader wants; `alive` already reports the state.
         f.debug_struct("WorkerControl")
             .field("name", &self.name)
             .field("alive", &!self.tx.is_closed())
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -151,7 +118,6 @@ impl<C> std::fmt::Debug for WorkerHandle<C> {
 
 impl<C: Send + 'static> WorkerControl<C> {
     /// Cheap-clone send-side handle.
-    #[must_use]
     pub(crate) fn handle(&self) -> WorkerHandle<C> {
         WorkerHandle {
             tx: self.tx.clone(),
@@ -260,6 +226,9 @@ async fn run<W: CommandWorker>(
     });
 
     loop {
+        // Two arms rather than an `if let`: each is a distinct `select!`, and
+        // the idle branch only exists when a tick interval was configured.
+        #[allow(clippy::single_match_else)]
         let next = match idle.as_mut() {
             Some(iv) => tokio::select! {
                 biased;
@@ -276,9 +245,11 @@ async fn run<W: CommandWorker>(
 
         match next {
             Some(NextEvent::Command((cmd, caller_span))) => {
-                let _enter = caller_span.enter();
+                // `Instrument`, not `Span::enter`: an `Entered` guard held
+                // across an `.await` bleeds the caller's span onto
+                // whatever the runtime schedules next on this thread.
                 trace!(target: "clickhouse::worker", worker = name, "handling command");
-                worker.handle(cmd).await;
+                worker.handle(cmd).instrument(caller_span).await;
             }
             Some(NextEvent::Idle) => {
                 trace!(target: "clickhouse::worker", worker = name, "idle tick");
@@ -507,7 +478,7 @@ mod tests {
             fn name() -> &'static str {
                 "panicky"
             }
-            async fn handle(&mut self, _: ()) {
+            async fn handle(&mut self, (): ()) {
                 panic!("intentional test panic");
             }
         }

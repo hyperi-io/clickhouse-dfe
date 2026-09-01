@@ -1,13 +1,10 @@
 //! `ClientInfo` block written inside the client-side Query packet.
 //!
-//! Mirrors clickhouse-cpp-client `SendQuery()` lines 1026-1086. Field
-//! emission is revision-gated -- the negotiated server revision drives
-//! which fields go on the wire. We emit only fields a non-distributed,
-//! non-OpenTelemetry, non-parallel-replicas TCP client needs; the
-//! revision-gated extras are written as zeros/empty strings to match
-//! the cpp-client default layout. Parallel-replicas and OpenTelemetry
-//! context can be added later without changing the wire shape for
-//! existing servers.
+//! Mirrors clickhouse-cpp-client `SendQuery()` lines 1026-1086, with the
+//! negotiated revision driving which fields go on the wire. A
+//! non-distributed, non-OpenTelemetry, non-parallel-replicas client
+//! still writes the revision-gated extras as zeros or empty strings,
+//! because the server reads them positionally.
 
 use tokio::io::AsyncWriteExt;
 
@@ -147,5 +144,104 @@ impl ClientInfo {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native::io::ClickHouseRead;
+    use crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION;
+    use tokio::io::AsyncReadExt;
+
+    /// The server reads `ClientInfo` positionally, so one field out of
+    /// order shifts every field after it and the query is rejected or
+    /// silently misattributed. Walks the whole block in cpp order.
+    #[tokio::test]
+    async fn client_info_write_to_matches_cpp_field_order() {
+        let info = ClientInfo::for_initial_query("test-client", 25, 4, 54_459, "quota-1");
+        let mut buf = Vec::new();
+        info.write_to(&mut buf, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+
+        let mut cur = std::io::Cursor::new(&buf[..]);
+        let mut one = [0u8; 1];
+
+        cur.read_exact(&mut one).await.unwrap();
+        assert_eq!(one[0], QUERY_KIND_INITIAL_QUERY, "query_kind");
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "", "initial_user");
+        assert_eq!(
+            cur.read_utf8_string().await.unwrap(),
+            "",
+            "initial_query_id"
+        );
+        assert_eq!(
+            cur.read_utf8_string().await.unwrap(),
+            "[::ffff:127.0.0.1]:0",
+            "initial_address must parse as a Poco SocketAddress"
+        );
+        assert_eq!(
+            cur.read_i64_le().await.unwrap(),
+            0,
+            "initial_query_start_time_microseconds"
+        );
+
+        cur.read_exact(&mut one).await.unwrap();
+        assert_eq!(one[0], INTERFACE_TYPE_TCP, "iface_type");
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "", "os_user");
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "", "client_hostname");
+        assert_eq!(
+            cur.read_utf8_string().await.unwrap(),
+            "test-client",
+            "client_name"
+        );
+        assert_eq!(cur.read_var_uint().await.unwrap(), 25, "version_major");
+        assert_eq!(cur.read_var_uint().await.unwrap(), 4, "version_minor");
+        assert_eq!(
+            cur.read_var_uint().await.unwrap(),
+            54_459,
+            "client_revision"
+        );
+        assert_eq!(
+            cur.read_utf8_string().await.unwrap(),
+            "quota-1",
+            "quota_key"
+        );
+        assert_eq!(cur.read_var_uint().await.unwrap(), 0, "distributed_depth");
+        assert_eq!(cur.read_var_uint().await.unwrap(), 0, "version_patch");
+
+        cur.read_exact(&mut one).await.unwrap();
+        assert_eq!(one[0], 0, "opentelemetry absent marker");
+        for field in [
+            "collaborate_with_initiator",
+            "count_participating_replicas",
+            "number_of_current_replica",
+        ] {
+            assert_eq!(cur.read_var_uint().await.unwrap(), 0, "{field}");
+        }
+
+        assert_eq!(
+            cur.position() as usize,
+            buf.len(),
+            "the block must be fully consumed"
+        );
+    }
+
+    /// The quota key reaches the server twice: once in the handshake
+    /// addendum and once per query here, so a query issued without it
+    /// is attributed to the wrong quota.
+    #[tokio::test]
+    async fn quota_key_reaches_the_wire() {
+        let info = ClientInfo::for_initial_query("c", 1, 0, 54_459, "team-a");
+        let mut buf = Vec::new();
+        info.write_to(&mut buf, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        let needle = b"team-a";
+        assert!(
+            buf.windows(needle.len()).any(|w| w == needle),
+            "quota_key must appear in the ClientInfo block"
+        );
     }
 }

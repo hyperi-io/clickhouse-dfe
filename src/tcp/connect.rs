@@ -7,22 +7,13 @@
 //! connection-tracking idle timeouts (~30-60s) without producing
 //! excessive probe traffic.
 //!
-//! `connect_tls` (under the `tls` feature) mirrors
-//! the same socket-level setup, then drives the rustls handshake
-//! against the supplied SNI string before returning a
-//! [`MaybeTlsStream::Tls`].
+//! `connect_tls` (under the `tls` feature) shares that socket setup,
+//! then drives the rustls handshake against the supplied SNI.
 //!
-//! [`open_handshaken`] is the high-level entry point the connection
-//! pool will call: connect, then drive [`crate::tcp::handshake`]
-//! against the unsplit stream, returning the ready-to-use stream and
-//! the negotiated [`ServerHello`]. The plain / TLS choice is encoded
-//! in [`ConnectKind`].
-//!
-//! The handshake is half-duplex (send Hello -> recv ServerHello ->
-//! send addendum), so the connection actor that follows can split
-//! the stream once for its long-lived read/write loop without the
-//! handshake needing its own split. See `split_buffered` for the
-//! actor-side helper.
+//! [`open_handshaken`] is the pool's entry point: connect, drive
+//! [`crate::tcp::handshake`] against the unsplit stream, return the
+//! ready stream plus the negotiated [`ServerHello`]. `split_buffered`
+//! then hands the actor its halves.
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -89,12 +80,8 @@ pub(crate) async fn connect_plain(addr: SocketAddr) -> Result<MaybeTlsStream> {
 /// hostname-based SNI -- the common pattern when the resolver runs
 /// outside the rust client (e.g. a service mesh).
 ///
-/// `config` is the resolved [`rustls::ClientConfig`] -- the SAME shared
-/// trust the HTTP transport uses. The pool builds it once (from the
-/// `Client`'s `with_tls_*` trust, or the default native+webpki anchors)
-/// and clones the `Arc` into each connect, so swapping default trust
-/// for a private CA is a `Client` builder call, not a change here. See
-/// [`crate::tls`] for the trust-resolution rules.
+/// `config` is the trust the pool resolved once and clones into each
+/// connect; see [`crate::tls`] for the resolution rules.
 #[cfg(feature = "tls")]
 pub(crate) async fn connect_tls(
     addr: SocketAddr,
@@ -116,16 +103,13 @@ pub(crate) async fn connect_tls(
     Ok(MaybeTlsStream::Tls(Box::new(tls)))
 }
 
-/// Split the stream into buffered read/write halves for the
-/// connection actor's long-lived loop. 64 KiB caps match
-/// [`CONN_READ_BUFFER`] / [`CONN_WRITE_BUFFER`].
+/// Split the stream into buffered read/write halves for the connection
+/// actor's long-lived loop, at the [`CONN_READ_BUFFER`] /
+/// [`CONN_WRITE_BUFFER`] caps.
 ///
-/// Borrowed-half split via [`tokio::io::split`] is used here rather
-/// than `TcpStream::into_split` because `MaybeTlsStream` is a wrapper
-/// enum -- the TLS variant cannot expose an `into_split` of its own.
-/// Borrowed halves block re-merge across moves, but the actor never
-/// re-merges: it owns the halves for the lifetime of the connection
-/// and drops them together.
+/// [`tokio::io::split`] rather than `TcpStream::into_split` because
+/// `MaybeTlsStream` is a wrapper enum and its TLS variant has no
+/// `into_split`; the halves cannot re-merge, which the actor never does.
 pub(crate) fn split_buffered(
     stream: MaybeTlsStream,
 ) -> (
@@ -141,26 +125,22 @@ pub(crate) fn split_buffered(
 
 /// Connect-side selector: plain TCP versus TLS.
 ///
-/// Encodes which transport [`open_handshaken`] reaches for. The TLS
-/// variant carries the SNI / hostname the server certificate will be
-/// validated against. Held as a separate value rather than a flag on
-/// [`HandshakeConfig`] because the SNI is a property of the
-/// connection, not of the post-connect handshake exchange.
-///
-/// The TLS variant is feature-gated on `tls`; without
-/// that feature only `Plain` exists and the match in
-/// [`open_handshaken`] is exhaustive on `Plain` alone.
+/// Separate from [`HandshakeConfig`] because the SNI is a property of
+/// the connection, not of the post-connect exchange. The TLS variants
+/// are feature-gated on `tls`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ConnectKind {
     /// Plain TCP. No TLS upgrade.
     Plain,
-    /// TLS over TCP. `server_name` is the SNI sent in the ClientHello
-    /// and the name the server certificate is validated against;
-    /// `config` is the resolved rustls trust the pool built once and
-    /// shares (cloned `Arc`) across reconnects.
+    /// TLS over TCP.
     #[cfg(feature = "tls")]
     Tls {
+        /// SNI sent in the ClientHello and the name the server
+        /// certificate is validated against.
         server_name: String,
+        /// Resolved rustls trust the pool built once and shares (cloned
+        /// `Arc`) across reconnects.
         config: std::sync::Arc<tokio_rustls::rustls::ClientConfig>,
     },
     /// A TLS trust was configured but could not be resolved. The pool
@@ -173,21 +153,14 @@ pub enum ConnectKind {
 /// Connect to `addr` and drive the handshake to completion. Returns
 /// the ready-to-use stream plus the negotiated [`ServerHello`].
 ///
-/// `kind` selects plain or TLS transport. The downstream handshake is
-/// identical: `handshake()` is transport-agnostic, operating over
-/// `AsyncRead + AsyncWrite` against the [`MaybeTlsStream`] adapter.
+/// `kind` selects plain or TLS transport; `handshake()` itself is
+/// transport-agnostic over the [`MaybeTlsStream`] adapter.
 ///
-/// The handshake is half-duplex (send Hello -> flush -> recv
-/// ServerHello -> send addendum -> flush), so it runs directly
-/// against `&mut MaybeTlsStream` without splitting. The connection
-/// actor that follows is the one that calls `split_buffered` for
-/// its long-lived read/write loop.
+/// # Errors
 ///
-/// Chunked-packet protocol mode is NOT negotiated this round -- the
-/// unchunked protocol is advertised and the server falls back.
-/// Adding chunked mode would extend the addendum exchange with two
-/// extra strings; see `crate::tcp::handshake::handshake` for the
-/// deferral note.
+/// [`Error::Custom`] when a configured TLS trust could not be resolved
+/// or the SNI is malformed, [`crate::Error::ServerException`] when the
+/// server rejects the Hello, and I/O errors from the connect itself.
 pub async fn open_handshaken(
     addr: SocketAddr,
     kind: &ConnectKind,
@@ -211,4 +184,43 @@ pub async fn open_handshaken(
     };
     let hello = handshake(&mut stream, cfg).await?;
     Ok((stream, hello))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    /// Nagle would batch small protocol packets behind a 40ms delayed
+    /// ACK, and without keepalive a kube-proxy conntrack entry drops an
+    /// idle pooled connection with no FIN.
+    #[tokio::test]
+    async fn connect_plain_sets_nodelay_and_keepalive() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+
+        let stream = connect_plain(addr).await.expect("loopback connect");
+        let MaybeTlsStream::Plain(sock) = &stream else {
+            panic!("connect_plain must yield the plain variant");
+        };
+        assert!(sock.nodelay().unwrap(), "TCP_NODELAY must be set");
+
+        let sock_ref = socket2::SockRef::from(sock);
+        assert!(sock_ref.keepalive().unwrap(), "SO_KEEPALIVE must be set");
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            assert_eq!(sock_ref.tcp_keepalive_time().unwrap(), TCP_KEEPALIVE_IDLE);
+            assert_eq!(
+                sock_ref.tcp_keepalive_interval().unwrap(),
+                TCP_KEEPALIVE_INTERVAL
+            );
+            assert_eq!(
+                sock_ref.tcp_keepalive_retries().unwrap(),
+                TCP_KEEPALIVE_RETRIES
+            );
+        }
+
+        let _accepted = accept.await.unwrap();
+    }
 }

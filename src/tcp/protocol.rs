@@ -41,7 +41,6 @@ pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_DISTRIBUTED_DEPTH: u64 = 54448;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_INITIAL_QUERY_START_TIME: u64 = 54449;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARALLEL_REPLICAS: u64 = 54453;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM: u64 = 54458;
-pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_QUOTA_KEY: u64 = 54458;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS: u64 = 54459;
 
 /// Active protocol revision this client advertises in Hello. Matches
@@ -50,11 +49,29 @@ pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS: u64 = 54459;
 /// current".
 pub(crate) const DBMS_TCP_PROTOCOL_VERSION: u64 = DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS;
 
-/// Cap on the flattened `stack_trace` field of an
-/// [`Error::ServerException`] built from a nested wire-format
-/// [`Exception`] chain. Matches the 1 MiB bad-response body cap used
-/// elsewhere; protects against hostile or runaway server output.
+/// Cap on the `stack_trace` field of an [`Error::ServerException`]. The
+/// wire string is only bounded by `native::io`'s 1 GiB `MAX_STRING_SIZE`,
+/// so this is what keeps hostile or runaway server output out of an
+/// error value callers log.
 pub(crate) const TCP_EXCEPTION_STACK_TRACE_CAP: usize = 1 << 20;
+
+/// Cap on the `message` field of an [`Error::ServerException`], for the
+/// same reason as [`TCP_EXCEPTION_STACK_TRACE_CAP`].
+pub(crate) const TCP_EXCEPTION_MESSAGE_CAP: usize = 64 * 1024;
+
+/// Truncate `s` to at most `cap` bytes on a UTF-8 character boundary.
+/// `String::truncate` panics mid-character, and server text is arbitrary
+/// UTF-8.
+pub(crate) fn truncate_on_char_boundary(s: &mut String, cap: usize) {
+    if s.len() <= cap {
+        return;
+    }
+    let mut end = cap;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
 
 // ---------------------------------------------------------------------------
 // Packet IDs
@@ -73,8 +90,7 @@ pub(crate) enum ClientPacketId {
 }
 
 /// Packet IDs sent server -> client. Mirrors `ServerCodes` in
-/// clickhouse-cpp-client `protocol.h`. Includes only the IDs we
-/// actually handle in subsequent branches; unknown IDs surface as
+/// clickhouse-cpp-client `protocol.h`; unknown IDs surface as
 /// [`Error::BadResponse`] via [`ServerPacketId::from_u64`].
 #[repr(u64)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,22 +111,24 @@ pub(crate) enum ServerPacketId {
 }
 
 impl ServerPacketId {
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`] for an id this client does not handle.
     pub(crate) fn from_u64(i: u64) -> Result<Self> {
-        use ServerPacketId::*;
         Ok(match i {
-            0 => Hello,
-            1 => Data,
-            2 => Exception,
-            3 => Progress,
-            4 => Pong,
-            5 => EndOfStream,
-            6 => ProfileInfo,
-            7 => Totals,
-            8 => Extremes,
-            10 => Log,
-            11 => TableColumns,
-            14 => ProfileEvents,
-            17 => TimezoneUpdate,
+            0 => Self::Hello,
+            1 => Self::Data,
+            2 => Self::Exception,
+            3 => Self::Progress,
+            4 => Self::Pong,
+            5 => Self::EndOfStream,
+            6 => Self::ProfileInfo,
+            7 => Self::Totals,
+            8 => Self::Extremes,
+            10 => Self::Log,
+            11 => Self::TableColumns,
+            14 => Self::ProfileEvents,
+            17 => Self::TimezoneUpdate,
             x => {
                 return Err(Error::BadResponse(format!(
                     "tcp: unknown server packet id {x}"
@@ -133,19 +151,6 @@ pub(crate) enum QueryProcessingStage {
     Complete = 2,
 }
 
-/// Chunked-protocol mode negotiation values, sent during the handshake
-/// addendum when both peers advertise at least
-/// `DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS`. Names match
-/// clickhouse-cpp-client.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ChunkedProtocolMode {
-    #[default]
-    NotChunked,
-    NotChunkedOptional,
-    Chunked,
-    ChunkedOptional,
-}
-
 // ---------------------------------------------------------------------------
 // Handshake + packet payload staging types
 // ---------------------------------------------------------------------------
@@ -154,21 +159,23 @@ pub(crate) enum ChunkedProtocolMode {
 /// callers from [`crate::tcp::connect::open_handshaken`] so they can
 /// pin connection state to the negotiated revision.
 #[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct ServerHello {
+    /// Server build name, e.g. `"ClickHouse server"`.
     pub server_name: String,
+    /// `(major, minor, patch)` as the server reported them.
     pub version: (u64, u64, u64),
+    /// Raw protocol revision the server advertised, before negotiation.
     pub revision: u64,
+    /// Session timezone; `None` below the timezone revision gate.
     pub timezone: Option<String>,
+    /// Operator-facing server display name; `None` below its revision gate.
     pub display_name: Option<String>,
 }
 
-/// TCP-protocol staging type for a server exception. The wire format
-/// is a singly-linked list of frames (`nested: Option<Box<Self>>`)
-/// rooted at the outermost (most recent) exception, whereas
-/// [`Error::ServerException`] is flat. This struct holds the
-/// parse intermediate before the reader flattens the chain into a
-/// single [`Error::ServerException`] at the dispatch boundary via
-/// [`Exception::into_error`].
+/// TCP-protocol staging type for a server exception: one flat wire
+/// frame, converted to [`Error::ServerException`] at the dispatch
+/// boundary by [`Exception::into_error`].
 ///
 /// Not exposed publicly. Callers only ever see the flat
 /// [`Error::ServerException`].
@@ -179,72 +186,63 @@ pub(crate) struct Exception {
     pub(crate) name: String,
     pub(crate) message: String,
     pub(crate) stack_trace: String,
-    pub(crate) nested: Option<Box<Exception>>,
 }
 
 impl Exception {
-    /// Flatten the nested chain into a single
-    /// [`Error::ServerException`]. The outermost frame supplies `code`
-    /// and `name`. Inner-frame messages are joined into the top-level
-    /// message with ` | caused by: ` separators; inner-frame stack
-    /// traces are joined with `\n---\n` separators.
+    /// Convert the wire frame into an [`Error::ServerException`], with
+    /// an empty `name` / `stack_trace` becoming `None`.
     ///
-    /// The final stack trace is capped at
-    /// [`TCP_EXCEPTION_STACK_TRACE_CAP`] (1 MiB); truncation emits a
-    /// `tracing::warn!` so an operator can see the cap was hit.
+    /// The message is capped at [`TCP_EXCEPTION_MESSAGE_CAP`] and the
+    /// stack trace at [`TCP_EXCEPTION_STACK_TRACE_CAP`], both cut on a
+    /// character boundary because server text is arbitrary UTF-8;
+    /// truncation emits a `tracing::warn!` so an operator can see the cap
+    /// was hit.
     pub(crate) fn into_error(self) -> Error {
         let Exception {
             code,
             name,
-            message,
-            stack_trace,
-            mut nested,
+            mut message,
+            mut stack_trace,
         } = self;
 
-        let mut combined_message = message;
-        let mut combined_stack = stack_trace;
-
-        while let Some(boxed) = nested {
-            let frame = *boxed;
-            if !frame.message.is_empty() {
-                combined_message.push_str(" | caused by: ");
-                combined_message.push_str(&frame.message);
-            }
-            if !frame.stack_trace.is_empty() {
-                if !combined_stack.is_empty() {
-                    combined_stack.push_str("\n---\n");
-                }
-                combined_stack.push_str(&frame.stack_trace);
-            }
-            nested = frame.nested;
-        }
-
-        if combined_stack.len() > TCP_EXCEPTION_STACK_TRACE_CAP {
+        if message.len() > TCP_EXCEPTION_MESSAGE_CAP {
             tracing::warn!(
-                original_len = combined_stack.len(),
+                original_len = message.len(),
+                cap = TCP_EXCEPTION_MESSAGE_CAP,
+                "tcp: server exception message truncated"
+            );
+            truncate_on_char_boundary(&mut message, TCP_EXCEPTION_MESSAGE_CAP);
+        }
+        if stack_trace.len() > TCP_EXCEPTION_STACK_TRACE_CAP {
+            tracing::warn!(
+                original_len = stack_trace.len(),
                 cap = TCP_EXCEPTION_STACK_TRACE_CAP,
                 "tcp: server exception stack_trace truncated"
             );
-            combined_stack.truncate(TCP_EXCEPTION_STACK_TRACE_CAP);
+            truncate_on_char_boundary(&mut stack_trace, TCP_EXCEPTION_STACK_TRACE_CAP);
         }
 
         Error::ServerException {
             code,
             name: if name.is_empty() { None } else { Some(name) },
-            message: combined_message,
-            stack_trace: if combined_stack.is_empty() {
+            message,
+            stack_trace: if stack_trace.is_empty() {
                 None
             } else {
-                Some(combined_stack)
+                Some(stack_trace)
             },
         }
     }
 }
 
-/// Progress packet payload. Fields populated depend on the negotiated
-/// revision; subsequent branches fill the optional ones (e.g.
-/// `total_rows_to_read`, written counters) as revisions allow.
+/// Progress packet payload; which fields the wire carries depends on the
+/// negotiated revision, and an omitted one reads back as zero.
+///
+/// The fields exist because the bytes must be consumed to keep the
+/// stream aligned, not because a caller reads them; surfacing progress
+/// to callers is a separate feature.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub(crate) struct Progress {
     pub(crate) rows_read: u64,
     pub(crate) bytes_read: u64,
@@ -253,8 +251,10 @@ pub(crate) struct Progress {
     pub(crate) written_bytes: u64,
 }
 
-/// ProfileInfo packet payload.
+/// ProfileInfo packet payload; read to keep the stream aligned, not yet
+/// surfaced to callers.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub(crate) struct ProfileInfo {
     pub(crate) rows: u64,
     pub(crate) blocks: u64,
@@ -264,8 +264,10 @@ pub(crate) struct ProfileInfo {
 }
 
 /// TableColumns packet payload (sent before INSERT to describe the
-/// destination schema).
+/// destination schema); read to keep the stream aligned, not yet
+/// surfaced to callers.
 #[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
 pub(crate) struct TableColumns {
     pub(crate) external_table_name: String,
     pub(crate) columns_definition: String,
@@ -315,7 +317,6 @@ mod tests {
             name: "UNKNOWN_TABLE".to_string(),
             message: "table foo does not exist".to_string(),
             stack_trace: "frame0".to_string(),
-            nested: None,
         };
         match exc.into_error() {
             Error::ServerException {
@@ -334,52 +335,6 @@ mod tests {
     }
 
     #[test]
-    fn exception_into_error_flattens_nested_chain() {
-        // Outer -> middle -> inner. Outer fields drive code + name.
-        let inner = Exception {
-            code: 999,
-            name: "INNER".to_string(),
-            message: "root cause".to_string(),
-            stack_trace: "inner-stack".to_string(),
-            nested: None,
-        };
-        let middle = Exception {
-            code: 998,
-            name: "MIDDLE".to_string(),
-            message: "intermediate".to_string(),
-            stack_trace: "middle-stack".to_string(),
-            nested: Some(Box::new(inner)),
-        };
-        let outer = Exception {
-            code: 60,
-            name: "UNKNOWN_TABLE".to_string(),
-            message: "top".to_string(),
-            stack_trace: "outer-stack".to_string(),
-            nested: Some(Box::new(middle)),
-        };
-        match outer.into_error() {
-            Error::ServerException {
-                code,
-                name,
-                message,
-                stack_trace,
-            } => {
-                assert_eq!(code, 60);
-                assert_eq!(name.as_deref(), Some("UNKNOWN_TABLE"));
-                assert_eq!(
-                    message,
-                    "top | caused by: intermediate | caused by: root cause"
-                );
-                assert_eq!(
-                    stack_trace.as_deref(),
-                    Some("outer-stack\n---\nmiddle-stack\n---\ninner-stack")
-                );
-            }
-            other => panic!("expected ServerException, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn exception_into_error_caps_stack_trace() {
         let big = "x".repeat(TCP_EXCEPTION_STACK_TRACE_CAP + 1024);
         let exc = Exception {
@@ -387,7 +342,6 @@ mod tests {
             name: "N".to_string(),
             message: "m".to_string(),
             stack_trace: big,
-            nested: None,
         };
         match exc.into_error() {
             Error::ServerException { stack_trace, .. } => {
@@ -398,6 +352,71 @@ mod tests {
         }
     }
 
+    /// `String::truncate` panics mid-character, and a server stack trace
+    /// is arbitrary UTF-8, so the cap has to land on a boundary.
+    #[test]
+    fn into_error_stack_trace_truncation_is_char_boundary_safe() {
+        // Three-byte characters, so no multiple of 3 lands on the 1 MiB
+        // cap: 1 << 20 is not divisible by 3.
+        let big = "\u{20ac}".repeat(TCP_EXCEPTION_STACK_TRACE_CAP);
+        assert!(!big.is_char_boundary(TCP_EXCEPTION_STACK_TRACE_CAP));
+        let exc = Exception {
+            code: 1,
+            name: "N".to_string(),
+            message: "m".to_string(),
+            stack_trace: big,
+        };
+        match exc.into_error() {
+            Error::ServerException { stack_trace, .. } => {
+                let s = stack_trace.expect("stack_trace populated");
+                assert!(s.len() <= TCP_EXCEPTION_STACK_TRACE_CAP);
+                // Cutting on the boundary below the cap loses at most
+                // two bytes of a three-byte character.
+                assert!(s.len() > TCP_EXCEPTION_STACK_TRACE_CAP - 3);
+            }
+            other => panic!("expected ServerException, got {other:?}"),
+        }
+    }
+
+    /// A wire message is bounded only by `MAX_STRING_SIZE` (1 GiB), so
+    /// the cap has to hold and cut on a character boundary.
+    #[test]
+    fn into_error_message_truncation_is_char_boundary_safe() {
+        // 64 KiB is not divisible by 3, so a run of three-byte characters
+        // guarantees the cap lands mid-character.
+        let big = "\u{20ac}".repeat(TCP_EXCEPTION_MESSAGE_CAP);
+        assert!(!big.is_char_boundary(TCP_EXCEPTION_MESSAGE_CAP));
+        let exc = Exception {
+            code: 60,
+            name: "N".to_string(),
+            message: big,
+            stack_trace: String::new(),
+        };
+        match exc.into_error() {
+            Error::ServerException { message, .. } => {
+                assert!(
+                    message.len() <= TCP_EXCEPTION_MESSAGE_CAP,
+                    "message must be capped, got {} bytes",
+                    message.len()
+                );
+                assert!(message.len() > TCP_EXCEPTION_MESSAGE_CAP - 3);
+                // A valid `String` proves the cut landed on a boundary.
+                assert!(message.starts_with('\u{20ac}'));
+            }
+            other => panic!("expected ServerException, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncate_on_char_boundary_never_splits_a_character() {
+        for cap in 0..12 {
+            let mut s = "\u{20ac}\u{20ac}\u{20ac}".to_string();
+            truncate_on_char_boundary(&mut s, cap);
+            assert!(s.len() <= cap.max(0));
+            assert_eq!(s.len() % 3, 0, "cut mid-character at cap {cap}");
+        }
+    }
+
     #[test]
     fn exception_into_error_blank_fields_become_none() {
         let exc = Exception {
@@ -405,7 +424,6 @@ mod tests {
             name: String::new(),
             message: "m".to_string(),
             stack_trace: String::new(),
-            nested: None,
         };
         match exc.into_error() {
             Error::ServerException {

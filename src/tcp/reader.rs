@@ -13,20 +13,15 @@
 //!
 //! Data packets carry either a schema block (`num_rows == 0`) or a
 //! payload block (`num_rows > 0`). Schema blocks surface their
-//! `(name, type_name)` column pairs in
-//! [`ServerPacket::Data::columns`]; payload blocks are fully decoded
-//! inline through [`crate::native::decode::decode_block`] and surface
-//! as [`ServerPacket::DataBlock`]. Decoding inline -- inside the
-//! reader sub-task -- is the only way the actor can advance past a
-//! payload block without misaligning the next packet's leading
-//! varuint: the column bytes are byte-after-byte interleaved with the
-//! block header, so an out-of-band consumer would race the next
-//! `read_packet` call. The telemetry `ProfileEvents` packet carries a
-//! leading string plus a Native block and is read-and-discarded inline
-//! for the same reason: the server emits it during normal query
-//! execution, so its bytes must be consumed to keep the stream
-//! aligned. Compressed blocks are not handled here: the handshake
-//! negotiates `NativeCompressionMethod::None`.
+//! `(name, type_name)` column pairs in [`ServerPacket::Data::columns`];
+//! payload blocks are decoded inline through
+//! [`crate::native::decode::decode_block`] and surface as
+//! [`ServerPacket::DataBlock`]. Decoding inline is the only way to
+//! advance past a block without misaligning the next packet's leading
+//! varuint, because the column bytes run straight on from the block
+//! header; `Log` and `ProfileEvents` are read-and-discarded here for the
+//! same reason. Compressed blocks do not appear: the Query packet
+//! always negotiates compression off.
 
 use tokio::io::AsyncReadExt;
 
@@ -38,35 +33,38 @@ use crate::tcp::protocol::{
     DBMS_MIN_REVISION_WITH_SERVER_DISPLAY_NAME, DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE,
     DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES, DBMS_MIN_REVISION_WITH_VERSION_PATCH,
     DBMS_TCP_PROTOCOL_VERSION, Exception, ProfileInfo, Progress, ServerHello, ServerPacketId,
-    TCP_EXCEPTION_STACK_TRACE_CAP, TableColumns,
+    TCP_EXCEPTION_STACK_TRACE_CAP, TableColumns, truncate_on_char_boundary,
 };
 
-/// Revision at which the server started emitting `total_rows_to_read`
-/// inside the Progress packet. Value matches clickhouse-cpp-client
-/// `client.cpp` line 25 (`#define DBMS_MIN_REVISION_WITH_TOTAL_ROWS_IN_PROGRESS 51554`).
-/// Introduced here because the reader is the first consumer; placing
-/// it alongside the other revision constants in `protocol.rs` would
-/// cascade a diff into 05b1 without need.
+/// Upper bound on the column count a single block header may declare.
+/// The wire value is an unbounded varuint that both block bodies size
+/// their allocations from, and `Vec::with_capacity` aborts the process
+/// rather than erroring, which a library cannot catch. ClickHouse itself
+/// refuses tables far below this, so no legitimate block reaches it.
 ///
-/// Note this gate is always satisfied at any revision this client
-/// negotiates (the `CLIENT_INFO` floor is 54032, well above 51554), so
-/// the field is in practice always present; modern servers write it
-/// unconditionally. The gate is retained as documentation of the
-/// historical introduction point and as defensive cover for the
-/// theoretical sub-51554 server we never reach.
+/// Duplicates `native::io`'s constant of the same name and value; the two
+/// collapse to one once the codec's copy is reachable from here.
+const MAX_BLOCK_COLUMNS: u64 = 16_384;
+
+/// Revision at which the server started emitting `total_rows_to_read`
+/// inside the Progress packet, matching clickhouse-cpp-client
+/// `client.cpp:25`. Every revision this client negotiates clears it (the
+/// `CLIENT_INFO` floor is 54032), so the gate is defensive cover for a
+/// server we never reach.
 pub(crate) const DBMS_MIN_REVISION_WITH_TOTAL_ROWS_IN_PROGRESS: u64 = 51554;
 
 /// Decoded server-to-client packet.
 ///
-/// For `Data` packets, the empty schema block (num_rows = 0) emitted
-/// by the server at the start of an INSERT has its `(name, type_name)`
-/// column metadata consumed off the wire and surfaced in `columns`.
-/// For data blocks with `num_rows > 0` the column payload is left in
-/// the reader; the cursor + Native decoder in Task 8 consumes it.
-/// `Log` and `ProfileEvents` blocks are both read-and-discarded at the
-/// reader (their bytes must be consumed to keep the stream aligned, but
-/// their contents are not surfaced to callers in v1).
+/// A schema block (`num_rows == 0`) surfaces its `(name, type_name)`
+/// pairs in [`ServerPacket::Data::columns`]; a payload block is decoded
+/// inline and surfaces as [`ServerPacket::DataBlock`]. `Log` and
+/// `ProfileEvents` are read and discarded here.
+///
+/// Several fields exist only because the bytes must be consumed to keep
+/// the stream aligned; surfacing progress, profile info and table
+/// columns to callers is a separate feature.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub(crate) enum ServerPacket {
     /// Schema block (Data packet with `num_rows == 0`).
     ///
@@ -97,7 +95,7 @@ pub(crate) enum ServerPacket {
     /// Server-log packet (sent when the caller set `send_logs_level`,
     /// which is forwarded onto the TCP Query). Its leading tag string +
     /// Native block are read and discarded at this layer to keep the
-    /// stream aligned; the log lines are not surfaced to callers in v1.
+    /// stream aligned; the log lines are not surfaced to callers.
     Log,
     TableColumns(TableColumns),
     /// ProfileEvents telemetry. The packet's leading string + Native
@@ -168,21 +166,25 @@ pub(crate) async fn read_hello<R: ClickHouseRead>(r: &mut R) -> Result<ServerHel
     }
 }
 
-/// Read a server Exception frame. Public entry into the recursive
-/// inner reader. The recursive call site itself uses [`Box::pin`]
-/// to break the async-fn-cycle's otherwise-infinite future size.
+/// Read a server Exception frame: signed-LE i32 `code`, length-prefixed
+/// `name`, `message` and `stack_trace`, then the obsolete one-byte
+/// `has_nested` flag.
+///
+/// The flag is read and discarded, never recursed on. The server writes
+/// it hardcoded false (`src/IO/WriteHelpers.cpp:91-92`) and its own
+/// reader marks the field `/// Obsolete` and does not recurse either
+/// (`src/IO/ReadHelpers.cpp:1964,1970`), so a nested chain is not a shape
+/// this wire produces; recursing on a peer-supplied byte would only add a
+/// stack-exhaustion surface.
+///
+/// `stack_trace` is capped at [`TCP_EXCEPTION_STACK_TRACE_CAP`] on a
+/// character boundary. This frame is reachable pre-auth through
+/// [`read_hello`], so the bytes are untrusted.
+///
+/// # Errors
+///
+/// I/O errors from the underlying reader.
 pub(crate) async fn read_exception<R: ClickHouseRead>(r: &mut R) -> Result<Exception> {
-    read_exception_inner(r).await
-}
-
-/// Recursive inner reader. Each frame is: signed-LE i32 `code`,
-/// length-prefixed `name`, `message`, `stack_trace`, one-byte
-/// `has_nested` flag. The `stack_trace` field is truncated to
-/// [`TCP_EXCEPTION_STACK_TRACE_CAP`] (1 MiB) at parse time;
-/// truncation emits a `tracing::warn!` so the cap is visible.
-/// This mirrors cpp `ReceiveException()` 955-1004 with the
-/// added body cap.
-async fn read_exception_inner<R: ClickHouseRead>(r: &mut R) -> Result<Exception> {
     // cpp reads the code as a fixed-width int32 (ReadFixed<int32_t>),
     // i.e. signed little-endian. Server-side codes are small positives
     // in practice but the wire is signed.
@@ -196,24 +198,14 @@ async fn read_exception_inner<R: ClickHouseRead>(r: &mut R) -> Result<Exception>
             cap = TCP_EXCEPTION_STACK_TRACE_CAP,
             "tcp: server exception stack_trace truncated"
         );
-        stack_trace.truncate(TCP_EXCEPTION_STACK_TRACE_CAP);
+        truncate_on_char_boundary(&mut stack_trace, TCP_EXCEPTION_STACK_TRACE_CAP);
     }
-    let has_nested = r.read_u8().await? != 0;
-    let nested = if has_nested {
-        // Box::pin at the recursive call site: rustc requires
-        // boxed indirection for any async-fn cycle, not just at
-        // the public entry. Without this, the future has an
-        // infinitely sized type.
-        Some(Box::new(Box::pin(read_exception_inner(r)).await?))
-    } else {
-        None
-    };
+    let _obsolete_has_nested = r.read_u8().await?;
     Ok(Exception {
         code,
         name,
         message,
         stack_trace,
-        nested,
     })
 }
 
@@ -293,17 +285,16 @@ pub(crate) async fn read_table_columns<R: ClickHouseRead>(r: &mut R) -> Result<T
 }
 
 /// Read the Data block header -- `(table_name, num_columns,
-/// num_rows)`. Mirrors cpp `SendData()` field order on the
-/// client side (writer side at line 1172-1181 is the inverse)
+/// num_rows)`. Mirrors cpp `SendData()` field order on the client side
 /// and `ReadBlock()` for the block-info section (853-887).
 ///
-/// The column-bytes payload is left in the reader; the cursor
-/// + Native decoder in a later branch consumes it.
+/// `num_columns` is bounded by [`MAX_BLOCK_COLUMNS`] here, at the single
+/// point both body readers get it from: the schema path reserves that
+/// many `(name, type_name)` pairs and [`decode_block`] sizes its own
+/// vectors from it infallibly.
 ///
-/// For empty schema blocks (num_rows == 0) the body has no value
-/// bytes after the (name, type_name) pairs, so callers can use
-/// [`read_empty_data_block_schema`] to consume those without a
-/// full decoder.
+/// The caller consumes the body: [`read_empty_data_block_schema`] for a
+/// schema block, [`decode_block`] for a payload block.
 async fn read_data_block_header<R: ClickHouseRead>(
     r: &mut R,
     server_revision: u64,
@@ -314,18 +305,13 @@ async fn read_data_block_header<R: ClickHouseRead>(
         None
     };
 
-    // Block info -- (field_id varint, value) pairs + zero terminator.
-    // cpp `ReadBlock` 854-877. At every revision this client
-    // negotiates the server emits exactly field 1 (is_overflows, u8)
-    // then field 2 (bucket_num, i32 LE) then the zero terminator;
-    // field 3 (out_of_order_buckets) only appears at rev >= 54480,
-    // above our 54459 pin. The values themselves carry no meaning for
-    // a non-distributed client and are discarded -- but we assert the
-    // field ids rather than accept any (varint, u8)(varint, i32)
-    // (varint) shape, so a misaligned or hostile encoder surfaces as a
-    // clean BadResponse instead of a silently mis-parsed block. A
-    // future revision bump past 54480 must revisit this (and is a
-    // full re-audit event per the protocol-version pin policy).
+    // Block info -- (field_id varint, value) pairs + zero terminator,
+    // cpp `ReadBlock` 854-877. The values carry no meaning for a
+    // non-distributed client, but the field ids are asserted rather than
+    // skipped, so a misaligned or hostile encoder surfaces as a clean
+    // BadResponse instead of a silently mis-parsed block. Field 3
+    // (out_of_order_buckets) appears only above the 54459 revision pin,
+    // so a bump past 54480 must revisit this.
     if server_revision >= DBMS_MIN_REVISION_WITH_BLOCK_INFO {
         let field1 = r.read_var_uint().await?;
         if field1 != 1 {
@@ -350,29 +336,35 @@ async fn read_data_block_header<R: ClickHouseRead>(
     }
 
     let num_columns = r.read_var_uint().await?;
+    if num_columns > MAX_BLOCK_COLUMNS {
+        return Err(Error::BadResponse(format!(
+            "tcp: block header declares {num_columns} columns, above the \
+             {MAX_BLOCK_COLUMNS} cap"
+        )));
+    }
     let num_rows = r.read_var_uint().await?;
     Ok((table_name, num_columns, num_rows))
 }
 
 /// Read the body of an empty Data block (num_rows == 0) -- the
-/// `num_columns` pairs of `(name, type_name)` strings the server
-/// emits at the start of an INSERT, plus the optional custom-
-/// serialization flag byte per column on revisions at and above
-/// `DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION` (54454).
-/// Mirrors the inverse shape that [`crate::native::encode_columns`]
-/// produces.
+/// `num_columns` pairs of `(name, type_name)` strings, plus the
+/// custom-serialization flag byte per column at and above revision
+/// 54454. Mirrors the shape [`crate::native::encode_columns`] produces,
+/// and lets the reader advance past a schema block without running the
+/// full Native decoder.
 ///
-/// This helper exists so the actor's reader sub-task can advance
-/// past the schema block without a full Native decoder. The
-/// streaming-block path with non-zero rows lands in Task 8's
-/// cursor and decoder.
+/// [`read_data_block_header`] has already bounded `num_columns` by
+/// [`MAX_BLOCK_COLUMNS`]; the fallible reserve below is what keeps this
+/// safe when it is called with an unchecked count.
 ///
 /// # Errors
 ///
-/// I/O errors from the underlying reader. The `(name, type_name)`
-/// strings inherit the `MAX_STRING_SIZE` cap from
-/// [`ClickHouseRead::read_utf8_string`], so a corrupt or malicious
-/// schema block cannot OOM the client.
+/// [`Error::BadResponse`] when the allocation for `num_columns` cannot be
+/// reserved, or when a column carries a non-zero custom-serialization
+/// flag. I/O errors from the underlying reader otherwise. The
+/// `(name, type_name)` strings inherit the `MAX_STRING_SIZE` cap from
+/// [`ClickHouseRead::read_utf8_string`], so a corrupt or malicious schema
+/// block cannot OOM the client.
 pub(crate) async fn read_empty_data_block_schema<R: ClickHouseRead>(
     r: &mut R,
     num_columns: u64,
@@ -380,12 +372,26 @@ pub(crate) async fn read_empty_data_block_schema<R: ClickHouseRead>(
 ) -> Result<Vec<(String, String)>> {
     let has_custom_ser = server_revision
         >= crate::native::encode::DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION;
-    let mut out = Vec::with_capacity(usize::try_from(num_columns).unwrap_or(0));
+    // Reserve fallibly: the count is peer-supplied, and an infallible
+    // `with_capacity` aborts the process instead of erroring.
+    let capacity = usize::try_from(num_columns).unwrap_or(usize::MAX);
+    let mut out: Vec<(String, String)> = Vec::new();
+    out.try_reserve(capacity)
+        .map_err(|e| Error::BadResponse(format!("tcp: cannot reserve {capacity} columns: {e}")))?;
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
         let type_name = r.read_utf8_string().await?;
         if has_custom_ser {
-            let _flag = r.read_u8().await?;
+            // 0 = normal serialisation. A non-zero flag means the column
+            // body is framed differently, so reading it as normal would
+            // misalign every following packet.
+            let flag = r.read_u8().await?;
+            if flag != 0 {
+                return Err(Error::BadResponse(format!(
+                    "tcp: column '{name}' uses custom serialization flag {flag} \
+                     -- only normal (0) is supported"
+                )));
+            }
         }
         out.push((name, type_name));
     }
@@ -395,16 +401,12 @@ pub(crate) async fn read_empty_data_block_schema<R: ClickHouseRead>(
 /// Read and discard a server telemetry block (`Log` / `ProfileEvents`).
 ///
 /// Both packets are framed as one leading length-prefixed string (the
-/// log tag / host name) followed by a Native block -- cpp-client's
-/// `ReceivePacket` handles both with `SkipString` + `ReadBlock`, and
-/// clickhouse-go likewise reads-and-drops them.
-/// [`read_data_block_header`] consumes the leading string in its
-/// table-name slot (valid because this client always negotiates a
-/// revision at or above `DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES`
-/// (50264), so the slot is read) plus the block header; the block body
-/// is then consumed and its decoded values dropped. The bytes MUST be
-/// read or the next packet's leading varuint misaligns. v1 does not
-/// surface log lines or profile events to callers.
+/// log tag / host name) followed by a Native block, which cpp-client's
+/// `ReceivePacket` handles with `SkipString` + `ReadBlock` and
+/// clickhouse-go reads-and-drops. [`read_data_block_header`] consumes
+/// the leading string in its table-name slot, valid because this client
+/// always negotiates at or above revision 50264. The bytes must be read
+/// or the next packet's leading varuint misaligns.
 async fn consume_telemetry_block<R: ClickHouseRead>(r: &mut R, server_revision: u64) -> Result<()> {
     let (_tag, num_columns, num_rows) = read_data_block_header(r, server_revision).await?;
     if num_rows == 0 {
@@ -463,12 +465,9 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
         ServerPacketId::Pong => Ok(ServerPacket::Pong),
         ServerPacketId::EndOfStream => Ok(ServerPacket::EndOfStream),
         ServerPacketId::Log => {
-            // The server sends Log packets when the caller requested
-            // them via the `send_logs_level` setting (which apps may set
-            // globally and which is forwarded onto the TCP Query). Both
-            // upstream clients consume the block; rejecting it would
-            // poison every query under such a setting. Consume + drop;
-            // surfacing log lines to callers is a follow-up.
+            // Sent whenever the caller set `send_logs_level`, which apps
+            // may set globally, so rejecting the block would poison
+            // every query under that setting.
             consume_telemetry_block(r, server_revision).await?;
             Ok(ServerPacket::Log)
         }
@@ -484,10 +483,9 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
         ServerPacketId::TimezoneUpdate => {
             Ok(ServerPacket::TimezoneUpdate(r.read_utf8_string().await?))
         }
-        // A mid-stream Hello (or any other unexpected id) is a protocol
-        // surprise; surface as BadResponse rather than silently
-        // advancing the stream pointer past unknown payload bytes.
-        other => Err(Error::BadResponse(format!(
+        // A mid-stream Hello is a protocol surprise; surface it rather
+        // than advance the stream pointer past unknown payload bytes.
+        other @ ServerPacketId::Hello => Err(Error::BadResponse(format!(
             "tcp: unexpected server packet {other:?} mid-stream"
         ))),
     }
@@ -542,7 +540,196 @@ mod tests {
         assert_eq!(exc.name, "DB::Exception");
         assert_eq!(exc.message, "msg");
         assert_eq!(exc.stack_trace.len(), TCP_EXCEPTION_STACK_TRACE_CAP);
-        assert!(exc.nested.is_none());
+    }
+
+    /// A server stack trace is arbitrary UTF-8, so the per-frame cap has
+    /// to cut on a character boundary or the read panics.
+    #[tokio::test]
+    async fn exception_stack_trace_truncation_is_char_boundary_safe() {
+        // 1 << 20 is not divisible by 3, so a run of three-byte
+        // characters guarantees the cap lands mid-character.
+        let big = "\u{20ac}".repeat(TCP_EXCEPTION_STACK_TRACE_CAP);
+        assert!(!big.is_char_boundary(TCP_EXCEPTION_STACK_TRACE_CAP));
+        let mut buf = Vec::new();
+        buf.write_i32_le(100i32).await.unwrap();
+        buf.write_string("DB::Exception".as_bytes()).await.unwrap();
+        buf.write_string("msg".as_bytes()).await.unwrap();
+        buf.write_string(big.as_bytes()).await.unwrap();
+        buf.write_u8(0).await.unwrap();
+        let mut cur = Cursor::new(buf);
+        let exc = read_exception(&mut cur).await.unwrap();
+        assert!(exc.stack_trace.len() <= TCP_EXCEPTION_STACK_TRACE_CAP);
+        assert!(exc.stack_trace.len() > TCP_EXCEPTION_STACK_TRACE_CAP - 3);
+    }
+
+    /// The `has_nested` byte is obsolete on both sides: the server
+    /// hardcodes it false (`WriteHelpers.cpp:91-92`) and its own reader
+    /// ignores it (`ReadHelpers.cpp:1964,1970`). Reading it and stopping
+    /// is what keeps a peer-supplied byte from steering recursion, and
+    /// the trailing sentinel proves the stream stays aligned.
+    #[tokio::test]
+    async fn read_exception_ignores_the_obsolete_nested_flag() {
+        let mut buf = Vec::new();
+        buf.write_i32_le(60i32).await.unwrap();
+        buf.write_string(b"DB::Exception").await.unwrap();
+        buf.write_string(b"outer").await.unwrap();
+        buf.write_string(b"").await.unwrap();
+        buf.write_u8(1).await.unwrap(); // obsolete has_nested = true
+        buf.write_var_uint(ServerPacketId::EndOfStream as u64)
+            .await
+            .unwrap();
+
+        let mut cur = Cursor::new(buf);
+        let exc = read_exception(&mut cur)
+            .await
+            .expect("the obsolete flag must not change the frame shape");
+        assert_eq!(exc.code, 60);
+        assert_eq!(exc.message, "outer");
+
+        let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        assert!(matches!(trailing, ServerPacket::EndOfStream));
+    }
+
+    /// `num_columns` is an unbounded varuint from the peer that both
+    /// block bodies size allocations from, and `Vec::with_capacity`
+    /// aborts rather than erroring, so the header read rejects it before
+    /// either body is entered -- the packet is truncated after
+    /// `num_columns`, which only parses if nothing reads past it.
+    #[tokio::test]
+    async fn read_packet_rejects_an_absurd_column_count() {
+        let mut buf = Vec::new();
+        buf.write_var_uint(ServerPacketId::Data as u64)
+            .await
+            .unwrap();
+        buf.write_string(b"").await.unwrap();
+        buf.write_var_uint(1).await.unwrap();
+        buf.write_u8(0).await.unwrap();
+        buf.write_var_uint(2).await.unwrap();
+        buf.write_i32_le(-1).await.unwrap();
+        buf.write_var_uint(0).await.unwrap();
+        buf.write_var_uint(1 << 60).await.unwrap(); // num_columns
+
+        let mut cur = Cursor::new(buf);
+        let err = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .expect_err("an absurd column count must be refused, not allocated");
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("above the"), "got {msg}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// Called with an unchecked count, the schema reader still errors
+    /// rather than aborting the process on the allocation.
+    #[tokio::test]
+    async fn read_empty_data_block_schema_reserves_fallibly() {
+        let mut cur = Cursor::new(Vec::new());
+        let err = read_empty_data_block_schema(&mut cur, 1 << 60, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .expect_err("an absurd column count must not be reserved infallibly");
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("cannot reserve"), "got {msg}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// A non-zero custom-serialization flag means the column body is
+    /// framed differently, so reading on would misalign the stream.
+    /// Matches `decode_block`'s handling of the same byte.
+    #[tokio::test]
+    async fn read_empty_data_block_schema_rejects_custom_serialization() {
+        let mut buf = Vec::new();
+        buf.write_string(b"n").await.unwrap();
+        buf.write_string(b"UInt64").await.unwrap();
+        buf.write_u8(1).await.unwrap();
+        let mut cur = Cursor::new(buf);
+        let err = read_empty_data_block_schema(&mut cur, 1, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .expect_err("a non-zero custom-serialization flag must be refused");
+        match err {
+            Error::BadResponse(msg) => {
+                assert!(msg.contains("custom serialization flag 1"), "got {msg}");
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// xorshift64*, so the property test needs no dev-dependency and
+    /// reproduces exactly from its seed.
+    struct Prng(u64);
+
+    impl Prng {
+        fn next_u64(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn next_byte(&mut self) -> u8 {
+            (self.next_u64() >> 33) as u8
+        }
+    }
+
+    /// `read_packet` faces bytes from an unauthenticated peer until the
+    /// handshake completes and from a possibly-buggy one after, so it
+    /// must return `Ok` or `Err` for any input -- never panic, and never
+    /// abort on an allocation.
+    #[tokio::test]
+    async fn read_packet_survives_garbage_and_truncation() {
+        // A well-formed schema-block packet, mutated below.
+        let mut good = Vec::new();
+        good.write_var_uint(ServerPacketId::Data as u64)
+            .await
+            .unwrap();
+        good.write_string(b"").await.unwrap();
+        good.write_var_uint(1).await.unwrap();
+        good.write_u8(0).await.unwrap();
+        good.write_var_uint(2).await.unwrap();
+        good.write_i32_le(-1).await.unwrap();
+        good.write_var_uint(0).await.unwrap();
+        good.write_var_uint(2).await.unwrap();
+        good.write_var_uint(0).await.unwrap();
+        good.write_string(b"n").await.unwrap();
+        good.write_string(b"UInt64").await.unwrap();
+        good.write_u8(0).await.unwrap();
+        good.write_string(b"s").await.unwrap();
+        good.write_string(b"String").await.unwrap();
+        good.write_u8(0).await.unwrap();
+
+        let mut rng = Prng(0x5DEE_CE66_D1CE_B00D);
+        for case in 0..4096u32 {
+            let mut bytes = good.clone();
+            match case % 4 {
+                // Truncation at an arbitrary point.
+                0 => {
+                    let cut = (rng.next_u64() as usize) % (bytes.len() + 1);
+                    bytes.truncate(cut);
+                }
+                // A single flipped byte.
+                1 => {
+                    let at = (rng.next_u64() as usize) % bytes.len();
+                    bytes[at] = rng.next_byte();
+                }
+                // A corrupt prefix over the header fields.
+                2 => {
+                    let n = 1 + (rng.next_u64() as usize) % 12;
+                    for b in bytes.iter_mut().take(n) {
+                        *b = rng.next_byte();
+                    }
+                }
+                // Wholly random input of a random length.
+                _ => {
+                    let len = (rng.next_u64() as usize) % 64;
+                    bytes = (0..len).map(|_| rng.next_byte()).collect();
+                }
+            }
+            let mut cur = Cursor::new(bytes);
+            // Either outcome is fine; a panic or an abort is not.
+            let _ = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION).await;
+        }
     }
 
     #[tokio::test]
@@ -737,9 +924,8 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(pkt, ServerPacket::ProfileEvents));
-        // The block bytes were consumed: the trailing EndOfStream reads
-        // cleanly. Before the fix this misaligned on the first
-        // ProfileEvents packet of any live query.
+        // The trailing EndOfStream reads cleanly only if the whole
+        // ProfileEvents block was consumed.
         let trailing = read_packet(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
             .await
             .unwrap();

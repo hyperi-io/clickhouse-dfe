@@ -2,56 +2,51 @@
 //!
 //! Pairs with `crate::tcp::connection_actor::ConnectionCmd::ExecuteStream`.
 //!
-//! [`TcpRawCursor`] is the v1 entry point: it yields whole
-//! [`DecodedBlock`]s one at a time. Callers walk the columnar container
-//! themselves; no row-serde bridge involved.
+//! [`TcpRawCursor`] yields whole [`DecodedBlock`]s one at a time; callers
+//! walk the columnar container themselves, with no row-serde bridge.
 //!
 //! A per-row deserialising cursor that bridges to the upstream
-//! `crate::Row` trait is a follow-up: `Row` is built around
-//! `serde::Deserialize` over RowBinary bytes, so it needs a transpose
-//! pass from the column-oriented [`DecodedBlock`] back to per-row
-//! RowBinary. That type lands with its implementation rather than as
-//! an always-erroring placeholder.
+//! `crate::Row` trait needs a transpose pass from the column-oriented
+//! [`DecodedBlock`] back to per-row RowBinary, so it lands with its
+//! implementation rather than as an always-erroring placeholder.
 //!
 //! # Cancel-on-drop
 //!
 //! Dropping the cursor drops its `mpsc::Receiver`, which trips the
-//! `results.closed()` watch the actor's `do_execute_stream` runs.
-//! That triggers a protocol Cancel + bounded drain inside the actor
-//! itself -- no explicit `tokio::spawn` from the cursor's `Drop`. The
-//! "runtime Handle captured for Drop-time spawn survival" pattern
-//! used elsewhere in this crate still applies in principle: we
-//! capture [`tokio::runtime::Handle::current`] at construction so
-//! future growth (e.g. a v2 sync-context cursor.next() backed by
-//! `block_on`) does not have to track down the right runtime. The
-//! Handle is stored even though v1 does not use it.
+//! `results.closed()` watch the actor's `do_execute_stream` runs. That
+//! triggers a protocol Cancel plus a bounded drain inside the actor
+//! itself, then releases the pool slot the cursor was holding.
 
+use deadpool::managed::Object;
 use tokio::sync::mpsc;
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::native::decode::DecodedBlock;
+use crate::tcp::pool::TcpConnectionManager;
 use crate::tcp::reader::ServerPacket;
 
 /// Whole-block streaming-SELECT cursor.
 ///
-/// Returns one [`DecodedBlock`] per `next()` call until the server
-/// emits `EndOfStream` (`next()` returns `Ok(None)`) or an Exception
-/// (`next()` returns `Err(Error::ServerException)`). Schema blocks
-/// (`num_rows == 0`) are surfaced as well so callers that care about
-/// the announced `(name, type_name)` pairs can read them; payload
-/// blocks always carry their own schema too via
-/// [`DecodedBlock::schema`] so most cursors skip the empty one.
+/// Returns one [`DecodedBlock`] per [`Self::next_block`] call until the
+/// server emits `EndOfStream` (`Ok(None)`) or an Exception
+/// (`Err(Error::ServerException)`). Schema blocks (`num_rows == 0`) are
+/// surfaced too, so callers that care about the announced
+/// `(name, type_name)` pairs can read them; payload blocks always carry
+/// their own schema via [`DecodedBlock::schema`].
+#[non_exhaustive]
 pub struct TcpRawCursor {
     rx: mpsc::Receiver<Result<ServerPacket>>,
-    /// Captured for any v2 Drop-time spawn need. Reserved -- not
-    /// consulted in v1. Holding `Handle::current()` at construction
-    /// means a future Drop that wants to schedule cleanup work (the
-    /// classic kill-on-drop pattern) survives the TLS-current-runtime
-    /// tear-down a generic sync caller would otherwise trigger.
-    _runtime: tokio::runtime::Handle,
-    /// `true` once an EndOfStream or Exception has been observed.
-    /// `next()` returns `Ok(None)` thereafter without touching `rx`.
+    /// The pool slot stays checked out for the life of the cursor, so the
+    /// connection streaming these blocks cannot be handed to another
+    /// caller mid-stream.
+    pool_slot: Option<Object<TcpConnectionManager>>,
+    /// `true` once an EndOfStream or an error has been observed;
+    /// [`Self::next_block`] then returns `Ok(None)` without touching `rx`.
     done: bool,
+    /// `true` only after EndOfStream. A closed channel without it means
+    /// the actor died mid-stream, which is an error, not a finished
+    /// result set.
+    saw_eos: bool,
 }
 
 impl TcpRawCursor {
@@ -64,9 +59,18 @@ impl TcpRawCursor {
     pub(crate) fn from_receiver(rx: mpsc::Receiver<Result<ServerPacket>>) -> Self {
         Self {
             rx,
-            _runtime: tokio::runtime::Handle::current(),
+            pool_slot: None,
             done: false,
+            saw_eos: false,
         }
+    }
+
+    /// Hold `slot` until the cursor drops. The dispatch helper calls this
+    /// with the object it acquired, because a slot released at dispatch
+    /// time would let the next caller take a connection that is still
+    /// streaming.
+    pub(crate) fn hold_pool_slot(&mut self, slot: Object<TcpConnectionManager>) {
+        self.pool_slot = Some(slot);
     }
 
     /// Pull the next [`DecodedBlock`] off the stream. Returns:
@@ -76,11 +80,14 @@ impl TcpRawCursor {
     ///   `block.num_rows == 0` if they want payload-only iteration.
     /// - `Ok(None)` when the server has emitted EndOfStream -- the
     ///   stream is fully drained, the connection is reusable.
-    /// - `Err(Error::ServerException { .. })` if the server returned
-    ///   an Exception mid-stream; the actor will drain to EndOfStream
-    ///   on its own, so the connection stays reusable.
-    /// - `Err(other)` for I/O or decode failures; the actor poisons
-    ///   the connection on these.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ServerException`] if the server returned an Exception
+    ///   mid-stream; the actor leaves the connection reusable.
+    /// - [`Error::Custom`] if the actor exited before EndOfStream.
+    /// - Any I/O or decode error the actor forwarded; the actor poisons
+    ///   the connection on those.
     pub async fn next_block(&mut self) -> Result<Option<DecodedBlock>> {
         if self.done {
             return Ok(None);
@@ -88,18 +95,20 @@ impl TcpRawCursor {
         loop {
             match self.rx.recv().await {
                 None => {
-                    // Actor exited without forwarding a final packet
-                    // -- treat as terminal so subsequent `next_block`
-                    // calls return `Ok(None)` rather than panic on a
-                    // closed receiver.
                     self.done = true;
-                    return Ok(None);
+                    if self.saw_eos {
+                        return Ok(None);
+                    }
+                    return Err(Error::Custom(
+                        "tcp: connection actor exited before EndOfStream".into(),
+                    ));
                 }
                 Some(Err(e)) => {
                     self.done = true;
                     return Err(e);
                 }
                 Some(Ok(ServerPacket::EndOfStream)) => {
+                    self.saw_eos = true;
                     self.done = true;
                     return Ok(None);
                 }
@@ -109,11 +118,9 @@ impl TcpRawCursor {
                 Some(Ok(ServerPacket::Data {
                     num_rows, columns, ..
                 })) => {
-                    // Surface the schema block as an empty
-                    // DecodedBlock; downstream callers cross-reference
-                    // `schema.len()` for the authoritative column
-                    // count, and a payload block follows shortly with
-                    // populated `columns`.
+                    // The schema block declares the columns but carries no
+                    // values; `schema.len()` is the authoritative column
+                    // count and a payload block follows with the values.
                     return Ok(Some(DecodedBlock {
                         columns: Vec::new(),
                         schema: columns,
@@ -121,9 +128,9 @@ impl TcpRawCursor {
                     }));
                 }
                 // Progress / ProfileInfo / TableColumns / TimezoneUpdate
-                // are not row data; skip and keep pulling until we see
-                // a block, EndOfStream, or Exception.
-                Some(Ok(_)) => continue,
+                // are not row data; keep pulling until we see a block,
+                // EndOfStream, or an Exception.
+                Some(Ok(_)) => {}
             }
         }
     }
@@ -132,7 +139,6 @@ impl TcpRawCursor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::Error;
     use crate::native::decode::DecodedColumn;
     use crate::tcp::reader::ServerPacket;
 
@@ -218,6 +224,29 @@ mod tests {
         .await
         .unwrap();
         tx.send(Ok(ServerPacket::EndOfStream)).await.unwrap();
+        assert!(cur.next_block().await.unwrap().is_none());
+    }
+
+    /// A channel that closes without EndOfStream means the actor died
+    /// mid-stream; reporting that as a clean end would silently truncate
+    /// the result set.
+    #[tokio::test]
+    async fn raw_cursor_errors_when_the_actor_dies_before_end_of_stream() {
+        let (tx, rx) = mpsc::channel::<Result<ServerPacket>>(4);
+        let mut cur = TcpRawCursor::from_receiver(rx);
+        drop(tx);
+        let err = cur
+            .next_block()
+            .await
+            .expect_err("a closed channel without EndOfStream is an error");
+        match err {
+            Error::Custom(msg) => assert!(
+                msg.contains("before EndOfStream"),
+                "expected a truncated-stream message, got {msg}"
+            ),
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        // Terminal afterwards, like every other end state.
         assert!(cur.next_block().await.unwrap().is_none());
     }
 }

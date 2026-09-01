@@ -34,10 +34,13 @@ macro_rules! ratcheted {
 
 pub mod native;
 
+// Crate-internal, and the TCP connection actor is its only consumer, so
+// it compiles with that transport rather than unconditionally.
+#[cfg(feature = "tcp")]
+mod worker;
+
 ratcheted! {
     pub mod error;
-
-    pub mod worker;
 
     #[cfg(feature = "tcp")]
     pub mod tcp;

@@ -36,20 +36,16 @@ use crate::tcp::protocol::{
 /// distinguish rust-client traffic from other drivers.
 pub(crate) const CLIENT_NAME: &str = "ClickHouse rust-client";
 
-/// Client major version, as `&'static str` from Cargo's env. Parsed to
-/// u64 at runtime in send_hello/ClientInfo via `.parse().unwrap_or(0)`;
-/// a const-fn parse does not compile against `env!`. The fallback to 0
-/// is a defensive default that never triggers for a well-formed crate
-/// (CARGO_PKG_VERSION_MAJOR is always a decimal integer).
+/// Client major version; parsed to `u64` at each use site.
 pub(crate) const CLIENT_VERSION_MAJOR_STR: &str = env!("CARGO_PKG_VERSION_MAJOR");
-/// Client minor version. Same const-fn-parse caveat as
-/// [`CLIENT_VERSION_MAJOR_STR`].
+/// Client minor version; parsed to `u64` at each use site.
 pub(crate) const CLIENT_VERSION_MINOR_STR: &str = env!("CARGO_PKG_VERSION_MINOR");
 
-/// Revision this client advertises when no server-negotiated revision
-/// is available yet (i.e. during Hello). After Handshake the server's
-/// revision is used everywhere else.
-pub(crate) const CLIENT_REVISION_FALLBACK: u64 = DBMS_TCP_PROTOCOL_VERSION;
+/// `flags` byte on a query-parameter entry. ClickHouse serialises bound
+/// parameters through its settings writer, where a name it does not know
+/// as a setting carries the CUSTOM flag; matches clickhouse-go's
+/// `Parameters.Encode`.
+const SETTING_FLAG_CUSTOM: u64 = 2;
 
 #[inline]
 fn client_version_major() -> u64 {
@@ -110,6 +106,14 @@ pub(crate) async fn send_addendum<W: ClickHouseWrite>(
 /// returns `Error::Other` rather than silently dropping them (matches
 /// cpp `UnimplementedError`).
 ///
+/// `params` are the server-side query parameters a `{name:Type}`
+/// placeholder in `query` resolves against. They ride the same
+/// `(name, flags, value)` triple shape as settings, in their own
+/// revision-gated section, but with the CUSTOM flag, because the server
+/// reads them through its custom-setting path
+/// (`TCPHandler.cpp:2268-2270` -> `BaseSettings::read`). Each value is
+/// therefore a ClickHouse Field dump, not free literal text.
+///
 /// Setting names and values are emitted verbatim as length-prefixed
 /// strings; the server consumes them as plain settings (no SQL parsing
 /// of the value at this layer). Validating the contents -- rejecting
@@ -121,6 +125,7 @@ pub(crate) async fn send_query<W: ClickHouseWrite>(
     query_id: &str,
     query: &str,
     extra_settings: &[(String, String)],
+    params: &[(String, String)],
     client_info: &ClientInfo,
 ) -> Result<()> {
     w.write_var_uint(ClientPacketId::Query as u64).await?;
@@ -155,16 +160,24 @@ pub(crate) async fn send_query<W: ClickHouseWrite>(
 
     w.write_var_uint(QueryProcessingStage::Complete as u64)
         .await?;
-    // Compression off; subsequent branches negotiate this via Client config.
+    // Compression off: the handshake never negotiates a block codec.
     w.write_var_uint(0).await?;
     w.write_string(query.as_bytes()).await?;
 
     if server_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS {
-        // No bound parameters supported at this layer yet; emit the
-        // empty-string terminator cpp writes at lines 1124. Param
-        // support lands later without changing this terminator's
-        // placement.
+        for (name, value) in params {
+            w.write_string(name.as_bytes()).await?;
+            w.write_var_uint(SETTING_FLAG_CUSTOM).await?;
+            w.write_string(value.as_bytes()).await?;
+        }
+        // Empty name marks end-of-parameters (cpp SendQuery line 1124).
         w.write_string(b"").await?;
+    } else if !params.is_empty() {
+        return Err(Error::Other(
+            "tcp: server revision predates bound query parameters \
+             (revision 54459); upgrade the server or inline the values"
+                .into(),
+        ));
     }
 
     w.flush().await?;
@@ -317,6 +330,146 @@ mod tests {
         assert_eq!(cur.position() as usize, buf.len());
     }
 
+    /// Walk the whole Query frame at the pinned revision: settings
+    /// triples, the settings terminator, the interserver-secret slot,
+    /// stage, compression, the SQL, then the parameters section and its
+    /// terminator. A misplaced field silently shifts every later one.
+    #[tokio::test]
+    async fn send_query_byte_layout_at_current_revision() {
+        let mut buf = Vec::new();
+        let ci = ClientInfo::for_initial_query(
+            CLIENT_NAME,
+            client_version_major(),
+            client_version_minor(),
+            DBMS_TCP_PROTOCOL_VERSION,
+            "",
+        );
+        let settings = vec![
+            ("max_block_size".to_string(), "1024".to_string()),
+            ("database".to_string(), "dfe".to_string()),
+        ];
+        let params = vec![
+            ("db".to_string(), "'default'".to_string()),
+            ("n".to_string(), "42".to_string()),
+        ];
+        send_query(
+            &mut buf,
+            DBMS_TCP_PROTOCOL_VERSION,
+            "qid",
+            "SELECT {n:UInt64}",
+            &settings,
+            &params,
+            &ci,
+        )
+        .await
+        .unwrap();
+
+        let mut cur = std::io::Cursor::new(&buf[..]);
+        assert_eq!(
+            cur.read_var_uint().await.unwrap(),
+            ClientPacketId::Query as u64
+        );
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "qid");
+
+        // ClientInfo, verified field-by-field in client_info.rs; skip to
+        // its end by re-reading the same shape.
+        skip_client_info(&mut cur).await;
+
+        // Settings: (name, flags, value) triples then an empty name.
+        for (name, value) in &settings {
+            assert_eq!(&cur.read_utf8_string().await.unwrap(), name);
+            assert_eq!(cur.read_var_uint().await.unwrap(), 0, "settings flags");
+            assert_eq!(&cur.read_utf8_string().await.unwrap(), value);
+        }
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "");
+
+        // Interserver secret, empty for a non-distributed client.
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "");
+
+        assert_eq!(
+            cur.read_var_uint().await.unwrap(),
+            QueryProcessingStage::Complete as u64
+        );
+        assert_eq!(cur.read_var_uint().await.unwrap(), 0, "compression off");
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "SELECT {n:UInt64}");
+
+        // Parameters: the same triple shape, flags = CUSTOM, then the
+        // empty-name terminator.
+        for (name, value) in &params {
+            assert_eq!(&cur.read_utf8_string().await.unwrap(), name);
+            assert_eq!(
+                cur.read_var_uint().await.unwrap(),
+                SETTING_FLAG_CUSTOM,
+                "a bound parameter is a custom setting"
+            );
+            assert_eq!(&cur.read_utf8_string().await.unwrap(), value);
+        }
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "");
+
+        assert_eq!(
+            cur.position() as usize,
+            buf.len(),
+            "the frame must be fully consumed"
+        );
+    }
+
+    /// Consume a `ClientInfo` block written at the pinned revision.
+    async fn skip_client_info(cur: &mut std::io::Cursor<&[u8]>) {
+        use tokio::io::AsyncReadExt;
+        let mut one = [0u8; 1];
+        cur.read_exact(&mut one).await.unwrap(); // query_kind
+        for _ in 0..3 {
+            let _ = cur.read_utf8_string().await.unwrap(); // initial_user/query_id/address
+        }
+        let _ = cur.read_i64_le().await.unwrap(); // initial_query_start_time
+        cur.read_exact(&mut one).await.unwrap(); // iface_type
+        for _ in 0..3 {
+            let _ = cur.read_utf8_string().await.unwrap(); // os_user/hostname/client_name
+        }
+        for _ in 0..3 {
+            let _ = cur.read_var_uint().await.unwrap(); // major/minor/revision
+        }
+        let _ = cur.read_utf8_string().await.unwrap(); // quota_key
+        let _ = cur.read_var_uint().await.unwrap(); // distributed_depth
+        let _ = cur.read_var_uint().await.unwrap(); // version_patch
+        cur.read_exact(&mut one).await.unwrap(); // opentelemetry marker
+        for _ in 0..3 {
+            let _ = cur.read_var_uint().await.unwrap(); // parallel-replicas zeros
+        }
+    }
+
+    /// Bound parameters cannot be expressed below revision 54459, so
+    /// sending them silently would drop the values and the server would
+    /// reject the `{name:Type}` placeholder.
+    #[tokio::test]
+    async fn send_query_rejects_parameters_below_the_revision_gate() {
+        let mut buf = Vec::new();
+        let ci = ClientInfo::for_initial_query(
+            CLIENT_NAME,
+            client_version_major(),
+            client_version_minor(),
+            DBMS_TCP_PROTOCOL_VERSION,
+            "",
+        );
+        let params = vec![("db".to_string(), "'default'".to_string())];
+        let old = DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS - 1;
+        let err = send_query(
+            &mut buf,
+            old,
+            "qid",
+            "SELECT {db:String}",
+            &[],
+            &params,
+            &ci,
+        )
+        .await
+        .expect_err("parameters below the gate must be refused");
+        match err {
+            Error::Other(_) => {}
+            other => panic!("expected Error::Other, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn send_query_rejects_old_revision() {
         let mut buf = Vec::new();
@@ -332,9 +485,17 @@ mod tests {
         // loop before failing.
         let old_revision = DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS - 1;
         let settings = vec![("max_block_size".to_string(), "1024".to_string())];
-        let err = send_query(&mut buf, old_revision, "qid", "SELECT 1", &settings, &ci)
-            .await
-            .expect_err("expected Error::Other for too-old server revision");
+        let err = send_query(
+            &mut buf,
+            old_revision,
+            "qid",
+            "SELECT 1",
+            &settings,
+            &[],
+            &ci,
+        )
+        .await
+        .expect_err("expected Error::Other for too-old server revision");
         match err {
             Error::Other(_) => {}
             other => panic!("expected Error::Other, got {other:?}"),

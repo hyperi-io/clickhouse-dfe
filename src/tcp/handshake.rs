@@ -13,40 +13,33 @@
 //! Returns the [`ServerHello`] so the caller can pin its connection
 //! state to the negotiated revision for every subsequent packet.
 //!
-//! ## Chunked-packet protocol -- deferred
+//! ## Chunked-packet protocol
 //!
-//! ClickHouse 24.x added an OPTIONAL chunked-packet protocol mode
-//! gated on `DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS`
-//! (54470). When both peers advertise that revision, the addendum
-//! exchange grows two extra strings (send-direction mode and
-//! recv-direction mode, each one of `"notchunked"`,
-//! `"notchunked_optional"`, `"chunked"`, `"chunked_optional"`).
-//!
-//! This branch does NOT implement chunked mode. The unchunked
-//! protocol is implicitly advertised by omitting the extra strings,
-//! and the server falls back. A later branch can extend
-//! `handshake` with chunked-mode negotiation without changing the
-//! function's external signature.
+//! ClickHouse 24.x added an optional chunked-packet mode gated on
+//! revision 54470, which grows the addendum by two mode strings. This
+//! client's revision pin is 54459, below the gate, so omitting the
+//! strings advertises the unchunked protocol and the server falls back.
 
 use crate::error::Result;
 use crate::native::io::{ClickHouseRead, ClickHouseWrite};
 use crate::tcp::protocol::ServerHello;
 use crate::tcp::{reader, writer};
 
-/// Handshake parameters supplied by the caller. Mirrors the inputs
-/// `clickhouse-cpp-client` reads from its `ClientOptions` at
-/// handshake time: `default_database`, `user`, `password`, and the
-/// quota-key string emitted in the post-Hello addendum.
+/// Handshake parameters supplied by the caller, mirroring what
+/// `clickhouse-cpp-client` reads from its `ClientOptions`.
 ///
-/// The defaults match server defaults: empty quota-key, `"default"`
-/// database, `"default"` user, empty password. A caller that wants
-/// anonymous access against a freshly installed ClickHouse server
-/// can use [`HandshakeConfig::default`] unchanged.
+/// The defaults match ClickHouse's own: `"default"` database and user,
+/// empty password and quota key.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct HandshakeConfig {
+    /// Default database for the session.
     pub database: String,
+    /// Username presented in the client Hello.
     pub user: String,
+    /// Password presented in the client Hello.
     pub password: String,
+    /// Quota key emitted in the post-Hello addendum and in `ClientInfo`.
     pub quota_key: String,
 }
 
@@ -64,23 +57,15 @@ impl Default for HandshakeConfig {
 /// Drive the TCP handshake on `stream`, returning the negotiated
 /// [`ServerHello`].
 ///
-/// `stream` must satisfy both [`ClickHouseRead`] and
-/// [`ClickHouseWrite`]; in practice the actor passes an unsplit
-/// [`crate::tcp::transport::MaybeTlsStream`] (which has blanket
-/// impls of both traits via the standard
-/// `AsyncRead + AsyncWrite + Unpin + Send + Sync` bound set).
-/// The handshake is half-duplex -- each step flushes before the
-/// next read or write -- so a single `&mut` reference to the
-/// unsplit stream is sufficient.
+/// The exchange is half-duplex -- each step flushes before the next read
+/// or write -- so one `&mut` to the unsplit stream is sufficient; the
+/// caller splits afterwards for the actor's long-lived loop.
 ///
-/// On a server error (auth failure, server still starting, etc.)
-/// the server replies with an Exception packet in place of Hello.
-/// [`reader::read_hello`] flattens that into an
-/// [`crate::error::Error::ServerException`] before this function
-/// returns.
+/// # Errors
 ///
-/// See the module docstring for the chunked-packet protocol
-/// deferral note.
+/// [`crate::error::Error::ServerException`] when the server replies with
+/// an Exception in place of Hello (auth failure, server still starting),
+/// flattened by [`reader::read_hello`]; I/O errors otherwise.
 pub(crate) async fn handshake<S>(stream: &mut S, cfg: &HandshakeConfig) -> Result<ServerHello>
 where
     S: ClickHouseRead + ClickHouseWrite,

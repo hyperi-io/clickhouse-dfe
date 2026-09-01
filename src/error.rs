@@ -67,6 +67,16 @@ pub enum Error {
     },
     #[error("bad response: {0}")]
     BadResponse(String),
+    /// A transport-level failure that a fresh attempt may not hit --
+    /// a pool-acquire timeout, a closed pool, a hook failure. Typed so
+    /// retry classification does not have to match on message text.
+    #[error("transient transport failure: {0}")]
+    Transient(String),
+    /// A connection could not be opened: an unresolvable host, a host
+    /// that resolved to no addresses, an empty endpoint list. Typed for
+    /// the same reason as [`Error::Transient`].
+    #[error("connect failed: {0}")]
+    Connect(String),
     #[error("timeout expired")]
     TimedOut,
     #[error("error while parsing columns header from the response: {0}")]
@@ -141,9 +151,9 @@ impl Error {
     /// Conservative retriability classification.
     ///
     /// Returns `true` for errors that *might* succeed on retry --
-    /// transport-level (`Network`, `TimedOut`) and a known set of
-    /// transient server-side codes (timeouts, simultaneous-query
-    /// limits, parts-count overruns, Keeper hiccups).
+    /// transport-level (`Network`, `TimedOut`, `Transient`, `Connect`)
+    /// and a known set of transient server-side codes (timeouts,
+    /// simultaneous-query limits, parts-count overruns, Keeper hiccups).
     ///
     /// Returns `false` for everything else, including unknown
     /// server codes. The classification is intentionally
@@ -155,7 +165,10 @@ impl Error {
     #[must_use]
     pub fn is_retriable(&self) -> bool {
         match self {
-            Self::Network(_) | Self::TimedOut => true,
+            // `Transient` and `Connect` are only ever built for a
+            // condition a fresh attempt may not hit, so they classify
+            // here rather than on their message text.
+            Self::Network(_) | Self::TimedOut | Self::Transient(_) | Self::Connect(_) => true,
             Self::ServerException { code, .. } => Self::is_retriable_code(*code),
             _ => false,
         }

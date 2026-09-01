@@ -17,10 +17,14 @@ use crate::tcp::client::TcpClient;
 ///
 /// Shaped like upstream's `Query` so the unified client can offer one
 /// call shape over both transports.
+#[non_exhaustive]
 pub struct TcpQuery<'a> {
     client: &'a TcpClient,
     sql: String,
     query_id: String,
+    /// Server-side query parameters, sent in the Query packet's
+    /// parameters section rather than interpolated into the SQL.
+    params: Vec<(String, String)>,
 }
 
 impl<'a> TcpQuery<'a> {
@@ -29,14 +33,51 @@ impl<'a> TcpQuery<'a> {
             client,
             sql: sql.to_owned(),
             query_id: String::new(),
+            params: Vec::new(),
         }
     }
 
     /// Set the `query_id` the server records in `system.query_log` and
     /// matches on in `KILL QUERY`. Empty (the default) lets the server
     /// assign one.
+    #[must_use]
     pub fn with_query_id(mut self, query_id: impl Into<String>) -> Self {
         self.query_id = query_id.into();
+        self
+    }
+
+    /// Bind a server-side parameter that the SQL references as
+    /// `{name:Type}`, e.g. `{database:String}`.
+    ///
+    /// The value travels in the Query packet's own parameters section,
+    /// never interpolated into the SQL, so it cannot change the
+    /// statement's shape.
+    ///
+    /// `value` is a ClickHouse **Field dump**, which is what the server
+    /// restores the parameters section with (`Field::restoreFromDump`,
+    /// `src/Core/Field.cpp:705`): a quoted literal for a string, and
+    /// likewise for a number, because the server casts the string to the
+    /// type the placeholder declares. `NULL` binds a null. A bare `41`
+    /// is refused with `CANNOT_RESTORE_FROM_FIELD_DUMP` (536); the
+    /// prefixed forms (`UInt64_41`, `Float64_1.5`) are accepted too.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # use clickhouse_dfe::TcpClient;
+    /// # async fn run(client: &TcpClient) -> clickhouse_dfe::Result<()> {
+    /// let blocks = client
+    ///     .query("SELECT name FROM system.columns WHERE database = {db:String}")
+    ///     .param("db", "'default'")
+    ///     .fetch_blocks()
+    ///     .await?;
+    /// # let _ = blocks;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.params.push((name.into(), value.into()));
         self
     }
 
@@ -50,7 +91,7 @@ impl<'a> TcpQuery<'a> {
     /// statement, or a transport error if the connection failed.
     pub async fn execute(self) -> Result<()> {
         self.client
-            .execute_query(&self.query_id, &self.sql, false)
+            .execute_query(&self.query_id, &self.sql, &self.params, false)
             .await
     }
 
@@ -66,7 +107,7 @@ impl<'a> TcpQuery<'a> {
     pub async fn fetch_blocks(self) -> Result<Vec<DecodedBlock>> {
         let mut cursor = self
             .client
-            .execute_stream(&self.query_id, &self.sql)
+            .execute_stream(&self.query_id, &self.sql, &self.params)
             .await?;
         let mut blocks = Vec::new();
         while let Some(block) = cursor.next_block().await? {

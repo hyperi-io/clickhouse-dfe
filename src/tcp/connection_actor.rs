@@ -1,45 +1,31 @@
 //! Background-task socket-state owner for ClickHouse TCP connections.
 //!
 //! Built on the generic `crate::worker::CommandWorker` primitive. The
-//! actor owns the writer half of a [`MaybeTlsStream`] for the lifetime
-//! of the connection; an independent reader sub-task owns the read
-//! half and forwards every decoded server packet through a bounded
-//! mpsc channel. Together they give the actor full-duplex visibility
-//! (the read loop is always running, even while a write command is in
-//! flight) without burdening callers with cancellation safety at the
-//! protocol layer.
+//! actor owns the writer half of a [`MaybeTlsStream`]; an independent
+//! reader sub-task owns the read half and forwards every decoded server
+//! packet through a bounded mpsc channel, so the read loop keeps running
+//! while a write command is in flight.
 //!
 //! # Why an actor instead of borrowed I/O
 //!
-//! The classic shape -- callers hold `&mut Connection` across the
-//! reader / writer halves for the duration of a query -- is
-//! structurally cancellation-unsafe: any `tokio::select!`,
-//! `tokio::time::timeout`, or HTTP-disconnect that drops the future
-//! mid-`read_packet()` leaves the socket in an unknown state. Recovery
-//! collapses to tearing down the TCP connection. Owning the I/O state
-//! inside a long-lived task means dropping a caller's future never
-//! disturbs the wire; instead the actor sees the reply-channel close
-//! and reacts at protocol level (Cancel packet, drain to EndOfStream,
-//! return to pool).
+//! Holding `&mut Connection` across the two halves for the duration of a
+//! query is structurally cancellation-unsafe: any `tokio::select!`,
+//! `tokio::time::timeout` or caller disconnect that drops the future
+//! mid-`read_packet()` leaves the socket in an unknown state, and the
+//! only recovery is tearing the connection down. Owning the I/O inside a
+//! long-lived task means a dropped caller future never disturbs the
+//! wire; the actor observes the reply channel closing and reacts at
+//! protocol level (Cancel packet, bounded drain, return to pool).
 //!
 //! Three capabilities only this shape unlocks:
 //!
 //! 1. Protocol-level Cancel during an in-flight query -- the writer is
-//!    free to send a Cancel packet because no caller holds it.
+//!    free to send it because no caller holds it.
 //! 2. Full-duplex Exception detection during INSERT -- the reader
 //!    sub-task surfaces a server-side rejection before the next block
-//!    is written.
-//! 3. Idle keepalive -- the actor can send Ping between commands
-//!    without racing the caller for the writer.
-//!
-//! This branch ships Ping (the foundational tracer bullet) plus
-//! `ExecuteQuery` -- the simplest write/drain command shape, used by
-//! `Client::execute` for DDL / INSERT-without-rows / SET / etc. The
-//! actor sends a Query packet followed by an empty-block terminator,
-//! then drains response packets until EndOfStream or a server
-//! Exception. Receiver drop mid-flight triggers a protocol-level
-//! Cancel + bounded drain, leaving the socket reusable. INSERT
-//! streaming and SELECT-with-rows cursors land in subsequent branches.
+//!    goes on the wire.
+//! 3. Idle keepalive -- Ping between commands without racing a caller
+//!    for the writer.
 //!
 //! # Internal layout
 //!
@@ -60,23 +46,21 @@
 //!
 //! # Reader-half ownership
 //!
-//! `tokio::io::split` returns owned halves backed by an internal
-//! `BiLock`. They are `Send + 'static` whenever the underlying stream
-//! is, which is exactly what `tokio::spawn` needs for the reader
-//! sub-task. The split is performed by `crate::tcp::connect::split_buffered`
-//! at the point we hand the stream to the actor, so the actor owns the
-//! writer half and only the writer half; the reader task owns its read
-//! half and only its read half.
+//! `crate::tcp::connect::split_buffered` splits the stream before the
+//! actor is spawned, so the actor owns the writer half and only that,
+//! and the reader task owns the read half and only that. The halves
+//! `tokio::io::split` returns are `Send + 'static` whenever the stream
+//! is, which is what `tokio::spawn` needs for the reader sub-task.
 
-#![allow(dead_code)] // The full command surface lands in subsequent branches.
-
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::io::{BufReader, BufWriter, ReadHalf, WriteHalf};
+use tokio::io::{AsyncWriteExt, BufReader, BufWriter, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
+use tokio::time::Sleep;
 
 use crate::error::{Error, Result};
 use crate::tcp::client_info::ClientInfo;
@@ -87,12 +71,20 @@ use crate::tcp::transport::MaybeTlsStream;
 use crate::tcp::writer::{self, CLIENT_NAME, CLIENT_VERSION_MAJOR_STR, CLIENT_VERSION_MINOR_STR};
 use crate::worker::{self, CommandWorker, WorkerControl, WorkerHandle};
 
-/// Bounded internal channel between the reader sub-task and the
-/// actor's command loop. 64 packets covers typical
-/// Progress / ProfileInfo / Log interleaving for a single command
-/// without stalling the reader. Falling behind blocks the reader,
-/// which propagates kernel TCP backpressure to the server.
-const PACKET_CHANNEL_CAPACITY: usize = 64;
+/// Bounded internal channel between the reader sub-task and the actor's
+/// command loop. The reader decodes inline, so a queued packet is a whole
+/// materialised block: at ClickHouse's 65,409-row default block size a
+/// 20-column `UInt64` result is ~10 MB per slot, and this cap is what
+/// bounds per-connection memory. Four slots keep the reader a step ahead
+/// of the actor; falling behind blocks it, which propagates kernel TCP
+/// backpressure to the server.
+const PACKET_CHANNEL_CAPACITY: usize = 4;
+
+/// Interval the reusable idle timer parks at when no `read_timeout` is
+/// configured. The timer is re-armed on every packet wait, so this only
+/// costs a wakeup on a command that has been waiting this long, and the
+/// wait resumes rather than failing.
+const IDLE_TIMER_PARK: Duration = Duration::from_secs(3600);
 
 /// Capacity of the actor's command mpsc. 16 covers the "one in-flight
 /// plus a few queued" pattern that pooled connections see; high
@@ -102,46 +94,32 @@ const DEFAULT_CMD_CHANNEL: usize = 16;
 
 /// Capacity of the per-stream mpsc that
 /// [`ConnectionHandle::execute_stream_cursor`] allocates between the
-/// actor and the [`crate::tcp::cursor::TcpRawCursor`]. 16 matches the
-/// in-flight + a-few-queued shape the reader sub-task's own
-/// `PACKET_CHANNEL_CAPACITY = 64` already buffers behind; raising it
-/// would only delay backpressure, not reduce memory pressure.
-const STREAM_CHANNEL_CAPACITY: usize = 16;
+/// actor and the [`crate::tcp::cursor::TcpRawCursor`]. Every slot is a
+/// decoded block, so it is bounded for the same reason
+/// [`PACKET_CHANNEL_CAPACITY`] is; four keeps the cursor supplied
+/// without doubling the buffered block count.
+const STREAM_CHANNEL_CAPACITY: usize = 4;
 
-/// Upper bound on how long the actor waits to drain response packets
-/// to EndOfStream after sending a Cancel or after a server Exception.
-/// A wedged server that ignores Cancel must not block the actor task
-/// (and thereby the pool slot) indefinitely. 30 s is a conservative
-/// v1 cap that leaves comfortable headroom for normal cancellation
-/// latency over LAN/WAN connections; per-query tuning is a later
-/// concern once dials are wired through `Client`.
+/// Upper bound on how long the actor waits to drain response packets to
+/// EndOfStream after sending a Cancel or after a server Exception. A
+/// wedged server that ignores Cancel must not hold the actor task, and
+/// thereby its pool slot, indefinitely.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Soft cap on a single INSERT block's pre-encoded payload. A caller
-/// that hands the actor an enormous block would otherwise stall the
-/// actor task (and its pool slot) for the duration of one large socket
-/// write, blocking every other command on that connection -- an
-/// effective self-DoS for a misconfigured client. Blocks past this cap
-/// are rejected with an error instead of transmitted; split the batch
-/// into smaller blocks (server `max_insert_block_size` defaults to 1M
-/// rows, far under this byte ceiling for typical row widths). 512 MiB
-/// is generous head-room over any sane block; it exists to catch
-/// pathological inputs, not to tune throughput.
+/// Cap on a single INSERT block's pre-encoded payload. One oversized
+/// block stalls the actor for the length of its socket write and blocks
+/// every other command on that connection, so blocks past this cap are
+/// rejected rather than transmitted. The server's `max_insert_block_size`
+/// default of 1M rows sits far below this ceiling at any sane row width.
 const MAX_INSERT_BLOCK_BYTES: usize = 512 * 1024 * 1024;
 
-/// Runtime state of the actor. `Idle` (post-handshake, between
-/// commands, after FinishInsert / Exception); `InsertActive` between
-/// a successful `BeginInsert` and the matching `FinishInsert` or
-/// surfaced Exception.
+/// Runtime state of the actor. `Idle` post-handshake, between commands,
+/// and after FinishInsert or a surfaced Exception; `InsertActive`
+/// between a successful `BeginInsert` and its matching `FinishInsert`.
 ///
-/// Captured as a plain field rather than as type-state: the actor is
-/// a single sequential task driving a wire protocol, and the small
-/// state machine is easier to reason about as a runtime enum than as
-/// phantom-type generics threaded through the `CommandWorker`
-/// machinery. Out-of-state commands surface as
-/// `Error::Custom("tcp: ...")` replies instead of panics so the
-/// caller can recover (e.g. propagate the typed error to a
-/// transaction-level handler).
+/// A runtime enum rather than type-state: the actor is a single
+/// sequential task driving a wire protocol, and out-of-state commands
+/// reply with an error instead of panicking so the caller can recover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
     Idle,
@@ -152,7 +130,7 @@ enum ActorState {
 ///
 /// Each variant embeds its own reply channel -- `oneshot` for single
 /// replies, `mpsc` for streams -- so the actor never has to track
-/// caller identity. The streaming SELECT variant lands in Task 8.
+/// caller identity.
 pub(crate) enum ConnectionCmd {
     /// Send a Ping; reply with `Ok(())` when Pong arrives, `Err` on
     /// I/O failure or a server Exception in place of Pong.
@@ -167,6 +145,7 @@ pub(crate) enum ConnectionCmd {
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Begin an INSERT session. The actor writes the Query packet
@@ -174,28 +153,19 @@ pub(crate) enum ConnectionCmd {
     /// chatter until the server's schema-block Data packet arrives,
     /// transitions to [`ActorState::InsertActive`], and replies with
     /// the `(name, type_name)` column pairs the schema block carried.
-    /// The columns vec is `Vec::new()` on a Task-7-vintage actor when
-    /// the server's revision does not write columns into the schema
-    /// block (no live ClickHouse server does this in practice -- 25.x
-    /// always emits names + types); callers should treat an empty vec
-    /// only as a "no schema information available" signal.
+    /// An empty vec means the schema block carried no column metadata.
     BeginInsert {
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         reply: oneshot::Sender<Result<Vec<(String, String)>>>,
     },
     /// Send a single Native-format data block during an in-flight
-    /// INSERT. `column_bytes` is the pre-encoded payload from
-    /// [`crate::native::encode_columns`]; the actor is purely a
-    /// transport here, never re-encoding.
-    ///
-    /// Before writing the actor non-blockingly drains any packets the
-    /// server has already pushed (Exception from a previous block's
-    /// constraint violation, Progress / Log, etc.). An Exception
-    /// surfaced through this path aborts the INSERT before any more
-    /// bytes go on the wire -- the full-duplex correctness win the
-    /// HTTP transport cannot get.
+    /// INSERT. The actor drains already-queued server packets first, so
+    /// a rejection of an earlier block aborts the INSERT before any more
+    /// bytes go on the wire -- the full-duplex win the HTTP transport
+    /// cannot get.
     SendInsertBlock {
         column_bytes: Vec<u8>,
         num_columns: u64,
@@ -207,63 +177,66 @@ pub(crate) enum ConnectionCmd {
     /// an Exception that arrives in between), then returns the actor
     /// to [`ActorState::Idle`] so the connection can be reused.
     FinishInsert { reply: oneshot::Sender<Result<()>> },
-    /// Run a streaming SELECT. The actor sends the Query packet plus
-    /// empty-block terminator, then forwards each non-`Pong`/
-    /// non-`Log` server packet -- `Data` schema block,
-    /// `DataBlock` payload, `Progress`, `ProfileInfo`, `EndOfStream`
-    /// -- through `results`. The caller dropping the receiver
-    /// (`results.closed()`) is observed by the actor and triggers a
-    /// protocol-level Cancel + bounded drain so the connection stays
-    /// reusable. A server Exception mid-stream is forwarded as
-    /// `Err(exc.into_error())` then drained.
-    ///
-    /// The decoder runs INSIDE the reader sub-task
-    /// (see [`crate::tcp::reader::read_packet`]); this command is
-    /// purely a packet-forwarding pipeline. Per-row deserialisation
-    /// happens in [`crate::tcp::cursor::TcpRawCursor`].
+    /// Run a streaming SELECT, forwarding each server packet through
+    /// `results`. Receiver drop triggers a protocol Cancel plus a
+    /// bounded drain; a mid-stream Exception is forwarded as `Err`.
+    /// Decoding happens inside the reader sub-task, so this command is
+    /// purely a forwarding pipeline.
     ExecuteStream {
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         results: mpsc::Sender<Result<ServerPacket>>,
     },
 }
 
-/// Cheap-clone send-side handle to a [`ConnectionActor`].
+/// Cheap-clone send-side handle to a [`ConnectionActor`]. Every field is
+/// reference-counted, so cloning is `O(1)`.
 ///
-/// Holds a `WorkerHandle` (the mpsc sender), a shared
-/// [`ServerHello`] for callers that need protocol revision facts, a
-/// shared poisoning flag the pool consults on `recycle`, and a shared
-/// `WorkerControl` that ties the actor task's lifetime to the
-/// handle. All are reference-counted so cloning is `O(1)`.
-///
-/// The actor task lives exactly as long as the last `ConnectionHandle`
-/// clone: the `Arc<WorkerControl>` drops with the final clone, and
-/// `WorkerControl`'s `Drop` signals graceful shutdown (drain +
-/// `on_shutdown` + exit), which closes the socket and lets the reader
-/// sub-task fall out. The pool slot holds the canonical handle, so a
-/// poisoned connection dropped on `recycle` refusal shuts its actor
-/// down deterministically -- no detached keep-alive task, no leak.
+/// The actor task lives exactly as long as the last clone: the shared
+/// `WorkerControl` drops with it and signals graceful shutdown, which
+/// closes the writer half and aborts the reader sub-task.
+/// [`Self::close`] takes that shutdown explicitly and waits for the
+/// task, so a panic inside it surfaces.
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ConnectionHandle {
     inner: WorkerHandle<ConnectionCmd>,
     server_hello: Arc<ServerHello>,
     poisoned: Arc<AtomicBool>,
     /// Owns the actor task. Shared so every clone counts toward the
-    /// task's lifetime; the last drop triggers graceful shutdown via
-    /// `WorkerControl::drop`. Never read -- held only for its `Drop`.
-    _control: Arc<WorkerControl<ConnectionCmd>>,
+    /// task's lifetime; `Option` so [`ConnectionHandle::close`] can take
+    /// the control out and consume-await it from behind the `Arc`.
+    control: Arc<tokio::sync::Mutex<Option<WorkerControl<ConnectionCmd>>>>,
 }
 
 impl ConnectionHandle {
-    /// True until the connection is poisoned. The pool consults this
-    /// on `recycle` to decide whether to keep the connection or drop
-    /// it.
+    /// Shut the actor down and wait for its task to finish.
     ///
-    /// Poisoning is set by the actor on any I/O failure and by
-    /// `Self::poison` from outside (e.g. a caller that observed an
-    /// inconsistent state). It is not reset; once poisoned a handle
-    /// stays not-alive for life.
+    /// Dropping the last clone signals the same shutdown but returns
+    /// immediately; this waits, so the socket and the reader sub-task are
+    /// provably gone when the call returns. Idempotent -- the second call
+    /// finds the control already taken and returns `Ok(())`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Custom`] wrapping the `JoinError` if the actor task
+    /// panicked.
+    pub async fn close(self) -> Result<()> {
+        let control = self.control.lock().await.take();
+        match control {
+            Some(control) => control.shutdown().await.map_err(|e| {
+                Error::Custom(format!(
+                    "tcp: connection actor task did not exit cleanly: {e}"
+                ))
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// True until the connection is poisoned, which the pool consults on
+    /// `recycle`. Poisoning is one-way: a poisoned handle never recovers.
     #[must_use]
     pub fn is_alive(&self) -> bool {
         !self.poisoned.load(Ordering::Acquire)
@@ -275,24 +248,18 @@ impl ConnectionHandle {
     }
 
     /// Negotiated server hello info (immutable after handshake).
-    #[must_use]
     pub(crate) fn server_hello(&self) -> &ServerHello {
         &self.server_hello
     }
 
-    /// Send a Ping and await Pong.
-    ///
-    /// Stray Progress / Log / ProfileEvents packets that arrive
-    /// between Ping and Pong are drained inside the actor. The
-    /// connection is poisoned on any I/O failure or reader sub-task
-    /// exit.
+    /// Send a Ping and await Pong. Packets that interleave are drained
+    /// inside the actor.
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor has exited (command channel
-    ///   closed) or dropped the reply channel before sending.
-    /// - Any error from the underlying `crate::tcp::writer::send_ping`
-    ///   or the reader sub-task.
+    /// [`Error::Custom`] if the actor has exited or dropped the reply
+    /// channel; any writer or reader error otherwise. An I/O failure
+    /// poisons the connection.
     pub async fn ping(&self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.inner
@@ -303,32 +270,26 @@ impl ConnectionHandle {
             .map_err(|_| Error::Custom("tcp: connection actor dropped ping reply".into()))?
     }
 
-    /// Run a query that does not stream rows back to the caller (DDL,
-    /// `SET`, INSERT-without-data, `KILL QUERY`, etc.). Returns once
-    /// the server emits EndOfStream OR an Exception, OR -- if the
-    /// caller's awaiting future is cancelled mid-flight -- once the
-    /// actor has sent a Cancel packet and drained to EndOfStream.
+    /// Run a query that streams no rows back (DDL, `SET`,
+    /// INSERT-without-data, `KILL QUERY`). Returns on EndOfStream, on an
+    /// Exception, or -- if the caller's future is dropped mid-flight --
+    /// once the actor has sent Cancel and drained.
     ///
-    /// Dropping the returned future (e.g. through `tokio::select!`,
-    /// `tokio::time::timeout`, or HTTP-disconnect) closes the reply
-    /// channel, which the actor observes via `reply.closed()` and
-    /// reacts to at protocol level. The socket stays usable; the
-    /// caller never sees a poisoned connection from a successful
-    /// cancellation.
+    /// Dropping the returned future closes the reply channel, which the
+    /// actor observes and answers at protocol level, so a cancellation
+    /// never poisons the connection.
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor has exited (command channel
-    ///   closed) or dropped the reply channel before sending.
-    /// - [`Error::ServerException`] if the server returned an
-    ///   Exception in place of EndOfStream.
-    /// - Any error from the underlying writer, the reader sub-task,
-    ///   or the drain timeout.
+    /// [`Error::Custom`] if the actor has exited or dropped the reply
+    /// channel, [`Error::ServerException`] if the server returned one in
+    /// place of EndOfStream, or a writer / reader / drain-timeout error.
     pub async fn execute_query(
         &self,
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.inner
@@ -336,6 +297,7 @@ impl ConnectionHandle {
                 query_id,
                 query,
                 extra_settings,
+                params,
                 reply,
             })
             .await
@@ -345,43 +307,24 @@ impl ConnectionHandle {
         })?
     }
 
-    /// Begin an INSERT session and return the column metadata the
-    /// server echoed in its schema block.
+    /// Begin an INSERT session and return the `(name, type_name)` pairs
+    /// the server echoed in its schema block.
     ///
-    /// `query` is the full SQL text (typically
-    /// `INSERT INTO <table> FORMAT Native`). The actor sends a Query
-    /// packet, drains protocol chatter until the schema-block Data
-    /// packet arrives, transitions internal state to in-INSERT, and
-    /// replies with the schema's `(name, type_name)` pairs.
-    ///
-    /// Subsequent [`Self::send_insert_block`] calls write Native
-    /// blocks; the matching [`Self::finish_insert`] terminates the
-    /// session.
-    ///
-    /// # v1 caveat
-    ///
-    /// Servers below the custom-serialization revision (any modern
-    /// 25.x server is above it) write the schema body the same way as
-    /// [`crate::native::encode_columns`] -- (name, type, flag) per
-    /// column. The actor consumes those bytes off the wire via
-    /// `crate::tcp::reader::read_empty_data_block_schema` regardless
-    /// of revision; the returned vec carries exactly what the wire
-    /// carried.
+    /// `query` is the full SQL, typically
+    /// `INSERT INTO <table> FORMAT Native`. [`Self::send_insert_block`]
+    /// then writes blocks and [`Self::finish_insert`] ends the session.
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor is already in `InsertActive`,
-    ///   the command channel is closed, or the reply channel was
-    ///   dropped.
-    /// - [`Error::ServerException`] if the server rejected the INSERT
-    ///   (auth, parse error, missing column, etc.) before the schema
-    ///   block.
-    /// - Any error from the underlying writer or the reader sub-task.
+    /// [`Error::Custom`] if the actor is already in an INSERT or has
+    /// exited, [`Error::ServerException`] if the server rejected the
+    /// INSERT before its schema block, or a writer / reader error.
     pub async fn begin_insert(
         &self,
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
     ) -> Result<Vec<(String, String)>> {
         let (reply, rx) = oneshot::channel();
         self.inner
@@ -389,6 +332,7 @@ impl ConnectionHandle {
                 query_id,
                 query,
                 extra_settings,
+                params,
                 reply,
             })
             .await
@@ -399,19 +343,16 @@ impl ConnectionHandle {
 
     /// Send one Native-format block during an in-flight INSERT.
     ///
-    /// `column_bytes` is the pre-encoded Native payload from
-    /// [`crate::native::encode_columns`]; the actor never re-encodes.
-    /// The actor non-blockingly drains any server-pushed packets
-    /// before writing -- a server Exception surfaced through that
-    /// drain aborts the INSERT before any more bytes go on the wire.
+    /// `column_bytes` is the pre-encoded payload from
+    /// [`crate::native::encode_columns`]; the actor never re-encodes. It
+    /// drains queued server packets first, so a rejection of an earlier
+    /// block aborts the INSERT before more bytes go on the wire.
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor is not in `InsertActive`, the
-    ///   command channel is closed, or the reply channel was dropped.
-    /// - [`Error::ServerException`] if the server emitted an Exception
-    ///   from a previous block (full-duplex detection).
-    /// - Any I/O error from the underlying writer.
+    /// [`Error::Custom`] if no INSERT is active or the actor has exited,
+    /// [`Error::ServerException`] from full-duplex detection of an
+    /// earlier block's rejection, or an I/O error.
     pub async fn send_insert_block(
         &self,
         column_bytes: Vec<u8>,
@@ -433,37 +374,25 @@ impl ConnectionHandle {
         })?
     }
 
-    /// Run a streaming SELECT and forward server packets through the
-    /// returned receiver.
+    /// Run a streaming SELECT and forward server packets through
+    /// `results` in wire order: the schema block
+    /// ([`ServerPacket::Data`] with `num_rows == 0`), zero or more
+    /// payload blocks, then [`ServerPacket::EndOfStream`], which the
+    /// cursor uses as its "no more rows" sentinel.
     ///
-    /// The actor sends a Query packet (followed by the empty-block
-    /// terminator that signals end-of-prequery), then pumps each
-    /// non-`Pong` / non-`Log` server packet into the supplied `tx`.
-    /// Packet ordering matches the wire: the server emits a schema
-    /// block ([`ServerPacket::Data`] with `num_rows == 0`) first,
-    /// then zero or more payload blocks ([`ServerPacket::DataBlock`]),
-    /// terminated by [`ServerPacket::EndOfStream`]. The terminal
-    /// packet is also forwarded so the cursor can use it as the
-    /// "no more rows" sentinel.
-    ///
-    /// Dropping the receiver (`tx` reaches `closed()`) triggers a
-    /// protocol-level Cancel inside the actor followed by a bounded
-    /// drain to EndOfStream; the connection stays reusable. A server
-    /// Exception mid-stream surfaces as
-    /// [`Error::ServerException`] on the receiver and the actor
-    /// drains the trailing EndOfStream itself.
+    /// Dropping the receiver triggers a protocol Cancel plus a bounded
+    /// drain inside the actor, leaving the connection reusable.
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor has exited (command channel
-    ///   closed) or dropped the reply before sending.
-    /// - Send errors from the actor reach the caller via the
-    ///   `results` channel, not the `Ok(())` return.
+    /// [`Error::Custom`] if the actor has exited. Every later error
+    /// reaches the caller through `results`, not this return.
     pub(crate) async fn execute_stream(
         &self,
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         results: mpsc::Sender<Result<ServerPacket>>,
     ) -> Result<()> {
         self.inner
@@ -471,6 +400,7 @@ impl ConnectionHandle {
                 query_id,
                 query,
                 extra_settings,
+                params,
                 results,
             })
             .await
@@ -481,12 +411,8 @@ impl ConnectionHandle {
     /// [`crate::tcp::cursor::TcpRawCursor`] that yields decoded
     /// blocks until `EndOfStream`.
     ///
-    /// Internally allocates an mpsc pair with `STREAM_CHANNEL_CAPACITY`
-    /// slots, dispatches `ExecuteStream`, and wraps the receiver. The
-    /// channel capacity is small (16) -- the actor's reader sub-task
-    /// already buffers up to `PACKET_CHANNEL_CAPACITY` (64) packets on
-    /// the other side, so a second large buffer here would just delay
-    /// memory pressure without reducing it.
+    /// Allocates a small bounded mpsc pair, dispatches `ExecuteStream`,
+    /// and wraps the receiver.
     ///
     /// # Errors
     ///
@@ -498,28 +424,23 @@ impl ConnectionHandle {
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
     ) -> Result<crate::tcp::cursor::TcpRawCursor> {
         let (tx, rx) = mpsc::channel(STREAM_CHANNEL_CAPACITY);
-        self.execute_stream(query_id, query, extra_settings, tx)
+        self.execute_stream(query_id, query, extra_settings, params, tx)
             .await?;
         Ok(crate::tcp::cursor::TcpRawCursor::from_receiver(rx))
     }
 
-    /// Terminate an in-flight INSERT session.
-    ///
-    /// The actor writes an empty Data block (the server's INSERT
-    /// end-of-input sentinel), drains response packets to EndOfStream
-    /// or a server Exception, and returns to `Idle` so the connection
-    /// can be reused.
+    /// Terminate an in-flight INSERT session: write the empty Data block
+    /// the server takes as end-of-input, drain to EndOfStream, and
+    /// return to `Idle` so the connection can be reused.
     ///
     /// # Errors
     ///
-    /// - [`Error::Custom`] if the actor is not in `InsertActive`, the
-    ///   command channel is closed, or the reply channel was dropped.
-    /// - [`Error::ServerException`] if the server rejected the INSERT
-    ///   on commit (constraint violation discovered during merge,
-    ///   etc.).
-    /// - Any I/O or drain-timeout error.
+    /// [`Error::Custom`] if no INSERT is active or the actor has exited,
+    /// [`Error::ServerException`] if the server rejected the INSERT on
+    /// commit, or an I/O or drain-timeout error.
     pub async fn finish_insert(&self) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         self.inner
@@ -532,10 +453,8 @@ impl ConnectionHandle {
     }
 }
 
-/// Internal message type carried over the reader -> actor mpsc.
-/// Splitting `Packet` from `Error` lets the actor distinguish a
-/// successfully decoded protocol packet from an I/O or decode failure
-/// without forcing every consumer to pattern-match on `Result`.
+/// Internal message carried over the reader -> actor mpsc; splitting
+/// `Packet` from `Error` keeps every consumer off `Result` matching.
 enum ReaderMessage {
     Packet(ServerPacket),
     Error(Error),
@@ -544,31 +463,34 @@ enum ReaderMessage {
 /// Tunables threaded into the actor at spawn time. Kept as a small
 /// struct (rather than positional `spawn` args) so future per-connection
 /// dials can be added without churning every `spawn` call site.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct ActorConfig {
-    /// Per-packet idle read timeout. When `Some(d)`, a query/stream/
+    /// Per-packet idle read timeout. When `Some(d)`, a query, stream or
     /// begin-insert read that goes `d` without receiving ANY packet is
     /// treated as a stalled server: the connection is poisoned and the
     /// caller sees [`Error::TimedOut`]. The timer resets on every packet,
-    /// so a long-but-progressing streaming SELECT never trips it -- this
-    /// is an idle gap bound, NOT a whole-query deadline. `None` (default)
-    /// leaves reads bounded only by caller-side cancellation, matching the
-    /// pre-dial behaviour.
+    /// so this bounds the gap BETWEEN packets, not the whole query.
+    /// `None` leaves reads bounded only by caller-side cancellation.
     pub read_timeout: Option<Duration>,
+    /// Quota key echoed into every Query packet's `ClientInfo`, so the
+    /// server attributes the query to the same quota the handshake
+    /// addendum named.
+    pub quota_key: String,
 }
 
 /// Background task that owns the writer half and the receive end of
-/// the reader -> actor channel. Implements `CommandWorker` so the
-/// generic runner from [`crate::worker`] handles the lifecycle
-/// plumbing (command loop, drain on shutdown, panic surfacing).
+/// the reader -> actor channel. Implements the crate's `CommandWorker`
+/// trait, whose generic runner handles the lifecycle plumbing (command
+/// loop, drain on shutdown, panic surfacing).
 pub struct ConnectionActor {
     writer: BufWriter<WriteHalf<MaybeTlsStream>>,
     pkt_rx: mpsc::Receiver<ReaderMessage>,
-    /// The reader sub-task lives as long as the actor. Dropping the
-    /// `JoinHandle` does NOT cancel the task; we keep it so that
-    /// observability tooling can attach to it in later branches and
-    /// so the read half's lifetime is visibly tied to the actor.
-    _reader_task: JoinHandle<()>,
+    /// Aborted in `Drop`. Dropping a `JoinHandle` does NOT cancel the
+    /// task, and the reader parks in `read_packet` until the server's own
+    /// receive timeout, so without the abort every recycled connection
+    /// leaks a task, an FD and a socket.
+    reader_task: JoinHandle<()>,
     server_hello: Arc<ServerHello>,
     poisoned: Arc<AtomicBool>,
     /// Idle or InsertActive. Gates which commands are accepted in
@@ -576,39 +498,48 @@ pub struct ConnectionActor {
     state: ActorState,
     /// Per-packet idle read timeout; see [`ActorConfig::read_timeout`].
     read_timeout: Option<Duration>,
+    /// Quota key echoed into every Query packet's `ClientInfo`.
+    quota_key: String,
+    /// One timer for the life of the connection, re-armed per packet
+    /// wait. A fresh `tokio::time::sleep` per loop iteration allocates a
+    /// timer entry per packet on a streaming SELECT.
+    idle_sleep: Pin<Box<Sleep>>,
 }
 
-/// Per-packet idle-timeout future. Resolves after `timeout` elapses, or
-/// never (`pending`) when `timeout` is `None`. Callers recreate it on
-/// each loop iteration so it bounds the gap BETWEEN packets, not the
-/// total query duration. Used as a `select!` arm alongside the
-/// `pkt_rx.recv()` arm: whichever fires first wins.
-async fn idle_timeout(timeout: Option<Duration>) {
-    match timeout {
-        Some(d) => tokio::time::sleep(d).await,
-        None => std::future::pending::<()>().await,
-    }
+/// One outcome of waiting for the next server packet.
+enum PacketWait {
+    /// The idle timer fired.
+    Idle,
+    /// The reader sub-task delivered a message, or closed (`None`).
+    Message(Option<ReaderMessage>),
+}
+
+/// One outcome of a drain-loop wait that also watches its caller.
+enum QueryEvent {
+    /// The caller dropped its receiver.
+    CallerGone,
+    /// The idle timer fired.
+    Idle,
+    /// The reader sub-task delivered a message, or closed (`None`).
+    Message(Option<ReaderMessage>),
 }
 
 impl ConnectionActor {
-    /// Spawn an actor over a freshly handshaken stream. Returns the
-    /// cheap-clone handle, which owns the actor task via a shared
-    /// `WorkerControl` (see [`ConnectionHandle`]): the task lives until
-    /// the last handle clone drops, then shuts down gracefully.
+    /// Spawn an actor over a freshly handshaken stream, returning the
+    /// cheap-clone handle that owns its task.
     ///
-    /// The stream is split into buffered read / write halves via
-    /// `crate::tcp::connect::split_buffered`. The read half is
-    /// moved into the reader sub-task (`tokio::spawn`); the write
-    /// half is moved into the actor. Both halves drop together when
-    /// the actor task exits, which closes the underlying socket.
+    /// `crate::tcp::connect::split_buffered` splits the stream: the read
+    /// half goes to the reader sub-task, the write half to the actor. On
+    /// shutdown the actor closes the write half and its `Drop` aborts
+    /// the reader task, which releases the socket.
+    #[must_use]
     pub fn spawn(stream: MaybeTlsStream, server_hello: ServerHello) -> ConnectionHandle {
         Self::spawn_with_config(stream, server_hello, ActorConfig::default())
     }
 
-    /// Spawn an actor with explicit [`ActorConfig`] tunables. `spawn` is
-    /// the zero-config shortcut (`ActorConfig::default()`); the pool's
-    /// `Manager::create` uses this form to thread the connection's
-    /// `read_timeout` dial through.
+    /// Spawn an actor with explicit [`ActorConfig`] tunables; the pool's
+    /// `Manager::create` uses this form to thread its dials through.
+    #[must_use]
     pub fn spawn_with_config(
         stream: MaybeTlsStream,
         server_hello: ServerHello,
@@ -629,30 +560,95 @@ impl ConnectionActor {
         let actor = ConnectionActor {
             writer: writer_half,
             pkt_rx,
-            _reader_task: reader_task,
+            reader_task,
             server_hello: Arc::clone(&server_hello),
             poisoned: Arc::clone(&poisoned),
             state: ActorState::Idle,
             read_timeout: config.read_timeout,
+            quota_key: config.quota_key,
+            idle_sleep: Box::pin(tokio::time::sleep(IDLE_TIMER_PARK)),
         };
 
         let control = worker::spawn(actor, DEFAULT_CMD_CHANNEL);
         let inner = control.handle();
-        // Tie the worker's lifetime to the ConnectionHandle clones by
-        // holding the WorkerControl behind an Arc on the handle itself.
-        // When the last clone drops, the Arc drops, WorkerControl::drop
-        // signals graceful shutdown, and the socket closes. An earlier
-        // shape parked the control on a detached `pending()` task --
-        // which held it (and its command-channel sender) for the whole
-        // runtime, so the worker never saw the channel close and the
-        // actor task + reader sub-task + socket FD leaked for every
-        // connection ever created.
+        // The last handle drop signals shutdown, which closes the socket.
         ConnectionHandle {
             inner,
             server_hello,
             poisoned,
-            _control: Arc::new(control),
+            control: Arc::new(tokio::sync::Mutex::new(Some(control))),
         }
+    }
+
+    /// Re-arm the idle timer for the next packet wait. With no
+    /// `read_timeout` configured it parks at [`IDLE_TIMER_PARK`], and the
+    /// wait resumes rather than failing when that elapses.
+    fn arm_idle(&mut self) {
+        let gap = self.read_timeout.unwrap_or(IDLE_TIMER_PARK);
+        self.idle_sleep
+            .as_mut()
+            .reset(tokio::time::Instant::now() + gap);
+    }
+
+    /// Wait for the next reader message under the idle timer.
+    async fn next_packet(&mut self) -> PacketWait {
+        self.arm_idle();
+        let Self {
+            idle_sleep, pkt_rx, ..
+        } = self;
+        tokio::select! {
+            biased;
+            () = idle_sleep.as_mut() => PacketWait::Idle,
+            msg = pkt_rx.recv() => PacketWait::Message(msg),
+        }
+    }
+
+    /// Poison and return [`Error::TimedOut`] when the fired idle timer is
+    /// a real deadline; `None` means it was only the park interval.
+    fn idle_timed_out(&self) -> Option<Error> {
+        self.read_timeout?;
+        self.poisoned.store(true, Ordering::Release);
+        Some(Error::TimedOut)
+    }
+
+    /// `ClientInfo` for one client-originated query. `query_id` is echoed
+    /// into `initial_query_id` so `system.query_log.initial_query_id`
+    /// matches the id the caller traces and `KILL QUERY` matches on.
+    fn client_info_for(&self, query_id: &str) -> ClientInfo {
+        let mut info = ClientInfo::for_initial_query(
+            CLIENT_NAME,
+            CLIENT_VERSION_MAJOR_STR.parse().unwrap_or(0),
+            CLIENT_VERSION_MINOR_STR.parse().unwrap_or(0),
+            self.server_hello.revision,
+            &self.quota_key,
+        );
+        info.initial_query_id.push_str(query_id);
+        info
+    }
+
+    /// Write the Query packet and the empty-block terminator that ends
+    /// the pre-query phase. Either failing leaves the wire half-written,
+    /// so every caller poisons on `Err`.
+    async fn issue_query(
+        &mut self,
+        query_id: &str,
+        query: &str,
+        extra_settings: &[(String, String)],
+        params: &[(String, String)],
+    ) -> Result<()> {
+        let client_info = self.client_info_for(query_id);
+        let revision = self.server_hello.revision;
+        writer::send_query(
+            &mut self.writer,
+            revision,
+            query_id,
+            query,
+            extra_settings,
+            params,
+            &client_info,
+        )
+        .await?;
+        writer::send_empty_block(&mut self.writer, revision).await
     }
 
     /// Send a Ping and wait for the Pong. Stray Progress / Log /
@@ -665,13 +661,12 @@ impl ConnectionActor {
             self.poisoned.store(true, Ordering::Release);
         })?;
         loop {
-            let msg = tokio::select! {
-                biased;
-                () = idle_timeout(self.read_timeout) => {
-                    self.poisoned.store(true, Ordering::Release);
-                    return Err(Error::TimedOut);
-                }
-                msg = self.pkt_rx.recv() => msg,
+            let msg = match self.next_packet().await {
+                PacketWait::Idle => match self.idle_timed_out() {
+                    Some(e) => return Err(e),
+                    None => continue,
+                },
+                PacketWait::Message(msg) => msg,
             };
             match msg {
                 Some(ReaderMessage::Packet(ServerPacket::Pong)) => return Ok(()),
@@ -708,49 +703,18 @@ impl ConnectionActor {
     /// Exception. Watches the reply channel via `reply.closed()` so a
     /// caller-side cancellation triggers a protocol-level Cancel and a
     /// bounded drain instead of tearing the socket down.
-    ///
-    /// The `query_id` is echoed into `ClientInfo.initial_query_id` so
-    /// the server-side `system.query_log.initial_query_id` matches the
-    /// id the client uses for tracing and for
-    /// `KILL QUERY WHERE query_id = ?`.
     async fn do_execute_query(
         &mut self,
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         mut reply: oneshot::Sender<Result<()>>,
     ) {
-        // Build ClientInfo per-query: 10 small strings plus a few
-        // primitives. Profiling has not shown this to be hot; caching
-        // on `Self` and rewriting query_id per call would save one
-        // string clone per query and is a follow-up if it ever matters.
-        let major: u64 = CLIENT_VERSION_MAJOR_STR.parse().unwrap_or(0);
-        let minor: u64 = CLIENT_VERSION_MINOR_STR.parse().unwrap_or(0);
-        let mut client_info = ClientInfo::for_initial_query(
-            CLIENT_NAME,
-            major,
-            minor,
-            self.server_hello.revision,
-            "",
-        );
-        client_info.initial_query_id = query_id.clone();
-
-        // Send the Query + empty-block terminator. Either failing
-        // poisons -- the wire is half-written.
-        let send_result = async {
-            writer::send_query(
-                &mut self.writer,
-                self.server_hello.revision,
-                &query_id,
-                &query,
-                &extra_settings,
-                &client_info,
-            )
-            .await?;
-            writer::send_empty_block(&mut self.writer, self.server_hello.revision).await
-        }
-        .await;
-        if let Err(e) = send_result {
+        if let Err(e) = self
+            .issue_query(&query_id, &query, &extra_settings, &params)
+            .await
+        {
             self.poisoned.store(true, Ordering::Release);
             let _ = reply.send(Err(e));
             return;
@@ -761,137 +725,108 @@ impl ConnectionActor {
         // always wins -- we never want to deliver a successful Ok to
         // a caller that has already moved on.
         loop {
-            tokio::select! {
-                biased;
+            self.arm_idle();
+            let event = {
+                let Self {
+                    idle_sleep, pkt_rx, ..
+                } = &mut *self;
+                tokio::select! {
+                    biased;
+                    () = reply.closed() => QueryEvent::CallerGone,
+                    () = idle_sleep.as_mut() => QueryEvent::Idle,
+                    msg = pkt_rx.recv() => QueryEvent::Message(msg),
+                }
+            };
 
-                _ = reply.closed() => {
-                    // Caller cancelled. Send a Cancel packet, drain to
-                    // EndOfStream (with timeout), then exit. The reply
-                    // send is a no-op at this point because the
-                    // receiver is gone.
-                    if let Err(e) = writer::send_cancel(&mut self.writer).await {
-                        self.poisoned.store(true, Ordering::Release);
-                        tracing::warn!(
-                            target: "clickhouse::tcp",
-                            error = %e,
-                            "failed to send Cancel after caller dropped reply"
-                        );
-                        return;
-                    }
-                    if let Err(e) = self.drain_to_end_of_stream().await {
-                        tracing::warn!(
-                            target: "clickhouse::tcp",
-                            error = %e,
-                            "drain after Cancel did not reach EndOfStream"
-                        );
-                        // drain_to_end_of_stream poisons on its own
-                        // failure modes; nothing else to do here.
-                    }
+            match event {
+                QueryEvent::CallerGone => {
+                    self.cancel_and_drain("caller dropped the reply").await;
                     return;
                 }
-
-                () = idle_timeout(self.read_timeout) => {
-                    // Server went silent for longer than read_timeout
-                    // mid-query (a stalled backend, not a slow-but-
-                    // progressing one -- the timer resets per packet).
-                    // Poison so the pool drops this connection, and
-                    // surface a retriable TimedOut.
-                    self.poisoned.store(true, Ordering::Release);
-                    let _ = reply.send(Err(Error::TimedOut));
-                    return;
-                }
-
-                msg = self.pkt_rx.recv() => match msg {
-                    Some(ReaderMessage::Packet(ServerPacket::EndOfStream)) => {
-                        let _ = reply.send(Ok(()));
-                        return;
-                    }
-                    Some(ReaderMessage::Packet(ServerPacket::Exception(exc))) => {
-                        // A query Exception is TERMINAL: the server emits
-                        // EndOfStream only on success (TCPHandler sends
-                        // sendLogs + sendEndOfStream on the success path,
-                        // and only sendException on the error path -- no
-                        // trailing EndOfStream), and it keeps the
-                        // connection open for reuse. Surface the typed
-                        // error immediately and leave the connection
-                        // un-poisoned. Do NOT drain -- there is nothing
-                        // to drain, and draining would block until
-                        // DRAIN_TIMEOUT and then poison a healthy
-                        // connection. Matches cpp-client + clickhouse-go.
-                        let _ = reply.send(Err(exc.into_error()));
-                        return;
-                    }
-                    Some(ReaderMessage::Packet(_)) => {
-                        // Data / Progress / Log / TableColumns /
-                        // ProfileInfo / ProfileEvents / Pong /
-                        // TimezoneUpdate -- nothing to surface for an
-                        // execute_query call. Drain through and keep
-                        // reading.
-                        continue;
-                    }
-                    Some(ReaderMessage::Error(e)) => {
-                        self.poisoned.store(true, Ordering::Release);
+                QueryEvent::Idle => {
+                    // The timer resets per packet, so reaching here means
+                    // a stalled backend rather than a slow-but-
+                    // progressing one.
+                    if let Some(e) = self.idle_timed_out() {
                         let _ = reply.send(Err(e));
                         return;
                     }
-                    None => {
-                        self.poisoned.store(true, Ordering::Release);
-                        let _ = reply.send(Err(Error::Custom(
-                            "tcp: reader sub-task exited mid-query".into(),
-                        )));
-                        return;
-                    }
-                },
+                }
+                QueryEvent::Message(Some(ReaderMessage::Packet(ServerPacket::EndOfStream))) => {
+                    let _ = reply.send(Ok(()));
+                    return;
+                }
+                QueryEvent::Message(Some(ReaderMessage::Packet(ServerPacket::Exception(exc)))) => {
+                    // An Exception is terminal and leaves the connection
+                    // reusable: the server sends EndOfStream only on the
+                    // success path, so a drain here would stall to
+                    // DRAIN_TIMEOUT and poison a healthy connection.
+                    let _ = reply.send(Err(exc.into_error()));
+                    return;
+                }
+                // Progress / Log / ProfileInfo / ProfileEvents and the
+                // rest carry nothing an execute_query caller wants.
+                QueryEvent::Message(Some(ReaderMessage::Packet(_))) => {}
+                QueryEvent::Message(Some(ReaderMessage::Error(e))) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    let _ = reply.send(Err(e));
+                    return;
+                }
+                QueryEvent::Message(None) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    let _ = reply.send(Err(Error::Custom(
+                        "tcp: reader sub-task exited mid-query".into(),
+                    )));
+                    return;
+                }
             }
         }
     }
 
-    /// Open an INSERT session: write the Query packet + empty-block
-    /// terminator, drain protocol chatter until the server emits its
-    /// schema-block Data packet, return the `(name, type_name)` pairs
-    /// it carried. The caller's `handle()` arm transitions to
-    /// `InsertActive` on success.
+    /// Send a protocol Cancel and drain to EndOfStream so the next
+    /// caller starts on a clean stream pointer. `reason` names the
+    /// trigger in the warning a failure logs.
+    async fn cancel_and_drain(&mut self, reason: &str) {
+        if let Err(e) = writer::send_cancel(&mut self.writer).await {
+            self.poisoned.store(true, Ordering::Release);
+            tracing::warn!(
+                target: "clickhouse::tcp",
+                error = %e,
+                reason,
+                "failed to send Cancel"
+            );
+            return;
+        }
+        if let Err(e) = self.drain_to_end_of_stream().await {
+            // drain_to_end_of_stream poisons on its own failure modes.
+            tracing::warn!(
+                target: "clickhouse::tcp",
+                error = %e,
+                reason,
+                "drain after Cancel did not reach EndOfStream"
+            );
+        }
+    }
+
+    /// Open an INSERT session and return the `(name, type_name)` pairs
+    /// the server's schema block carried.
     ///
-    /// The state transition is deliberately externalised so an
-    /// `Err` return (server Exception, I/O failure) leaves the actor
-    /// in `Idle` -- the connection can still be used for further
-    /// commands. On I/O failure the actor is poisoned and the pool
-    /// recycle path will drop it.
+    /// The state transition lives in the `handle()` arm, so an `Err`
+    /// return leaves the actor in `Idle` and the connection usable for
+    /// further commands.
     async fn do_begin_insert(
         &mut self,
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
     ) -> Result<Vec<(String, String)>> {
-        let major: u64 = CLIENT_VERSION_MAJOR_STR.parse().unwrap_or(0);
-        let minor: u64 = CLIENT_VERSION_MINOR_STR.parse().unwrap_or(0);
-        let mut client_info = ClientInfo::for_initial_query(
-            CLIENT_NAME,
-            major,
-            minor,
-            self.server_hello.revision,
-            "",
-        );
-        client_info.initial_query_id = query_id.clone();
-
-        // Send Query + empty-block terminator (the same shape cpp
-        // `SendQuery()` uses for INSERTs -- the empty trailing block
-        // signals end-of-prequery and prompts the server to respond
-        // with its schema block).
-        let send_result = async {
-            writer::send_query(
-                &mut self.writer,
-                self.server_hello.revision,
-                &query_id,
-                &query,
-                &extra_settings,
-                &client_info,
-            )
-            .await?;
-            writer::send_empty_block(&mut self.writer, self.server_hello.revision).await
-        }
-        .await;
-        if let Err(e) = send_result {
+        // The empty trailing block signals end-of-prequery and prompts
+        // the server to answer with its schema block.
+        if let Err(e) = self
+            .issue_query(&query_id, &query, &extra_settings, &params)
+            .await
+        {
             self.poisoned.store(true, Ordering::Release);
             return Err(e);
         }
@@ -900,20 +835,18 @@ impl ConnectionActor {
         // an Exception. Progress / Log / TableColumns are normal
         // pre-schema chatter -- discard.
         loop {
-            let msg = tokio::select! {
-                biased;
-                () = idle_timeout(self.read_timeout) => {
-                    self.poisoned.store(true, Ordering::Release);
-                    return Err(Error::TimedOut);
-                }
-                msg = self.pkt_rx.recv() => msg,
+            let msg = match self.next_packet().await {
+                PacketWait::Idle => match self.idle_timed_out() {
+                    Some(e) => return Err(e),
+                    None => continue,
+                },
+                PacketWait::Message(msg) => msg,
             };
             match msg {
                 Some(ReaderMessage::Packet(ServerPacket::Data { columns, .. })) => {
-                    // num_rows is always 0 for schema blocks now that
-                    // read_packet routes num_rows > 0 through the
-                    // DataBlock variant. Schema block reached -- return
-                    // its (name, type_name) pairs to the caller.
+                    // `read_packet` routes num_rows > 0 through the
+                    // DataBlock variant, so a Data packet here is the
+                    // schema block.
                     return Ok(columns);
                 }
                 Some(ReaderMessage::Packet(ServerPacket::DataBlock(block))) => {
@@ -932,19 +865,16 @@ impl ConnectionActor {
                     return Err(exc.into_error());
                 }
                 Some(ReaderMessage::Packet(ServerPacket::EndOfStream)) => {
-                    // EndOfStream before any schema block means the
-                    // server accepted-and-finished the query without
-                    // expecting INSERT data (e.g. INSERT INTO ...
-                    // SELECT, where the server fetches data itself).
-                    // For Task 7 we treat this as a user mistake:
-                    // BeginInsert is for client-feeding INSERT only.
+                    // The server finished without asking for data, which
+                    // means it feeds itself (`INSERT ... SELECT`);
+                    // `begin_insert` is for client-fed INSERT only.
                     return Err(Error::BadResponse(
                         "tcp: server returned EndOfStream before INSERT schema block \
                          (was this INSERT ... SELECT?)"
                             .into(),
                     ));
                 }
-                Some(ReaderMessage::Packet(_)) => continue,
+                Some(ReaderMessage::Packet(_)) => {}
                 Some(ReaderMessage::Error(e)) => {
                     self.poisoned.store(true, Ordering::Release);
                     return Err(e);
@@ -959,17 +889,12 @@ impl ConnectionActor {
         }
     }
 
-    /// Send one Native block during an in-flight INSERT.
+    /// Send one Native block during an in-flight INSERT, draining
+    /// already-queued server packets first: a constraint-violating row
+    /// in block N surfaces on block N+1's send, with no socket teardown.
     ///
-    /// Non-blockingly drains any packets the server has already
-    /// pushed -- a server Exception surfaces here and aborts the
-    /// INSERT before any more bytes hit the wire. This is the
-    /// full-duplex correctness path: a constraint-violating row in
-    /// block N can surface as an error on block N+1's send call
-    /// without socket teardown.
-    ///
-    /// State transitions to `Idle` only on Exception. I/O failure
-    /// poisons; successful write keeps the session in `InsertActive`.
+    /// State returns to `Idle` on Exception or I/O failure; a successful
+    /// write keeps the session in `InsertActive`.
     async fn do_send_insert_block(
         &mut self,
         column_bytes: Vec<u8>,
@@ -977,10 +902,8 @@ impl ConnectionActor {
         num_rows: u64,
         reply: oneshot::Sender<Result<()>>,
     ) {
-        // Reject a pathologically large block before it can stall the
-        // actor on one giant socket write. The connection stays usable
-        // (nothing hit the wire) and stays in InsertActive -- the
-        // caller can re-send a smaller block or finish the INSERT.
+        // Nothing has hit the wire, so the session stays in
+        // InsertActive and the caller can re-send a smaller block.
         if column_bytes.len() > MAX_INSERT_BLOCK_BYTES {
             let _ = reply.send(Err(Error::Custom(format!(
                 "tcp: INSERT block of {} bytes exceeds the {MAX_INSERT_BLOCK_BYTES} byte cap; \
@@ -992,25 +915,33 @@ impl ConnectionActor {
 
         // Full-duplex check FIRST. `try_recv` is non-blocking, so we
         // drain everything queued without waiting for new packets.
-        while let Ok(msg) = self.pkt_rx.try_recv() {
-            match msg {
-                ReaderMessage::Packet(ServerPacket::Exception(exc)) => {
-                    // Server aborted the INSERT mid-stream. The Exception
-                    // is terminal (no EndOfStream follows) and the
-                    // connection stays usable, so return to Idle and
-                    // surface the error WITHOUT draining -- a drain would
-                    // wait for an EndOfStream that never comes and stall
-                    // until DRAIN_TIMEOUT before poisoning a healthy
-                    // connection.
+        loop {
+            match self.pkt_rx.try_recv() {
+                Ok(ReaderMessage::Packet(ServerPacket::Exception(exc))) => {
+                    // Terminal, and the connection stays usable: return to
+                    // Idle and surface without draining, because no
+                    // EndOfStream follows an Exception.
                     self.state = ActorState::Idle;
                     let _ = reply.send(Err(exc.into_error()));
                     return;
                 }
-                ReaderMessage::Packet(_) => continue, // Progress / Log -- keep draining
-                ReaderMessage::Error(e) => {
+                // Progress / Log -- keep draining.
+                Ok(ReaderMessage::Packet(_)) => {}
+                Ok(ReaderMessage::Error(e)) => {
                     self.poisoned.store(true, Ordering::Release);
                     self.state = ActorState::Idle;
                     let _ = reply.send(Err(e));
+                    return;
+                }
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    // The reader sub-task is gone, so nothing will ever
+                    // observe the server's answer to this block.
+                    self.poisoned.store(true, Ordering::Release);
+                    self.state = ActorState::Idle;
+                    let _ = reply.send(Err(Error::Custom(
+                        "tcp: reader sub-task exited mid-INSERT".into(),
+                    )));
                     return;
                 }
             }
@@ -1045,157 +976,98 @@ impl ConnectionActor {
         self.drain_to_end_of_stream().await
     }
 
-    /// Streaming SELECT body. Writes the Query packet + empty-block
-    /// terminator, then forwards every packet the reader sub-task
-    /// emits into `results`. Schema blocks
-    /// ([`ServerPacket::Data`]), payload blocks
-    /// ([`ServerPacket::DataBlock`]), Progress / ProfileInfo /
-    /// TableColumns / TimezoneUpdate, and the terminal EndOfStream
-    /// all reach the caller in wire order so the cursor can stitch
-    /// them back together. `Pong` and `Log` are protocol chatter
-    /// with no cursor relevance and are dropped here.
+    /// Streaming SELECT body: forward every packet the reader sub-task
+    /// emits into `results` in wire order, so the cursor can stitch the
+    /// blocks back together. `Pong`, `Log` and `ProfileEvents` are
+    /// dropped here.
     ///
     /// Cancellation works the same way as
-    /// [`do_execute_query`]: `results.closed()` (the caller dropping
-    /// the receiver) wins the `tokio::select!` with `biased;` and
-    /// triggers a protocol Cancel + bounded drain.
+    /// [`Self::do_execute_query`]: `results.closed()` wins the
+    /// `tokio::select!` with `biased;` and triggers a protocol Cancel
+    /// plus a bounded drain.
     async fn do_execute_stream(
         &mut self,
         query_id: String,
         query: String,
         extra_settings: Vec<(String, String)>,
+        params: Vec<(String, String)>,
         results: mpsc::Sender<Result<ServerPacket>>,
     ) {
-        let major: u64 = CLIENT_VERSION_MAJOR_STR.parse().unwrap_or(0);
-        let minor: u64 = CLIENT_VERSION_MINOR_STR.parse().unwrap_or(0);
-        let mut client_info = ClientInfo::for_initial_query(
-            CLIENT_NAME,
-            major,
-            minor,
-            self.server_hello.revision,
-            "",
-        );
-        client_info.initial_query_id = query_id.clone();
-
-        let send_result = async {
-            writer::send_query(
-                &mut self.writer,
-                self.server_hello.revision,
-                &query_id,
-                &query,
-                &extra_settings,
-                &client_info,
-            )
-            .await?;
-            writer::send_empty_block(&mut self.writer, self.server_hello.revision).await
-        }
-        .await;
-        if let Err(e) = send_result {
+        if let Err(e) = self
+            .issue_query(&query_id, &query, &extra_settings, &params)
+            .await
+        {
             self.poisoned.store(true, Ordering::Release);
             let _ = results.send(Err(e)).await;
             return;
         }
 
         loop {
-            tokio::select! {
-                biased;
+            self.arm_idle();
+            let event = {
+                let Self {
+                    idle_sleep, pkt_rx, ..
+                } = &mut *self;
+                tokio::select! {
+                    biased;
+                    () = results.closed() => QueryEvent::CallerGone,
+                    () = idle_sleep.as_mut() => QueryEvent::Idle,
+                    msg = pkt_rx.recv() => QueryEvent::Message(msg),
+                }
+            };
 
-                _ = results.closed() => {
-                    if let Err(e) = writer::send_cancel(&mut self.writer).await {
-                        self.poisoned.store(true, Ordering::Release);
-                        tracing::warn!(
-                            target: "clickhouse::tcp",
-                            error = %e,
-                            "failed to send Cancel after stream receiver dropped"
-                        );
-                        return;
-                    }
-                    if let Err(e) = self.drain_to_end_of_stream().await {
-                        tracing::warn!(
-                            target: "clickhouse::tcp",
-                            error = %e,
-                            "drain after stream Cancel did not reach EndOfStream"
-                        );
-                    }
+            match event {
+                QueryEvent::CallerGone => {
+                    self.cancel_and_drain("stream receiver dropped").await;
                     return;
                 }
-
-                () = idle_timeout(self.read_timeout) => {
-                    // Server stalled mid-stream past read_timeout (the
-                    // timer resets on every block, so a slow-but-
-                    // progressing stream never reaches here). Poison so
-                    // the pool drops the connection; surface retriable
-                    // TimedOut to the cursor.
-                    self.poisoned.store(true, Ordering::Release);
-                    let _ = results.send(Err(Error::TimedOut)).await;
-                    return;
-                }
-
-                msg = self.pkt_rx.recv() => match msg {
-                    Some(ReaderMessage::Packet(ServerPacket::EndOfStream)) => {
-                        // Forward EndOfStream as the cursor's
-                        // "no more rows" sentinel; ignore send-error
-                        // here -- the stream is complete either way.
-                        let _ = results.send(Ok(ServerPacket::EndOfStream)).await;
-                        return;
-                    }
-                    Some(ReaderMessage::Packet(ServerPacket::Exception(exc))) => {
-                        // A streaming Exception is terminal: forward the
-                        // typed error and stop. The server sends no
-                        // EndOfStream after it, so do NOT drain (it would
-                        // stall until DRAIN_TIMEOUT and then poison a
-                        // healthy connection).
-                        let _ = results.send(Err(exc.into_error())).await;
-                        return;
-                    }
-                    Some(ReaderMessage::Packet(ServerPacket::Pong))
-                    | Some(ReaderMessage::Packet(ServerPacket::Log))
-                    | Some(ReaderMessage::Packet(ServerPacket::ProfileEvents)) => {
-                        // Protocol chatter -- nothing the cursor cares
-                        // about. ProfileEvents in particular arrives on
-                        // every live query; the reader has already
-                        // consumed its block bytes, so we just drop the
-                        // marker here and keep reading.
-                        continue;
-                    }
-                    Some(ReaderMessage::Packet(pkt)) => {
-                        if results.send(Ok(pkt)).await.is_err() {
-                            // Caller dropped the receiver between our
-                            // last select and now. Send Cancel + drain
-                            // so the next caller's stream pointer is
-                            // clean.
-                            if let Err(e) = writer::send_cancel(&mut self.writer).await {
-                                self.poisoned.store(true, Ordering::Release);
-                                tracing::warn!(
-                                    target: "clickhouse::tcp",
-                                    error = %e,
-                                    "failed to send Cancel after late stream receiver drop"
-                                );
-                                return;
-                            }
-                            if let Err(e) = self.drain_to_end_of_stream().await {
-                                tracing::warn!(
-                                    target: "clickhouse::tcp",
-                                    error = %e,
-                                    "drain after late stream Cancel did not reach EndOfStream"
-                                );
-                            }
-                            return;
-                        }
-                    }
-                    Some(ReaderMessage::Error(e)) => {
-                        self.poisoned.store(true, Ordering::Release);
+                QueryEvent::Idle => {
+                    if let Some(e) = self.idle_timed_out() {
                         let _ = results.send(Err(e)).await;
                         return;
                     }
-                    None => {
-                        self.poisoned.store(true, Ordering::Release);
-                        let _ = results.send(Err(Error::Custom(
-                            "tcp: reader sub-task exited mid-stream".into(),
-                        ))).await;
+                }
+                QueryEvent::Message(Some(ReaderMessage::Packet(ServerPacket::EndOfStream))) => {
+                    // The cursor's "no more rows" sentinel; the stream is
+                    // complete whether or not the send lands.
+                    let _ = results.send(Ok(ServerPacket::EndOfStream)).await;
+                    return;
+                }
+                QueryEvent::Message(Some(ReaderMessage::Packet(ServerPacket::Exception(exc)))) => {
+                    // Terminal, and no EndOfStream follows, so draining
+                    // here would stall to DRAIN_TIMEOUT and poison a
+                    // healthy connection.
+                    let _ = results.send(Err(exc.into_error())).await;
+                    return;
+                }
+                // Protocol chatter with no cursor relevance; the reader
+                // has already consumed the block bytes behind the marker.
+                QueryEvent::Message(Some(ReaderMessage::Packet(
+                    ServerPacket::Pong | ServerPacket::Log | ServerPacket::ProfileEvents,
+                ))) => {}
+                QueryEvent::Message(Some(ReaderMessage::Packet(pkt))) => {
+                    if results.send(Ok(pkt)).await.is_err() {
+                        // The receiver went away between the select and
+                        // this send.
+                        self.cancel_and_drain("stream receiver dropped mid-send")
+                            .await;
                         return;
                     }
-                },
+                }
+                QueryEvent::Message(Some(ReaderMessage::Error(e))) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    let _ = results.send(Err(e)).await;
+                    return;
+                }
+                QueryEvent::Message(None) => {
+                    self.poisoned.store(true, Ordering::Release);
+                    let _ = results
+                        .send(Err(Error::Custom(
+                            "tcp: reader sub-task exited mid-stream".into(),
+                        )))
+                        .await;
+                    return;
+                }
             }
         }
     }
@@ -1205,23 +1077,19 @@ impl ConnectionActor {
     /// or after a server Exception so the next caller starts on a
     /// clean stream pointer.
     ///
-    /// On timeout the connection is poisoned and an error is returned;
-    /// pool recycle in a later branch drops the connection on the
-    /// `is_alive()` check.
+    /// On timeout the connection is poisoned, so the pool's `recycle`
+    /// refuses it on the `is_alive()` check.
     async fn drain_to_end_of_stream(&mut self) -> Result<()> {
         let drain = async {
             loop {
                 match self.pkt_rx.recv().await {
                     Some(ReaderMessage::Packet(ServerPacket::EndOfStream)) => return Ok(()),
                     Some(ReaderMessage::Packet(ServerPacket::Exception(exc))) => {
-                        // A second Exception arriving mid-drain --
-                        // surface it. The first error (if any) has
-                        // already been sent to the caller via the
-                        // reply channel; this one only affects the
-                        // drain's return value.
+                        // The caller already has its own error; this one
+                        // only affects the drain's return value.
                         return Err(exc.into_error());
                     }
-                    Some(ReaderMessage::Packet(_)) => continue,
+                    Some(ReaderMessage::Packet(_)) => {}
                     Some(ReaderMessage::Error(e)) => {
                         self.poisoned.store(true, Ordering::Release);
                         return Err(e);
@@ -1255,42 +1123,39 @@ impl CommandWorker for ConnectionActor {
     }
 
     async fn handle(&mut self, cmd: Self::Command) {
-        // State-machine gate. The actor accepts Ping / ExecuteQuery /
-        // BeginInsert only in `Idle`; SendInsertBlock / FinishInsert
-        // only in `InsertActive`. Out-of-state commands reply with
-        // `Error::Custom`; the actor task itself stays alive so the
-        // caller can recover (e.g. issue FinishInsert to reset).
+        // State gate: Ping / ExecuteQuery / BeginInsert / ExecuteStream
+        // only in `Idle`, SendInsertBlock / FinishInsert only in
+        // `InsertActive`. An out-of-state command replies with an error
+        // and leaves the actor alive so the caller can recover.
         match (self.state, cmd) {
-            (ActorState::InsertActive, ConnectionCmd::Ping { reply }) => {
-                let _ = reply.send(Err(Error::Custom("tcp: actor busy in INSERT".into())));
-            }
-            (ActorState::InsertActive, ConnectionCmd::ExecuteQuery { reply, .. }) => {
+            (
+                ActorState::InsertActive,
+                ConnectionCmd::Ping { reply } | ConnectionCmd::ExecuteQuery { reply, .. },
+            ) => {
                 let _ = reply.send(Err(Error::Custom("tcp: actor busy in INSERT".into())));
             }
             (ActorState::InsertActive, ConnectionCmd::BeginInsert { reply, .. }) => {
                 let _ = reply.send(Err(Error::Custom("tcp: actor already in INSERT".into())));
             }
             (ActorState::InsertActive, ConnectionCmd::ExecuteStream { results, .. }) => {
-                // Forward a single Err frame so the cursor's first
-                // poll surfaces the misuse cleanly. The actor stays
-                // alive; the caller can finish_insert and retry.
+                // One Err frame so the cursor's first poll surfaces the
+                // misuse; the caller can finish_insert and retry.
                 let _ = results
                     .send(Err(Error::Custom("tcp: actor busy in INSERT".into())))
                     .await;
             }
-            (ActorState::Idle, ConnectionCmd::SendInsertBlock { reply, .. }) => {
+            (
+                ActorState::Idle,
+                ConnectionCmd::SendInsertBlock { reply, .. }
+                | ConnectionCmd::FinishInsert { reply },
+            ) => {
                 let _ = reply.send(Err(Error::Custom("tcp: no INSERT session active".into())));
             }
-            (ActorState::Idle, ConnectionCmd::FinishInsert { reply }) => {
-                let _ = reply.send(Err(Error::Custom("tcp: no INSERT session active".into())));
-            }
-            (_, ConnectionCmd::Ping { reply }) => {
+            (ActorState::Idle, ConnectionCmd::Ping { reply }) => {
                 let result = self.do_ping().await;
                 if reply.send(result).is_err() {
-                    // Caller dropped the receiver before we finished.
-                    // Not an error in itself -- the socket is in a
-                    // known state -- but worth a warn so an
-                    // unexpected pattern shows up in logs.
+                    // The socket is in a known state, so this is only
+                    // worth a warn.
                     tracing::warn!(
                         target: "clickhouse::tcp",
                         "ping reply dropped by caller before send"
@@ -1298,30 +1163,34 @@ impl CommandWorker for ConnectionActor {
                 }
             }
             (
-                _,
+                ActorState::Idle,
                 ConnectionCmd::ExecuteQuery {
                     query_id,
                     query,
                     extra_settings,
+                    params,
                     reply,
                 },
             ) => {
                 // do_execute_query owns the reply Sender for the full
                 // duration so it can watch `reply.closed()` and react
                 // to caller-side cancellation at protocol level.
-                self.do_execute_query(query_id, query, extra_settings, reply)
+                self.do_execute_query(query_id, query, extra_settings, params, reply)
                     .await;
             }
             (
-                _,
+                ActorState::Idle,
                 ConnectionCmd::BeginInsert {
                     query_id,
                     query,
                     extra_settings,
+                    params,
                     reply,
                 },
             ) => {
-                let result = self.do_begin_insert(query_id, query, extra_settings).await;
+                let result = self
+                    .do_begin_insert(query_id, query, extra_settings, params)
+                    .await;
                 if result.is_ok() {
                     self.state = ActorState::InsertActive;
                 }
@@ -1333,7 +1202,7 @@ impl CommandWorker for ConnectionActor {
                 }
             }
             (
-                _,
+                ActorState::InsertActive,
                 ConnectionCmd::SendInsertBlock {
                     column_bytes,
                     num_columns,
@@ -1344,11 +1213,10 @@ impl CommandWorker for ConnectionActor {
                 self.do_send_insert_block(column_bytes, num_columns, num_rows, reply)
                     .await;
             }
-            (_, ConnectionCmd::FinishInsert { reply }) => {
+            (ActorState::InsertActive, ConnectionCmd::FinishInsert { reply }) => {
                 let result = self.do_finish_insert().await;
-                // Whether finish succeeded or surfaced an Exception,
-                // the INSERT session is over -- return to Idle so the
-                // connection is reusable for non-INSERT commands.
+                // The session is over either way, so return to Idle and
+                // leave the connection reusable for non-INSERT commands.
                 self.state = ActorState::Idle;
                 if reply.send(result).is_err() {
                     tracing::warn!(
@@ -1358,32 +1226,43 @@ impl CommandWorker for ConnectionActor {
                 }
             }
             (
-                _,
+                ActorState::Idle,
                 ConnectionCmd::ExecuteStream {
                     query_id,
                     query,
                     extra_settings,
+                    params,
                     results,
                 },
             ) => {
-                // do_execute_stream owns `results` for the full
-                // command lifetime so it can watch `results.closed()`
-                // and react to receiver-drop at protocol level
-                // (same pattern as do_execute_query).
-                self.do_execute_stream(query_id, query, extra_settings, results)
+                // do_execute_stream owns `results` for the full command
+                // lifetime so it can watch `results.closed()` and react
+                // to receiver-drop at protocol level.
+                self.do_execute_stream(query_id, query, extra_settings, params, results)
                     .await;
             }
         }
     }
-    // on_idle / idle_interval: default no-op. An idle-keepalive driver
-    // (periodic Ping between commands) is a later-branch concern.
-    // on_shutdown: default. Closing the writer is the only shutdown
-    // signal ClickHouse's TCP protocol recognises -- the kernel does
-    // that for us when the writer half drops.
+
+    /// Close the write half so the server sees FIN. `WriteHalf` has no
+    /// `Drop` of its own, so nothing else ends the session from our side.
+    async fn on_shutdown(&mut self) {
+        if let Err(e) = self.writer.shutdown().await {
+            tracing::debug!(
+                target: "clickhouse::tcp",
+                error = %e,
+                "closing the writer half on shutdown failed"
+            );
+        }
+    }
 }
 
 impl Drop for ConnectionActor {
     fn drop(&mut self) {
+        // The reader owns the read half; aborting it is what releases the
+        // socket, because it is parked in `read_packet` and will not
+        // observe the closed writer for the server's whole idle timeout.
+        self.reader_task.abort();
         if self.poisoned.load(Ordering::Acquire) {
             tracing::warn!(
                 target: "clickhouse::tcp",
@@ -1398,11 +1277,9 @@ impl Drop for ConnectionActor {
     }
 }
 
-/// Reader sub-task body. Owns the read half for the lifetime of the
-/// connection. Reads packets one at a time and forwards them through
-/// the channel; on I/O or decode failure sends a single `Error`
-/// message and exits. On receiver close (actor dropped) exits
-/// silently -- the actor has already torn the connection down.
+/// Reader sub-task body: own the read half, forward packets one at a
+/// time, and on I/O or decode failure send one `Error` and exit. A
+/// closed receiver means the actor has already torn the connection down.
 async fn reader_loop(
     mut r: BufReader<ReadHalf<MaybeTlsStream>>,
     tx: mpsc::Sender<ReaderMessage>,
@@ -1439,11 +1316,10 @@ mod tests {
     // would silently break the actor's async-friendly story.
     static_assertions::assert_impl_all!(ConnectionHandle: Send, Sync);
 
-    /// Test scaffold -- pair an actor over a loopback TcpStream with
-    /// the "server" side of the same connection so we can script the
-    /// wire format directly. Using a real loopback rather than
-    /// `tokio::io::duplex` because `MaybeTlsStream::Plain` wraps a
-    /// concrete `TcpStream`; duplex wouldn't fit the enum.
+    /// Pair an actor over a loopback `TcpStream` with the server side of
+    /// the same connection, so the wire format can be scripted directly.
+    /// A real loopback rather than `tokio::io::duplex` because
+    /// `MaybeTlsStream::Plain` wraps a concrete `TcpStream`.
     async fn paired() -> (ConnectionHandle, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1542,6 +1418,299 @@ mod tests {
         );
     }
 
+    /// `WriteHalf` has no `Drop`, and the reader parks in `read_packet`
+    /// until the server's own receive timeout, so without the explicit
+    /// close and abort every recycled connection leaks a task, an FD and
+    /// a socket.
+    #[tokio::test]
+    async fn dropping_the_last_handle_closes_the_socket_and_exits_the_reader() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired().await;
+        drop(handle);
+
+        // A closed client side reads as EOF, not as a stall.
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), server.read(&mut buf))
+            .await
+            .expect("the socket must close promptly, not wait on a server timeout")
+            .expect("read after client close");
+        assert_eq!(n, 0, "expected EOF on the server side, got {n} bytes");
+    }
+
+    /// `close` is the awaited form of the same shutdown, so callers that
+    /// need the socket provably gone (the pool refusing a connection)
+    /// have something to wait on.
+    #[tokio::test]
+    async fn close_waits_for_the_actor_and_is_idempotent() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired().await;
+        let second = handle.clone();
+
+        handle.close().await.expect("close should succeed");
+
+        let mut buf = [0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(2), server.read(&mut buf))
+            .await
+            .expect("close must have shut the socket down")
+            .expect("read after close");
+        assert_eq!(n, 0);
+
+        // The control is already taken, so a second close is a no-op.
+        second.close().await.expect("second close should be Ok");
+    }
+
+    /// A server that ignores Cancel must not hold the actor, and thereby
+    /// its pool slot, past [`DRAIN_TIMEOUT`]. The connection is poisoned
+    /// so the pool refuses it rather than handing on a stream pointer
+    /// parked mid-result.
+    ///
+    /// Every wait here is driven explicitly -- a real socket read, or
+    /// [`tokio::time::advance`]. Nothing may wait on a timer firing by
+    /// itself: auto-advance is skipped whenever the driver was woken
+    /// (tokio `runtime/time/mod.rs`, `park_thread_timeout`), and the
+    /// reader sub-task's registered socket read makes that routine under
+    /// load, so a `tokio::time::timeout` here hangs instead of firing.
+    #[tokio::test(start_paused = true)]
+    async fn drain_timeout_poisons_when_cancel_is_ignored() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired().await;
+
+        let cancel_handle = handle.clone();
+        let exec = tokio::spawn(async move {
+            cancel_handle
+                .execute_query(
+                    "q_drain".into(),
+                    "SELECT sleep(9)".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+        });
+
+        // The Query packet reaching the server proves the actor is past
+        // `issue_query` and sitting in its drain loop.
+        let mut buf = [0u8; 4096];
+        let n = server.read(&mut buf).await.expect("the Query packet");
+        assert!(n > 0, "the actor must have issued the query");
+
+        // Aborting drops the reply receiver, which is the caller-gone
+        // path: Cancel, then the bounded drain. The server stays silent,
+        // so the drain can only end on its own timeout.
+        exec.abort();
+
+        for _ in 0..10 {
+            if !handle.is_alive() {
+                break;
+            }
+            tokio::time::advance(DRAIN_TIMEOUT).await;
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !handle.is_alive(),
+            "a drain that never reaches EndOfStream must poison the connection"
+        );
+
+        drop(server);
+    }
+
+    /// The pool hands the same connection to the next caller, so a
+    /// cursor dropped mid-stream has to leave the socket on a clean
+    /// packet boundary.
+    #[tokio::test]
+    async fn dropping_the_cursor_cancels_and_leaves_the_connection_reusable() {
+        let (handle, mut server) = paired().await;
+
+        let server_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let _drained = drain_client_bytes(&mut server).await;
+            write_schema_block(&mut server, &[("n", "UInt64")]).await;
+            write_uint64_payload_block(&mut server, &[1, 2, 3]).await;
+
+            // Wait for the Cancel the cursor drop triggers, then answer
+            // EndOfStream so the actor's drain completes.
+            let mut chunk = [0u8; 4096];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            let mut saw_cancel = false;
+            while tokio::time::Instant::now() < deadline {
+                let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match tokio::time::timeout(left, server.read(&mut chunk)).await {
+                    Ok(Ok(0)) => break,
+                    Ok(Ok(n)) => {
+                        if chunk[..n].contains(&(ClientPacketId::Cancel as u8)) {
+                            saw_cancel = true;
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            assert!(saw_cancel, "dropping the cursor must send Cancel");
+            server
+                .write_var_uint(ServerPacketId::EndOfStream as u64)
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+
+            // Then serve the follow-up Ping.
+            let id = read_byte(&mut server).await;
+            assert_eq!(u64::from(id), ClientPacketId::Ping as u64);
+            server
+                .write_var_uint(ServerPacketId::Pong as u64)
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            server
+        });
+
+        let mut cursor = handle
+            .execute_stream_cursor(
+                "rs_drop".into(),
+                "SELECT number AS n FROM numbers(3)".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("execute_stream_cursor should succeed");
+        // Take the schema block only, then abandon the stream.
+        let schema = cursor.next_block().await.unwrap().expect("schema block");
+        assert_eq!(schema.num_rows, 0);
+        drop(cursor);
+
+        handle
+            .ping()
+            .await
+            .expect("the connection must be reusable after a cursor drop");
+        assert!(handle.is_alive());
+
+        let _server = server_task.await.unwrap();
+    }
+
+    /// One oversized block would hold the actor for its whole socket
+    /// write, so it is rejected before any byte goes on the wire and the
+    /// session stays open for a smaller one.
+    #[tokio::test]
+    async fn send_insert_block_rejects_oversized_block_and_stays_in_insert() {
+        let (handle, mut server) = paired().await;
+
+        let server_task = tokio::spawn(async move {
+            let _drained = drain_client_bytes(&mut server).await;
+            write_schema_block(&mut server, &[("n", "UInt64")]).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            server
+        });
+
+        handle
+            .begin_insert(
+                "q_big".into(),
+                "INSERT INTO t FORMAT Native".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("begin_insert should succeed");
+
+        let err = handle
+            .send_insert_block(vec![0u8; MAX_INSERT_BLOCK_BYTES + 1], 1, 1)
+            .await
+            .expect_err("an oversized block must be refused");
+        match err {
+            Error::Custom(msg) => assert!(msg.contains("exceeds the"), "got {msg}"),
+            other => panic!("expected Custom, got {other:?}"),
+        }
+
+        // Still in InsertActive: a normal block is accepted.
+        handle
+            .send_insert_block(Vec::new(), 1, 0)
+            .await
+            .expect("the session must survive a refused block");
+        assert!(handle.is_alive());
+
+        let _server = server_task.await.unwrap();
+    }
+
+    /// A SELECT issued during an INSERT is caller misuse; the cursor
+    /// must surface it rather than hang, and the actor must survive.
+    #[tokio::test]
+    async fn execute_stream_during_insert_yields_one_err_frame() {
+        let (handle, mut server) = paired().await;
+
+        let server_task = tokio::spawn(async move {
+            let _drained = drain_client_bytes(&mut server).await;
+            write_schema_block(&mut server, &[("n", "UInt64")]).await;
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            server
+        });
+
+        handle
+            .begin_insert(
+                "q_busy_stream".into(),
+                "INSERT INTO t FORMAT Native".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect("begin_insert should succeed");
+
+        let mut cursor = handle
+            .execute_stream_cursor("rs_busy".into(), "SELECT 1".into(), Vec::new(), Vec::new())
+            .await
+            .expect("dispatch succeeds; the misuse surfaces on the cursor");
+        let err = cursor
+            .next_block()
+            .await
+            .expect_err("a SELECT during an INSERT must surface an error");
+        match err {
+            Error::Custom(msg) => assert!(msg.contains("busy in INSERT"), "got {msg}"),
+            other => panic!("expected Custom, got {other:?}"),
+        }
+        assert!(handle.is_alive(), "misuse must not poison the connection");
+
+        let _server = server_task.await.unwrap();
+    }
+
+    /// A rejected INSERT leaves the socket in a known state, so the
+    /// actor stays in Idle and the connection stays poolable.
+    #[tokio::test]
+    async fn begin_insert_exception_leaves_actor_idle_and_alive() {
+        let (handle, mut server) = paired().await;
+
+        let server_task = tokio::spawn(async move {
+            let _drained = drain_client_bytes(&mut server).await;
+            write_server_exception(&mut server, 60, "no such table").await;
+            // Then answer the Ping that proves the actor is Idle.
+            let id = read_byte(&mut server).await;
+            assert_eq!(u64::from(id), ClientPacketId::Ping as u64);
+            server
+                .write_var_uint(ServerPacketId::Pong as u64)
+                .await
+                .unwrap();
+            server.flush().await.unwrap();
+            server
+        });
+
+        let err = handle
+            .begin_insert(
+                "q_reject".into(),
+                "INSERT INTO nope FORMAT Native".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .expect_err("the server rejected the INSERT");
+        match err {
+            Error::ServerException { code, .. } => assert_eq!(code, 60),
+            other => panic!("expected ServerException, got {other:?}"),
+        }
+
+        assert!(handle.is_alive(), "a rejection must not poison");
+        handle
+            .ping()
+            .await
+            .expect("the actor must be back in Idle after a rejected INSERT");
+
+        let _server = server_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn double_drop_safety() {
         let (handle, mut server) = paired().await;
@@ -1632,7 +1801,7 @@ mod tests {
         });
 
         let result = handle
-            .execute_query("q1".into(), "SELECT 1".into(), Vec::new())
+            .execute_query("q1".into(), "SELECT 1".into(), Vec::new(), Vec::new())
             .await;
         assert!(result.is_ok(), "execute_query should succeed: {result:?}");
         assert!(handle.is_alive());
@@ -1668,13 +1837,18 @@ mod tests {
             server.write_string("".as_bytes()).await.unwrap();
             tokio::io::AsyncWriteExt::write_u8(&mut server, 0u8)
                 .await
-                .unwrap(); // has_nested = false
+                .unwrap(); // obsolete has_nested byte
             server.flush().await.unwrap();
             server
         });
 
         let err = handle
-            .execute_query("q2".into(), "SELECT * FROM nope".into(), Vec::new())
+            .execute_query(
+                "q2".into(),
+                "SELECT * FROM nope".into(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .expect_err("expected server Exception to surface");
         match err {
@@ -1755,8 +1929,12 @@ mod tests {
         // `tokio::time::timeout` drops the inner future on expiry,
         // which drops the oneshot::Receiver -- the cancel path.
         let cancel_handle = handle.clone();
-        let exec_fut =
-            cancel_handle.execute_query("qcancel".into(), "SELECT sleep(10)".into(), Vec::new());
+        let exec_fut = cancel_handle.execute_query(
+            "qcancel".into(),
+            "SELECT sleep(10)".into(),
+            Vec::new(),
+            Vec::new(),
+        );
         // Brief timeout so the actor has time to flush the Query
         // packet to the server before we drop the future.
         let timeout_result = tokio::time::timeout(Duration::from_millis(150), exec_fut).await;
@@ -1813,7 +1991,7 @@ mod tests {
         server.write_string(b"DB::Exception").await.unwrap();
         server.write_string(message.as_bytes()).await.unwrap();
         server.write_string(b"").await.unwrap();
-        AsyncWriteExt::write_u8(server, 0).await.unwrap(); // has_nested = false
+        AsyncWriteExt::write_u8(server, 0).await.unwrap(); // obsolete has_nested byte
         server.flush().await.unwrap();
     }
 
@@ -1839,6 +2017,7 @@ mod tests {
             .begin_insert(
                 "q_busy".into(),
                 "INSERT INTO t FORMAT Native".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -1915,6 +2094,7 @@ mod tests {
                 "q_finish".into(),
                 "INSERT INTO t FORMAT Native".into(),
                 Vec::new(),
+                Vec::new(),
             )
             .await
             .expect("begin_insert should succeed");
@@ -1964,6 +2144,7 @@ mod tests {
             .begin_insert(
                 "q_fd".into(),
                 "INSERT INTO t FORMAT Native".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -2015,6 +2196,7 @@ mod tests {
             .execute_stream_cursor(
                 "rs_stream_unit".into(),
                 "SELECT number AS n FROM numbers(3)".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -2074,6 +2256,7 @@ mod tests {
                 "rs_stream_err".into(),
                 "SELECT * FROM doesnt_exist".into(),
                 Vec::new(),
+                Vec::new(),
             )
             .await
             .expect("execute_stream_cursor should succeed");
@@ -2103,6 +2286,7 @@ mod tests {
         // connection so the pool drops it.
         let (handle, mut server) = paired_with_config(ActorConfig {
             read_timeout: Some(Duration::from_millis(80)),
+            ..ActorConfig::default()
         })
         .await;
 
@@ -2114,7 +2298,12 @@ mod tests {
         });
 
         let err = handle
-            .execute_query("rq_timeout".into(), "SELECT sleep(9)".into(), Vec::new())
+            .execute_query(
+                "rq_timeout".into(),
+                "SELECT sleep(9)".into(),
+                Vec::new(),
+                Vec::new(),
+            )
             .await
             .expect_err("a silent server must surface TimedOut, not hang");
         assert!(matches!(err, Error::TimedOut), "got {err:?}");
@@ -2131,6 +2320,7 @@ mod tests {
         // poison the connection -- not block until the caller gives up.
         let (handle, mut server) = paired_with_config(ActorConfig {
             read_timeout: Some(Duration::from_millis(80)),
+            ..ActorConfig::default()
         })
         .await;
 
@@ -2150,6 +2340,7 @@ mod tests {
             .execute_stream_cursor(
                 "rs_timeout".into(),
                 "SELECT number AS n FROM numbers(9)".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .await
@@ -2173,9 +2364,8 @@ mod tests {
     #[tokio::test]
     async fn execute_stream_aligns_rows_across_multiple_blocks() {
         // Two payload blocks of different widths back-to-back then EOS.
-        // The cursor must yield each block's rows in order with no
-        // cross-boundary misalignment -- the silent-misalignment edge
-        // the differential review flagged.
+        // The cursor must yield each block's rows in order, with no
+        // cross-boundary misalignment.
         let (handle, mut server) = paired().await;
 
         let server_task = tokio::spawn(async move {
@@ -2195,6 +2385,7 @@ mod tests {
             .execute_stream_cursor(
                 "rs_multiblock".into(),
                 "SELECT number AS n FROM numbers(5)".into(),
+                Vec::new(),
                 Vec::new(),
             )
             .await

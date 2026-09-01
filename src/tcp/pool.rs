@@ -8,43 +8,19 @@
 //! drops it otherwise -- the next caller then sees a freshly
 //! handshaken connection courtesy of `Manager::create`.
 //!
-//! The pool is `pub(crate)` in this branch -- the public construction
-//! site lands in the next branch as `Client::tcp(addr)`. Live
-//! end-to-end coverage (a real ClickHouse server, real handshake,
-//! pool acquire + ping + return + re-acquire) also rides with that
-//! branch; the unit tests here cover the deadpool wiring against a
-//! mock manager.
-//!
 //! # Recycle semantics
 //!
-//! [`ConnectionHandle::is_alive`] currently checks the poisoned flag
-//! only -- it does not probe the underlying socket. That is sufficient
-//! because the actor's reader sub-task poisons on any I/O failure
-//! (read EOF, decode error, etc.) and the writer arms poison on any
-//! send failure. Channel-closed (the actor task has exited and
-//! dropped its receiver) is the one not-yet-detected mode; in
-//! practice the actor's reader sub-task is what tears the connection
-//! down first, so by the time the channel closes the poisoned flag
-//! has already been set. A dedicated channel-closed probe is tracked
-//! for a follow-up audit pass.
+//! [`ConnectionHandle::is_alive`] checks the poisoned flag only; it does
+//! not probe the socket. The actor's reader sub-task poisons on any I/O
+//! failure and the writer arms poison on any send failure, so a torn
+//! connection is flagged before its channel ever closes.
 //!
-//! # Timeout defaults
+//! Refusing a connection shuts its actor down and waits, so the socket
+//! and the reader sub-task are gone before the slot refills. That wait
+//! is what `recycle_timeout` bounds.
 //!
-//! - `max_size = 8` mirrors the existing HTTP pool default so a
-//!   user switching transports does not silently see a different
-//!   concurrency ceiling.
-//! - `wait = 30s` bounds the acquire wait when every slot is busy;
-//!   callers see a `Pool::get` error instead of hanging.
-//! - `create = 10s` bounds connect + handshake; LAN handshakes
-//!   complete in <100ms on a healthy server, so 10s only fires under
-//!   network failure or a misconfigured backend.
-//! - `recycle = 5s` is generous: `is_alive` is a single atomic load.
-//!   The timeout exists to insure against a future recycle
-//!   implementation that grows a socket probe, not for the current
-//!   load-only check.
-//!
-//! Timeout configuration requires deadpool's `Runtime` to be set,
-//! which is why [`build_pool`] threads `Runtime::Tokio1` through.
+//! Timeout configuration requires deadpool's `Runtime` to be set, which
+//! is why [`build_pool`] threads `Runtime::Tokio1` through.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -80,9 +56,9 @@ pub(crate) const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 /// 10s is conservative head-room against transient packet loss.
 pub(crate) const DEFAULT_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default upper bound on the recycle (is-alive) check. Recycle is a
-/// single atomic load today, so 5s exists purely as insurance
-/// against future probe-on-recycle changes.
+/// Default upper bound on the recycle check. The liveness test is a
+/// single atomic load, but refusing a connection also awaits its actor
+/// shutdown, so this bounds a writer close against an unresponsive peer.
 pub(crate) const DEFAULT_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// deadpool `Manager` implementation for ClickHouse TCP connections.
@@ -94,26 +70,18 @@ pub(crate) const DEFAULT_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// drops it otherwise via [`RecycleError::Message`]; deadpool then
 /// calls `create` again for the next caller so the pool slot
 /// refills.
+#[non_exhaustive]
 pub struct TcpConnectionManager {
-    /// Candidate server addresses as the caller supplied them (e.g.
-    /// `["ch-1:9000", "ch-2:9000"]`). INVARIANT: non-empty -- the
-    /// builders (`Client::tcp` / `with_tcp_addrs`) enforce this, and
-    /// `Manager::create`'s round-robin modulo arithmetic relies on
-    /// it. Each is resolved per connection inside `Manager::create`
-    /// via the async resolver, not pinned to a `SocketAddr` at
-    /// construction -- so a hostname that gains new A records after the
-    /// pool is built picks them up on the next connect, and an
-    /// unresolvable host surfaces as a pool-acquire error rather than a
-    /// constructor panic.
+    /// Candidate server addresses as the caller supplied them.
+    /// INVARIANT: non-empty, which `Manager::create`'s round-robin
+    /// modulo arithmetic relies on. Each is resolved per connection via
+    /// the async resolver rather than pinned to a `SocketAddr`, so new A
+    /// records are picked up on reconnect.
     pub endpoints: Vec<String>,
-    /// Round-robin cursor shared across the pool. `create` does a
-    /// `fetch_add(1)` to pick the starting endpoint for each connect,
-    /// then walks the list from there -- so concurrent `create` calls
-    /// (the pool opens connections lazily as slots fill) spread their
-    /// starts across endpoints rather than all hammering endpoint 0.
-    /// `Arc` because the manager is shared by the pool; `AtomicUsize`
-    /// because `create` takes `&self`. Wrapping at `usize::MAX` is
-    /// harmless -- the value is only ever used modulo `endpoints.len()`.
+    /// Round-robin cursor shared across the pool, so concurrent `create`
+    /// calls spread their starting endpoint instead of all hammering
+    /// endpoint 0. Wrapping at `usize::MAX` is harmless: the value is
+    /// only used modulo `endpoints.len()`.
     pub next: Arc<AtomicUsize>,
     /// Plain TCP vs TLS selection. Carries the SNI on the TLS arm so
     /// the manager re-uses the same name across reconnects without
@@ -138,29 +106,21 @@ impl managed::Manager for TcpConnectionManager {
 
     async fn create(&self) -> Result<ConnectionHandle> {
         // Round-robin connect-failover: pick a starting endpoint via the
-        // shared atomic cursor, then walk the whole list from there in
-        // one pass, returning the first that connects. This delivers
-        // multi-host + connect-failover "for free" through deadpool's
-        // existing `create` path -- a poisoned connection is dropped on
-        // `recycle`, and the next `create` round-robins to a (possibly
-        // different) endpoint. `n >= 1` by the non-empty invariant on
-        // `endpoints`, so the modulo is safe.
+        // shared atomic cursor, walk the list from there in one pass,
+        // return the first that connects. `n >= 1` by the non-empty
+        // invariant on `endpoints`, so the modulo is safe.
         let n = self.endpoints.len();
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let mut last_err: Option<Error> = None;
         for i in 0..n {
             let endpoint = &self.endpoints[(start + i) % n];
-            // Resolve per connection via tokio's async resolver (not the
-            // blocking std `ToSocketAddrs`), so a hostname that gains new
-            // A records after the pool is built picks them up on
-            // reconnect, and an unresolvable host surfaces as a pool
-            // error rather than a constructor panic. First address only
-            // -- multi-A-record fan-out is a separate follow-up.
+            // Resolve per connection via tokio's async resolver, not the
+            // blocking std `ToSocketAddrs`; first address only.
             let resolved = match tokio::net::lookup_host(endpoint).await {
                 Ok(mut addrs) => addrs.next().ok_or_else(|| {
-                    Error::Custom(format!("tcp: {endpoint:?} resolved to no addresses"))
+                    Error::Connect(format!("tcp: {endpoint:?} resolved to no addresses"))
                 }),
-                Err(e) => Err(Error::Custom(format!(
+                Err(e) => Err(Error::Connect(format!(
                     "tcp: cannot resolve {endpoint:?}: {e}"
                 ))),
             };
@@ -180,6 +140,7 @@ impl managed::Manager for TcpConnectionManager {
                         hello,
                         ActorConfig {
                             read_timeout: self.read_timeout,
+                            quota_key: self.config.quota_key.clone(),
                         },
                     ));
                 }
@@ -187,10 +148,12 @@ impl managed::Manager for TcpConnectionManager {
             }
         }
         // Every endpoint failed this pass. Surface the last error
-        // unchanged (it stays typed, so retry classification sees it);
-        // the `unwrap` is sound because `n >= 1` guarantees the loop ran
-        // at least once and set `last_err` on its failing path.
-        Err(last_err.expect("create loop ran at least once over a non-empty endpoint list"))
+        // unchanged so it stays typed for retry classification; the
+        // fallback covers the unreachable empty-list case without a
+        // panic in a pool-acquire path.
+        Err(last_err.unwrap_or_else(|| {
+            Error::Connect("tcp: no endpoints configured for this pool".to_string())
+        }))
     }
 
     async fn recycle(&self, obj: &mut ConnectionHandle, metrics: &Metrics) -> RecycleResult<Error> {
@@ -199,23 +162,38 @@ impl managed::Manager for TcpConnectionManager {
         if let Some(max) = self.max_lifetime
             && metrics.created.elapsed() >= max
         {
+            close_refused(obj).await;
             return Err(RecycleError::message("connection exceeded max_lifetime"));
         }
         if obj.is_alive() {
             Ok(())
         } else {
+            close_refused(obj).await;
             Err(RecycleError::message("connection poisoned"))
         }
     }
 }
 
+/// Shut the actor behind a refused handle down and wait for it, so the
+/// socket, the actor task and its reader sub-task are gone before the
+/// slot refills. Cloning is `O(1)` and `close` takes the shared control,
+/// so this shuts down the same actor the caller was holding. Bounded by
+/// deadpool's `recycle_timeout`.
+async fn close_refused(obj: &ConnectionHandle) {
+    if let Err(e) = obj.clone().close().await {
+        tracing::warn!(
+            target: "clickhouse::tcp",
+            error = %e,
+            "refused connection did not shut down cleanly"
+        );
+    }
+}
+
 /// Concrete pool type for TCP connections.
 ///
-/// Type alias rather than a newtype so users (and the Client
-/// integration that follows) interact with deadpool's surface
-/// directly -- `pool.get().await` returns a deadpool `Object` that
-/// derefs to `ConnectionHandle`, and dropping it returns the
-/// connection to the pool.
+/// Type alias rather than a newtype so callers interact with deadpool's
+/// surface directly: `pool.get().await` returns an `Object` that derefs
+/// to `ConnectionHandle`, and dropping it returns the connection.
 pub type NativePool = Pool<TcpConnectionManager>;
 
 /// Pool configuration knobs surfaced to callers. Maps to a
@@ -227,6 +205,7 @@ pub type NativePool = Pool<TcpConnectionManager>;
 /// 10 s create timeout, 5 s recycle timeout. Tune by mutating the
 /// struct before handing it to [`build_pool`].
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct PoolConfig {
     /// Maximum number of connections the pool will hold.
     pub max_size: usize,
@@ -280,6 +259,7 @@ impl Default for PoolConfig {
 /// (e.g. `["127.0.0.1:9000"]`) so we can re-resolve at rebuild time
 /// rather than caching a `SocketAddr` that may have gone stale.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct TcpClientConfig {
     /// Candidate server addresses as the caller supplied them.
     /// Resolved at pool-build time, not at `Client::tcp` time, so a
@@ -313,37 +293,22 @@ pub struct TcpClientConfig {
 /// across feature configurations -- the conversion to `ConnectKind`
 /// happens at pool-build time, where the feature gate is in scope.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub enum ConnectKindConfig {
+    /// Plain TCP; no TLS upgrade.
     #[default]
     Plain,
     /// TLS over TCP. Held even when `tls` is off so the
     /// struct layout stays stable; pool build then returns an error
     /// if the feature is missing rather than silently downgrading to
     /// plain.
-    Tls { server_name: String },
+    Tls {
+        /// SNI sent in the ClientHello and the name the certificate is
+        /// validated against.
+        server_name: String,
+    },
 }
 
-/// Build a TCP connection pool over the supplied endpoint list,
-/// handshake config, and dials. The `Runtime::Tokio1` wiring is
-/// mandatory once any timeout is set; we set it unconditionally so a
-/// caller adding a timeout later does not see the build silently fail.
-///
-/// # Panics
-///
-/// Panics if `endpoints` is empty -- the round-robin in
-/// `Manager::create` divides by `endpoints.len()`. The `TcpClient`
-/// builders assert non-emptiness before reaching here, so an empty
-/// list is a programming error, not a runtime condition.
-///
-/// # Errors
-///
-/// Returns [`Error::Custom`] when the underlying
-/// [`deadpool::managed::PoolBuilder::build`] fails. The only documented
-/// build failure today is `BuildError::NoRuntimeSpecified`, which this
-/// function rules out by always supplying a runtime -- but we map
-/// the error explicitly so a future deadpool revision that adds new
-/// build failures still surfaces as a typed crate error rather than
-/// a panic.
 /// Build-time TLS intent for the TCP pool's connect path.
 ///
 /// Distinguishes "no trust was configured" (-> default anchors are fine)
@@ -352,6 +317,7 @@ pub enum ConnectKindConfig {
 /// a build-time-only input rather than on `PoolConfig` because it is not
 /// a runtime dial.
 #[cfg(feature = "tls")]
+#[non_exhaustive]
 pub enum TcpTls {
     /// Caller never customised trust. The TLS arm resolves the default
     /// native+webpki anchors (happy path).
@@ -363,6 +329,23 @@ pub enum TcpTls {
     ConfiguredButFailed,
 }
 
+/// Build a TCP connection pool over the supplied endpoint list,
+/// handshake config, and dials. `Runtime::Tokio1` is supplied
+/// unconditionally, because deadpool refuses to build once any timeout
+/// is set without it.
+///
+/// # Panics
+///
+/// If `endpoints` is empty -- `Manager::create`'s round-robin divides by
+/// `endpoints.len()`, and the `TcpClient` builders assert non-emptiness
+/// before reaching here.
+///
+/// # Errors
+///
+/// [`Error::Custom`] when [`deadpool::managed::PoolBuilder::build`]
+/// fails. Its only documented failure is `NoRuntimeSpecified`, which
+/// supplying a runtime rules out; the mapping is explicit so a future
+/// deadpool build failure surfaces typed rather than as a panic.
 pub fn build_pool(
     endpoints: Vec<String>,
     kind: ConnectKindConfig,
@@ -432,13 +415,10 @@ pub fn build_pool(
 
 #[cfg(test)]
 mod tests {
-    //! Pool unit tests use a mock `Manager` that hands out
-    //! `ConnectionHandle`s built over loopback `TcpStream`s. This
-    //! exercises deadpool's recycle protocol against the real
-    //! `is_alive` / `poison` contract on `ConnectionHandle` without
-    //! requiring a live ClickHouse server. The real
-    //! `TcpConnectionManager` is exercised end-to-end via the
-    //! `Client::tcp` live tests that land in the next branch.
+    //! A mock `Manager` hands out `ConnectionHandle`s built over
+    //! loopback `TcpStream`s, so deadpool's recycle protocol is
+    //! exercised against the real `is_alive` / `poison` contract with no
+    //! ClickHouse server involved.
     use super::*;
     use crate::tcp::connection_actor::ConnectionActor;
     use crate::tcp::protocol::{DBMS_TCP_PROTOCOL_VERSION, ServerHello};
@@ -488,10 +468,6 @@ mod tests {
                 creates: Arc::new(AtomicUsize::new(0)),
                 max_lifetime: None,
             }
-        }
-
-        fn create_count(&self) -> usize {
-            self.creates.load(Ordering::Acquire)
         }
     }
 
@@ -651,6 +627,48 @@ mod tests {
         assert!(acquired, "third acquire should succeed after a drop");
 
         drop(b);
+    }
+
+    /// A `create` that never completes must surface through the pool's
+    /// own `create_timeout` rather than hanging the acquire; the mapped
+    /// error has to stay retriable so the next pass tries another
+    /// endpoint.
+    #[tokio::test]
+    async fn create_timeout_surfaces_as_a_pool_error() {
+        struct StalledManager;
+
+        impl managed::Manager for StalledManager {
+            type Type = ConnectionHandle;
+            type Error = Error;
+
+            async fn create(&self) -> Result<ConnectionHandle> {
+                std::future::pending::<()>().await;
+                unreachable!("the create timeout fires first")
+            }
+
+            async fn recycle(&self, _: &mut ConnectionHandle, _: &Metrics) -> RecycleResult<Error> {
+                Ok(())
+            }
+        }
+
+        let pool = Pool::<StalledManager>::builder(StalledManager)
+            .max_size(1)
+            .create_timeout(Some(Duration::from_millis(20)))
+            .runtime(Runtime::Tokio1)
+            .build()
+            .expect("test pool builds");
+
+        let err = match tokio::time::timeout(Duration::from_secs(2), pool.get()).await {
+            Err(_) => panic!("acquire hung past the create timeout"),
+            Ok(Ok(_)) => panic!("create never completes; acquire must fail"),
+            Ok(Err(e)) => e,
+        };
+        let mapped = crate::tcp::retry::map_pool_error(err);
+        assert!(
+            matches!(mapped, Error::Transient(_)),
+            "a create timeout must map to a transient error, got {mapped:?}"
+        );
+        assert!(crate::tcp::retry::is_retriable_transport(&mapped));
     }
 
     /// A bounded `acquire_timeout` must surface as an `Err` when the

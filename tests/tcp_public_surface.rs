@@ -13,8 +13,7 @@
 use std::time::Duration;
 
 use clickhouse_dfe::TcpClient;
-use clickhouse_dfe::tcp::connection_actor::ConnectionHandle;
-use clickhouse_dfe::tcp::{RetryPolicy, TcpInsertSession, TcpRawCursor};
+use clickhouse_dfe::tcp::{ConnectionHandle, RetryPolicy, TcpInsertSession, TcpRawCursor};
 
 /// Every builder knob has to be readable back before a connection exists.
 #[test]

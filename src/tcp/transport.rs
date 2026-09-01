@@ -28,12 +28,14 @@ pub(crate) const CONN_WRITE_BUFFER: usize = 64 * 1024;
 /// gate; boxing keeps the unboxed `Plain` variant cheap.
 ///
 /// Returned to callers from [`crate::tcp::connect::open_handshaken`].
-/// Variants are intentionally non-exhaustive from a callsite point of
-/// view -- the connection actor pattern-matches internally; external
-/// users treat the value as an opaque `AsyncRead + AsyncWrite` handle.
+/// The connection actor pattern-matches internally; external users treat
+/// the value as an opaque `AsyncRead + AsyncWrite` handle.
 #[allow(clippy::large_enum_variant)] // Tls variant only exists with feature; boxed anyway.
+#[non_exhaustive]
 pub enum MaybeTlsStream {
+    /// Plain TCP socket.
     Plain(TcpStream),
+    /// TLS session over a TCP socket.
     #[cfg(feature = "tls")]
     Tls(Box<tokio_rustls::client::TlsStream<TcpStream>>),
 }
