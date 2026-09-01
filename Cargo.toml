@@ -35,9 +35,9 @@ tls = [
     "dep:webpki-roots",
     "dep:rustls-native-certs",
 ]
-# `clickhouse/*` moves in step so HTTP and TCP negotiate the same codec.
-lz4 = ["clickhouse/lz4", "dep:lz4_flex", "dep:cityhash-rs"]
-zstd = ["clickhouse/zstd", "dep:zstd", "dep:cityhash-rs"]
+# Block compression is upstream's; this crate negotiates `None` on TCP.
+lz4 = ["clickhouse/lz4"]
+zstd = ["clickhouse/zstd"]
 dynamic = ["dep:serde_json"]
 unified = ["tcp"]
 ext = []
@@ -69,13 +69,6 @@ deadpool = { version = ">=0.12, <0.13", default-features = false, features = ["m
 # 0.6 shares the socket2 that tokio and hyper-util already resolve to.
 socket2 = { version = ">=0.6, <0.7", features = ["all"], optional = true }
 
-# lz4 / zstd
-# 0.11.x unifies with upstream's own lz4_flex.
-lz4_flex = { version = ">=0.11.6, <0.12", default-features = false, features = ["std"], optional = true }
-# Exact pin as upstream: the block checksum is wire format.
-cityhash-rs = { version = "=1.0.1", optional = true }
-zstd = { version = ">=0.13, <0.14", default-features = false, optional = true }
-
 # tls
 rustls = { version = ">=0.23, <0.24", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"], optional = true }
 tokio-rustls = { version = ">=0.26, <0.27", default-features = false, features = ["aws_lc_rs", "tls12", "logging"], optional = true }
@@ -94,12 +87,28 @@ tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
 serde_json = ">=1.0.149, <2"
 dotenvy = ">=0.15.7, <0.16"
 static_assertions = ">=1.1, <2"
+proptest = { version = ">=1.11.0, <2", default-features = false, features = ["std", "bit-set"] }
 
 # Upstream's lint set plus `unsafe_code = "deny"`.
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unreachable_pub = "warn"
 unsafe_code = "deny"
+missing_docs = "warn"
 
+# Groups get priority = -1 so an individual lint level always wins.
 [lints.clippy]
+pedantic = { level = "warn", priority = -1 }
 undocumented_unsafe_blocks = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+missing_safety_doc = "warn"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "warn"
+private_intra_doc_links = "warn"
+invalid_codeblock_attributes = "warn"
+invalid_rust_codeblocks = "warn"
+bare_urls = "warn"

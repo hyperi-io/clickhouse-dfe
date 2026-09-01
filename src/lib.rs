@@ -8,28 +8,55 @@
 
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+// The crate docs are the README, whose prose names products, not code items;
+// modules re-enable the lint where the names really are Rust or wire types.
+#![allow(clippy::doc_markdown)]
 
-pub mod error;
+// The pedantic and rustdoc lint set in Cargo.toml is enforced in `native`;
+// every other module carries the allow until its own remediation wave clears
+// it. Removing an entry here is how a module opts in.
+macro_rules! ratcheted {
+    ($($(#[$attr:meta])* $vis:vis mod $name:ident;)*) => {
+        $(
+            $(#[$attr])*
+            #[allow(
+                missing_docs,
+                clippy::pedantic,
+                clippy::unwrap_used,
+                clippy::expect_used,
+                clippy::missing_errors_doc,
+                clippy::missing_panics_doc
+            )]
+            $vis mod $name;
+        )*
+    };
+}
+
 pub mod native;
-pub mod worker;
 
-#[cfg(feature = "tcp")]
-pub mod tcp;
+ratcheted! {
+    pub mod error;
 
-#[cfg(feature = "tls")]
-pub mod tls;
+    pub mod worker;
 
-#[cfg(feature = "dynamic")]
-pub mod dynamic;
+    #[cfg(feature = "tcp")]
+    pub mod tcp;
 
-#[cfg(feature = "unified")]
-pub mod unified;
+    #[cfg(feature = "tls")]
+    pub mod tls;
 
-#[cfg(feature = "ext")]
-pub mod ext;
+    #[cfg(feature = "dynamic")]
+    pub mod dynamic;
 
-#[cfg(feature = "inserter")]
-pub mod inserter;
+    #[cfg(feature = "unified")]
+    pub mod unified;
+
+    #[cfg(feature = "ext")]
+    pub mod ext;
+
+    #[cfg(feature = "inserter")]
+    pub mod inserter;
+}
 
 pub use error::{Error, Result};
 

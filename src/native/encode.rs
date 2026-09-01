@@ -1,13 +1,13 @@
 //! Columnar block encoder for native INSERT.
 //!
-//! Transposes row-oriented RowBinary data (one `Vec<u8>` per row) into the
-//! native columnar wire format used by ClickHouse data blocks.
+//! Transposes row-oriented `RowBinary` data (one `Vec<u8>` per row) into the
+//! native columnar wire format used by `ClickHouse` data blocks.
 //!
 //! # Supported types for INSERT
 //!
 //! All scalar fixed-size types, String, FixedString(N), Nullable(T),
 //! LowCardinality(T), Array(T), Map(K, V), Tuple(T1..Tn), and nested combinations.
-//! LowCardinality is fully encoded with a per-block dictionary + indices.
+//! `LowCardinality` is fully encoded with a per-block dictionary + indices.
 //! JSON is declared and written as a String column and cast server-side.
 //! Variant and Dynamic are not yet supported.
 
@@ -15,24 +15,21 @@ use crate::error::{Error, Result};
 use crate::native::columns::ColumnType;
 use crate::native::io::ClickHouseBytesWrite;
 
-/// Minimum server protocol revision where INSERT blocks must include
-/// a per-column `custom_serialization` flag byte before the values.
-/// Older servers skip the flag entirely; newer ones require it set
-/// (server-side default-serialisation expectation).
-///
-/// Used here by the encoder so blocks emitted into HTTP request
-/// bodies via the HTTP path or onto a TCP socket in a future transport match
-/// what the server expects. A future TCP transport layer will share
-/// this value -- duplication is intentional for now to keep 05a
-/// self-contained.
+/// Minimum server protocol revision where a block carries a per-column
+/// `custom_serialization` flag byte before the values. The sole definition:
+/// both the encoder and the decoder gate on it.
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
+
+/// Flag bit 9, which `ClickHouse` requires on every client INSERT block's
+/// `LowCardinality` column.
+const HAS_ADDITIONAL_KEYS: u64 = 1 << 9;
 
 /// Column schema entry for a native INSERT block.
 #[derive(Debug, Clone)]
 pub struct ColumnSchema {
     /// Column name as declared to the server.
     pub(crate) name: String,
-    /// Type name string sent on the wire (LowCardinality stripped).
+    /// Type name string sent on the wire (`LowCardinality` stripped).
     pub(crate) type_name: String,
     /// Parsed column type used for encoding decisions.
     pub(crate) col_type: ColumnType,
@@ -40,6 +37,10 @@ pub struct ColumnSchema {
 
 impl ColumnSchema {
     /// Build a `ColumnSchema` list from server-provided `(name, type_name)` pairs.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`] for a type name this codec cannot encode.
     pub fn from_headers(headers: &[(String, String)]) -> Result<Vec<Self>> {
         headers
             .iter()
@@ -60,7 +61,7 @@ impl ColumnSchema {
     }
 }
 
-/// Encode buffered RowBinary rows into native columnar block column bytes.
+/// Encode buffered `RowBinary` rows into native columnar block column bytes.
 ///
 /// Returns a flat byte buffer containing, for each column in order:
 /// - `string(column_name)`
@@ -73,20 +74,13 @@ impl ColumnSchema {
 ///
 /// # Performance
 ///
-/// This is the baseline implementation: per-cell `.to_vec()` makes
-/// `n_rows x n_cols` small heap allocations on the outer transpose
-/// pass, plus further allocations inside the recursive paths
-/// (Nullable null-fill, LowCardinality dict, Array/Map element
-/// collection, Tuple field bins). The zero-copy refactor in a
-/// follow-up branch (slice-references for the outer pass + pre-
-/// sized output) eliminates the outer allocations; the inner
-/// recursive paths still allocate. Treat numbers from this baseline
-/// as the correctness reference; perf numbers come from the
-/// follow-up.
+/// Every cell is a borrowed slice of the caller's row buffers; the only
+/// allocations left are the per-column slice vectors, the `LowCardinality`
+/// dictionary index list, and one default buffer per Nullable column.
 ///
 /// # Errors
 ///
-/// Returns `Error::BadResponse` if any row's RowBinary data is truncated or
+/// Returns `Error::BadResponse` if any row's `RowBinary` data is truncated or
 /// contains an unsupported type for INSERT.
 pub fn encode_columns(
     rows: &[Vec<u8>],
@@ -94,14 +88,11 @@ pub fn encode_columns(
     revision: u64,
 ) -> Result<Vec<u8>> {
     let has_custom_ser = revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION;
-    if columns.is_empty() {
+    if columns.is_empty() || rows.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Pass 1 -- record per-column byte ranges into the original row
-    // buffers (no copy, no per-cell allocation). For 1M rows x N
-    // columns this avoids 1M x N heap allocations versus the
-    // previous `to_vec()` approach.
+    // Pass 1 -- record per-column byte ranges into the caller's row buffers.
     let n = rows.len();
     let mut per_col: Vec<Vec<&[u8]>> = (0..columns.len()).map(|_| Vec::with_capacity(n)).collect();
     for row in rows {
@@ -111,11 +102,8 @@ pub fn encode_columns(
             rb_advance(row, &mut pos, &col.col_type)?;
             per_col[ci].push(&row[start..pos]);
         }
-        // Data-loss guard: caller may pass columns with fewer entries than
-        // T's RowBinary serialisation produced (e.g. dynamic `with_columns*`
-        // ctor narrowing the column set). Without this check the encoder
-        // would silently drop the trailing bytes and the resulting INSERT
-        // block would carry only the declared prefix of each row.
+        // A caller narrowing the column set below what the row's RowBinary
+        // carries would otherwise ship only the declared prefix of each row.
         if pos != row.len() {
             return Err(Error::BadResponse(format!(
                 "native INSERT: row has {} trailing RowBinary bytes after the {} declared column(s)",
@@ -125,12 +113,8 @@ pub fn encode_columns(
         }
     }
 
-    // Pass 2 -- emit header + native-encoded data for each column.
-    //
-    // Pre-size `out` from the sum of recorded slice lengths plus a
-    // small overhead per column (~32 bytes for name + type + flag
-    // byte). Avoids reallocations during `extend_from_slice` calls
-    // -- the realloc cost dominated for wide schemas.
+    // Pass 2 -- emit header + native-encoded data for each column, pre-sized
+    // from the recorded slice lengths so a wide schema costs no reallocations.
     let payload_size: usize = per_col.iter().flat_map(|c| c.iter().map(|s| s.len())).sum();
     let header_size: usize = columns
         .iter()
@@ -157,8 +141,10 @@ pub fn encode_columns(
     Ok(out)
 }
 
-/// Recursively write native columnar data for `values` (one `Vec<u8>` per row,
-/// containing raw RowBinary bytes for a single value).
+/// Recursively write native columnar data for `values`, one `RowBinary` cell
+/// per row.
+// One arm per composite wire shape; splitting it would scatter the layout.
+#[allow(clippy::too_many_lines)]
 fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) -> Result<()> {
     // Fixed-size scalars, String, and FixedString: RowBinary bytes == native bytes.
     if col_type.fixed_size().is_some()
@@ -179,22 +165,15 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
     match col_type {
         ColumnType::Nullable(inner) => {
             // Native: u8[n] null flags, then inner_type[n] values (zero for nulls).
-            let mut inner_vals: Vec<Vec<u8>> = Vec::with_capacity(values.len());
+            // Every null row shares one default buffer.
+            let mut default = Vec::new();
+            rb_write_default(&mut default, inner);
+            let mut inner_refs: Vec<&[u8]> = Vec::with_capacity(values.len());
             for v in values {
-                if v.is_empty() {
-                    return Err(rb_truncated());
-                }
-                let flag = v[0]; // RowBinary: 0 = has value, 1 = null
-                out.push(flag);
-                if flag == 0 {
-                    inner_vals.push(v[1..].to_vec()); // value bytes follow flag
-                } else {
-                    let mut def = Vec::new();
-                    rb_write_default(&mut def, inner); // zero bytes for null slot
-                    inner_vals.push(def);
-                }
+                let (&flag, rest) = v.split_first().ok_or_else(rb_truncated)?;
+                out.push(flag); // RowBinary: 0 = has value, 1 = null
+                inner_refs.push(if flag == 0 { rest } else { &default });
             }
-            let inner_refs: Vec<&[u8]> = inner_vals.iter().map(|v| v.as_slice()).collect();
             write_col_values(&inner_refs, inner, out)?;
         }
 
@@ -219,73 +198,69 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
                     (inner.as_ref(), false)
                 };
 
-            let mut dict: Vec<Vec<u8>> = Vec::new();
-            let mut seen: std::collections::HashMap<Vec<u8>, u32> =
+            let mut default_val = Vec::new();
+            let mut dict: Vec<&[u8]> = Vec::new();
+            let mut seen: std::collections::HashMap<&[u8], u32> =
                 std::collections::HashMap::default();
 
             if is_nullable_inner {
-                // Index 0 = default T value, represents NULL.
-                let mut default_val = Vec::new();
+                // Index 0 is the default T value, standing for NULL.
                 rb_write_default(&mut default_val, dict_type);
-                seen.insert(default_val.clone(), 0);
-                dict.push(default_val);
+                seen.insert(&default_val, 0);
+                dict.push(&default_val);
             }
 
             let mut indices: Vec<u32> = Vec::with_capacity(values.len());
             for v in values {
-                // For Nullable inner: strip the Nullable RowBinary wrapper.
-                // [0x01] = NULL -> index 0; [0x00, bytes...] = Some(v) -> extract bytes.
-                let key: Option<Vec<u8>> = if is_nullable_inner {
-                    if v.is_empty() || v[0] == 0x01 {
-                        None // NULL
-                    } else {
-                        Some(v[1..].to_vec()) // extract T bytes
+                // A Nullable inner arrives wrapped: [0x01] is NULL, [0x00, T..]
+                // is Some(T), and the wrapper is stripped for the dictionary.
+                let key: Option<&[u8]> = if is_nullable_inner {
+                    match v.split_first() {
+                        None | Some((0x01, _)) => None,
+                        Some((_, rest)) => Some(rest),
                     }
                 } else {
-                    Some(v.to_vec())
+                    Some(v)
                 };
 
                 let idx = match key {
-                    None => 0, // NULL -> index 0
+                    None => 0,
                     Some(bytes) => {
-                        if let Some(&i) = seen.get(&bytes) {
-                            i
-                        } else {
-                            let i = dict.len() as u32;
-                            seen.insert(bytes.clone(), i);
+                        let next = u32::try_from(dict.len()).map_err(|_| {
+                            Error::BadResponse(
+                                "native INSERT: LowCardinality dictionary exceeds u32 indices"
+                                    .to_string(),
+                            )
+                        })?;
+                        *seen.entry(bytes).or_insert_with(|| {
                             dict.push(bytes);
-                            i
-                        }
+                            next
+                        })
                     }
                 };
                 indices.push(idx);
             }
 
-            // Choose smallest index type that fits all dict indices.
-            let index_type: u64 = if dict.len() <= 0x100 {
-                0 // U8
+            // Narrowest index width that addresses the whole dictionary; a u32
+            // index vector caps the width at 4 bytes, so code 3 is unreachable.
+            let (index_type, index_bytes): (u64, usize) = if dict.len() <= 0x100 {
+                (0, 1)
             } else if dict.len() <= 0x1_0000 {
-                1 // U16
-            } else if (dict.len() as u64) <= 0x1_0000_0000 {
-                2 // U32
+                (1, 2)
             } else {
-                3 // U64
+                (2, 4)
             };
 
-            // ClickHouse requires HAS_ADDITIONAL_KEYS (bit 9 = 0x200) for client INSERT blocks.
-            const HAS_ADDITIONAL_KEYS: u64 = 1 << 9;
             let flags = HAS_ADDITIONAL_KEYS | index_type;
 
             out.extend_from_slice(&1u64.to_le_bytes()); // version
             out.extend_from_slice(&flags.to_le_bytes()); // flags
             out.extend_from_slice(&(dict.len() as u64).to_le_bytes()); // dict_size
-            // Convert owned dict bytes to slice references for the recursive call.
-            let dict_refs: Vec<&[u8]> = dict.iter().map(|v| v.as_slice()).collect();
-            write_col_values(&dict_refs, dict_type, out)?; // dict values (type = T, not Nullable(T))
+            // Dictionary type is T, never Nullable(T).
+            write_col_values(&dict, dict_type, out)?;
             out.extend_from_slice(&(indices.len() as u64).to_le_bytes()); // num_indices
-            let ibytes = [1usize, 2, 4, 8][index_type as usize];
             for idx in &indices {
-                out.extend_from_slice(&idx.to_le_bytes()[..ibytes]);
+                out.extend_from_slice(&idx.to_le_bytes()[..index_bytes]);
             }
         }
 
@@ -293,16 +268,14 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
             // Native: u64[n] cumulative offsets, then all elements as a sub-column.
             let mut cum: u64 = 0;
             let mut offsets: Vec<u64> = Vec::with_capacity(values.len());
-            let mut all_elems: Vec<Vec<u8>> = Vec::new();
+            let mut all_elems: Vec<&[u8]> = Vec::new();
 
             for v in values {
-                let mut pos = 0;
-                let (count, hdr) = rb_read_varuint(v, pos)?;
-                pos += hdr;
+                let (count, mut pos) = rb_read_varuint(v, 0)?;
                 for _ in 0..count {
                     let start = pos;
                     rb_advance(v, &mut pos, inner)?;
-                    all_elems.push(v[start..pos].to_vec());
+                    all_elems.push(&v[start..pos]);
                 }
                 cum += count;
                 offsets.push(cum);
@@ -311,28 +284,25 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
             for off in &offsets {
                 out.extend_from_slice(&off.to_le_bytes());
             }
-            let elem_refs: Vec<&[u8]> = all_elems.iter().map(|v| v.as_slice()).collect();
-            write_col_values(&elem_refs, inner, out)?;
+            write_col_values(&all_elems, inner, out)?;
         }
 
         ColumnType::Map(key_type, val_type) => {
             // Native: u64[n] cumulative offsets, then key sub-column, then value sub-column.
             let mut cum: u64 = 0;
             let mut offsets: Vec<u64> = Vec::with_capacity(values.len());
-            let mut all_keys: Vec<Vec<u8>> = Vec::new();
-            let mut all_vals: Vec<Vec<u8>> = Vec::new();
+            let mut all_keys: Vec<&[u8]> = Vec::new();
+            let mut all_vals: Vec<&[u8]> = Vec::new();
 
             for v in values {
-                let mut pos = 0;
-                let (count, hdr) = rb_read_varuint(v, pos)?;
-                pos += hdr;
+                let (count, mut pos) = rb_read_varuint(v, 0)?;
                 for _ in 0..count {
                     let ks = pos;
                     rb_advance(v, &mut pos, key_type)?;
-                    all_keys.push(v[ks..pos].to_vec());
+                    all_keys.push(&v[ks..pos]);
                     let vs = pos;
                     rb_advance(v, &mut pos, val_type)?;
-                    all_vals.push(v[vs..pos].to_vec());
+                    all_vals.push(&v[vs..pos]);
                 }
                 cum += count;
                 offsets.push(cum);
@@ -341,27 +311,24 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
             for off in &offsets {
                 out.extend_from_slice(&off.to_le_bytes());
             }
-            let key_refs: Vec<&[u8]> = all_keys.iter().map(|v| v.as_slice()).collect();
-            let val_refs: Vec<&[u8]> = all_vals.iter().map(|v| v.as_slice()).collect();
-            write_col_values(&key_refs, key_type, out)?;
-            write_col_values(&val_refs, val_type, out)?;
+            write_col_values(&all_keys, key_type, out)?;
+            write_col_values(&all_vals, val_type, out)?;
         }
 
         ColumnType::Tuple(fields) => {
             // Native: each field is a separate sub-column in definition order.
-            let mut field_vals: Vec<Vec<Vec<u8>>> =
+            let mut field_vals: Vec<Vec<&[u8]>> =
                 vec![Vec::with_capacity(values.len()); fields.len()];
             for v in values {
                 let mut pos = 0;
                 for (fi, field_type) in fields.iter().enumerate() {
                     let start = pos;
                     rb_advance(v, &mut pos, field_type)?;
-                    field_vals[fi].push(v[start..pos].to_vec());
+                    field_vals[fi].push(&v[start..pos]);
                 }
             }
-            for (fi, field_type) in fields.iter().enumerate() {
-                let field_refs: Vec<&[u8]> = field_vals[fi].iter().map(|v| v.as_slice()).collect();
-                write_col_values(&field_refs, field_type, out)?;
+            for (field, field_type) in field_vals.iter().zip(fields) {
+                write_col_values(field, field_type, out)?;
             }
         }
 
@@ -377,8 +344,8 @@ fn write_col_values(values: &[&[u8]], col_type: &ColumnType, out: &mut Vec<u8>) 
 
 /// Advance `pos` past one RowBinary-encoded value of `col_type`.
 ///
-/// RowBinary and native wire formats are identical for all scalar types.
-/// Only `Nullable` differs: RowBinary has a per-row flag followed by the
+/// `RowBinary` and native wire formats are identical for all scalar types.
+/// Only `Nullable` differs: `RowBinary` has a per-row flag followed by the
 /// value (or nothing for null), while native packs flags and values separately.
 fn rb_advance(data: &[u8], pos: &mut usize, col_type: &ColumnType) -> Result<()> {
     // Fixed-size types: same byte count in RowBinary and native.
@@ -394,9 +361,9 @@ fn rb_advance(data: &[u8], pos: &mut usize, col_type: &ColumnType) -> Result<()>
     match col_type {
         ColumnType::String | ColumnType::Json | ColumnType::NewJson => {
             let (len, hdr) = rb_read_varuint(data, *pos)?;
-            let end = pos
-                .checked_add(hdr)
-                .and_then(|p| p.checked_add(len as usize))
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| pos.checked_add(hdr)?.checked_add(len))
                 .ok_or_else(rb_truncated)?;
             if end > data.len() {
                 return Err(rb_truncated());
@@ -481,27 +448,11 @@ fn rb_write_default(out: &mut Vec<u8>, col_type: &ColumnType) {
 
 /// Read a varuint from `data` starting at `pos`, returning `(value, bytes_consumed)`.
 fn rb_read_varuint(data: &[u8], pos: usize) -> Result<(u64, usize)> {
-    let mut out = 0u64;
-    let mut shift = 0u32;
-    let mut i = pos;
-    loop {
-        if i >= data.len() {
-            return Err(rb_truncated());
-        }
-        let b = data[i];
-        i += 1;
-        out |= u64::from(b & 0x7F) << shift;
-        shift += 7;
-        if b & 0x80 == 0 {
-            break;
-        }
-        if shift >= 64 {
-            return Err(Error::BadResponse(
-                "native INSERT: varuint overflow in RowBinary".to_string(),
-            ));
-        }
+    let tail = data.get(pos..).ok_or_else(rb_truncated)?;
+    match crate::native::io::get_var_uint(tail) {
+        Err(Error::NotEnoughData) => Err(rb_truncated()),
+        other => other,
     }
-    Ok((out, i - pos))
 }
 
 fn rb_truncated() -> Error {
@@ -623,14 +574,74 @@ mod tests {
             type_name: "UInt8".to_string(),
             col_type: ColumnType::UInt8,
         }];
-        let err = match encode_columns(&rows, &cols, 0) {
-            Ok(_) => panic!("trailing RowBinary bytes must reject"),
-            Err(e) => e,
+        let Err(err) = encode_columns(&rows, &cols, 0) else {
+            panic!("trailing RowBinary bytes must reject")
         };
         let msg = format!("{err}");
         assert!(
             msg.contains("trailing") || msg.contains("leftover"),
             "expected trailing-byte error, got: {msg}",
         );
+    }
+
+    fn schema(type_name: &str) -> Vec<ColumnSchema> {
+        ColumnSchema::from_headers(&[("c".to_string(), type_name.to_string())])
+            .expect("schema parses")
+    }
+
+    /// Strip the `varuint("c") + varuint(type_name)` column header.
+    fn body(out: &[u8], type_name: &str) -> Vec<u8> {
+        let header = 2 + 1 + type_name.len();
+        out[header..].to_vec()
+    }
+
+    #[test]
+    fn encode_tuple_writes_one_subcolumn_per_field() {
+        // Two rows of (UInt8, UInt16): all the u8s, then all the u16s.
+        let rows = vec![vec![1u8, 2, 0], vec![3u8, 4, 0]];
+        let out = encode_columns(&rows, &schema("Tuple(UInt8, UInt16)"), 0).expect("encodes");
+        assert_eq!(
+            body(&out, "Tuple(UInt8, UInt16)"),
+            vec![1, 3, /* u16s */ 2, 0, 4, 0]
+        );
+    }
+
+    #[test]
+    fn encode_map_writes_offsets_then_keys_then_values() {
+        // One row: {1: 2, 3: 4}. RowBinary is varuint(count) + k,v pairs.
+        let rows = vec![vec![2u8, 1, 2, 3, 4]];
+        let out = encode_columns(&rows, &schema("Map(UInt8, UInt8)"), 0).expect("encodes");
+        let mut expected = 2u64.to_le_bytes().to_vec();
+        expected.extend_from_slice(&[1, 3]); // keys
+        expected.extend_from_slice(&[2, 4]); // values
+        assert_eq!(body(&out, "Map(UInt8, UInt8)"), expected);
+    }
+
+    #[test]
+    fn encode_rejects_truncated_array_row() {
+        // The row claims three elements and carries one.
+        let rows = vec![vec![3u8, 9]];
+        let err = encode_columns(&rows, &schema("Array(UInt8)"), 0)
+            .expect_err("a truncated array row must reject");
+        assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn encode_empty_rows_writes_no_prefix() {
+        // A zero-row block carries no column payload at all, so the encoder
+        // must not emit a LowCardinality prefix for one.
+        let out = encode_columns(&[], &schema("LowCardinality(String)"), 0).expect("encodes");
+        assert!(out.is_empty(), "got {out:?}");
+    }
+
+    #[test]
+    fn encode_lowcardinality_picks_the_narrowest_index_width() {
+        // Two distinct keys fit a u8 index, so flags carry index code 0.
+        let rows = vec![vec![1u8, b'a'], vec![1u8, b'b'], vec![1u8, b'a']];
+        let out = encode_columns(&rows, &schema("LowCardinality(String)"), 0).expect("encodes");
+        let data = body(&out, "LowCardinality(String)");
+        assert_eq!(&data[..8], &1u64.to_le_bytes(), "version");
+        assert_eq!(&data[8..16], &0x200u64.to_le_bytes(), "additional keys, u8");
+        assert_eq!(&data[16..24], &2u64.to_le_bytes(), "dictionary size");
     }
 }

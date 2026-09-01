@@ -1,52 +1,15 @@
-//! Native columnar block decoder.
+//! Native columnar block decoder -- the inverse of
+//! [`crate::native::encode_columns`], mirroring [`NativeReader.cpp`].
 //!
-//! Inverse of [`crate::native::encode_columns`]. Reads a Native-format
-//! data block off any [`ClickHouseRead`] source and returns a
-//! [`DecodedBlock`] -- one [`DecodedColumn`] per declared column, with
-//! typed value buffers for every scalar variant and recursive child
-//! columns for Nullable / Array / Tuple / Map / LowCardinality.
-//!
-//! # Why a runtime-typed container?
-//!
-//! [`crate::native::columns::read_column`] already decodes
-//! every column type, but it returns per-row RowBinary bytes -- a
-//! shape optimised for piping into upstream's row-oriented
-//! `rowbinary::deserialize_row` machinery. The streaming-SELECT cursor
-//! over TCP wants the inverse: a columnar container that callers can
-//! iterate row by row WITHOUT a second transpose pass. `DecodedBlock`
-//! is that container. It coexists with `read_column`; both reach the
-//! same bytes on the wire but bridge to different downstream shapes.
-//!
-//! # Mirror of `NativeReader.cpp`
-//!
-//! The bytes-on-wire follow [`NativeReader.cpp`] on `upstream/master`
-//! and [`crate::native::encode::encode_columns`]. Round-trip
-//! property tests (one per supported type) sit next to this module
-//! and pin the bytes against the encoder.
-//!
-//! # Scope of v1
-//!
-//! Decoded types:
-//!
-//! - Numerics: `UInt8/16/32/64/128/256`, `Int8/16/32/64/128/256`,
-//!   `Float32/64`, `Bool` (decoded as `UInt8`).
-//! - `Decimal32/64/128/256` (backing little-endian integer + the
-//!   `precision`/`scale` lifted from the type name).
-//! - String / FixedString(N).
-//! - Date / Date32 / DateTime / DateTime64 (`precision` + optional
-//!   `timezone` for DateTime64).
-//! - UUID, IPv4, IPv6.
-//! - Nullable(T), Array(T), Tuple(T1, ..., Tn), Map(K, V), LowCardinality(T).
-//! - JSON, as `DecodedColumn::String`, when the query sets
-//!   `output_format_native_write_json_as_string=1` -- which `TcpClient`
-//!   does by default.
-//!
-//! Out of v1 scope (encoded as `DecodedColumn::Unsupported(type_name)`):
-//! Variant, Dynamic, path-serialised JSON, Time / Time64, BFloat16, geo types. These
-//! survive the block-skip path without misaligning the stream pointer
-//! because [`crate::native::columns::read_column`] consumes their wire
-//! bytes; the decoder tags them Unsupported so the cursor surfaces a
-//! clean error if a caller tries to read a value out.
+//! Reads a Native-format data block off any [`ClickHouseRead`] source into a
+//! [`DecodedBlock`]: one [`DecodedColumn`] per declared column, holding typed
+//! value buffers the cursor can index row by row without a second transpose.
+//! `Variant`, `Dynamic` and `JSON` columns arrive as
+//! [`DecodedColumn::Json`], one document per row, rendered by
+//! [`crate::native::columns::read_column`]. `BFloat16`, `Time`, `Time64` and
+//! the geo types have no typed variant yet: their wire bytes are consumed so
+//! the stream pointer stays aligned and the column is tagged
+//! [`DecodedColumn::Unsupported`].
 //!
 //! [`NativeReader.cpp`]: https://github.com/ClickHouse/ClickHouse/blob/master/src/Formats/NativeReader.cpp
 
@@ -56,26 +19,30 @@ use tokio::io::AsyncReadExt;
 
 use crate::error::{Error, Result};
 use crate::native::columns::{self, ColumnType};
-use crate::native::io::ClickHouseRead;
+use crate::native::io::{ClickHouseRead, read_exact_grown, with_cap};
 
-/// Upper bound on composite-type nesting the decoder will descend.
-/// Bounds the recursive `decode_column` so a hostile server announcing
-/// `Array(Array(...))` thousands deep cannot drive unbounded
-/// (heap-allocated, boxed-future) recursion. This backstops the
-/// parse-time depth guard in [`crate::native::columns::ColumnType`]:
-/// since types only reach `decode_column` via that parser, the cap is
-/// rarely exercised, but it keeps the decoder robust if a deep type is
-/// constructed by any other path.
+/// Upper bound on composite-type nesting `decode_column` will descend,
+/// backstopping the parse-time guard in [`crate::native::columns::ColumnType`]
+/// for a type built outside the parser.
 const MAX_DECODE_DEPTH: usize = 32;
 
-/// Fixed-width little-endian scalar that can be bulk-decoded. The blanket
-/// numeric column decode reads the whole column's bytes in one
-/// `read_exact` and converts them in a single tight loop, instead of
-/// one `.await` per element -- the per-element shape forced N await
-/// points (and N bounds checks) per N-row column on the streaming-SELECT
-/// hot path. On little-endian targets the conversion loop lowers to a
-/// `memcpy`; on big-endian it is a vectorisable byte-swap.
-trait LeScalar: Sized + Copy {
+/// Hard cap on the `num_rows` a Data packet header may declare. The count is a
+/// server-controlled varuint that sizes every per-column buffer in the block.
+const MAX_BLOCK_ROWS: u64 = 1 << 28;
+
+/// Hard cap on the `num_columns` a Data packet header may declare.
+const MAX_BLOCK_COLUMNS: u64 = 1 << 16;
+
+/// Reject a length a server declared but cannot back with payload.
+fn refused(what: &str, got: u64, cap: u64) -> Error {
+    Error::BadResponse(format!(
+        "native: block declares {got} {what}, above the {cap} cap"
+    ))
+}
+
+/// Fixed-width little-endian scalar decoded a whole column at a time: one
+/// `read_exact` and one conversion pass, rather than an await point per row.
+trait LeScalar: Sized + Copy + Default {
     const WIDTH: usize;
     fn from_le_slice(bytes: &[u8]) -> Self;
 }
@@ -87,8 +54,11 @@ macro_rules! impl_le_scalar {
                 const WIDTH: usize = std::mem::size_of::<$t>();
                 #[inline]
                 fn from_le_slice(bytes: &[u8]) -> Self {
-                    // `chunks_exact(WIDTH)` guarantees an exact-width slice.
-                    <$t>::from_le_bytes(bytes.try_into().expect("chunks_exact yields WIDTH bytes"))
+                    // The sole caller feeds `chunks_exact(WIDTH)`, so the
+                    // fallback arm is unreachable.
+                    bytes
+                        .try_into()
+                        .map_or_else(|_| Self::default(), <$t>::from_le_bytes)
                 }
             }
         )*
@@ -101,11 +71,12 @@ impl_le_scalar!(u16, i16, u32, i32, u64, i64, u128, i128, f32, f64);
 /// whole column followed by a single conversion pass.
 async fn read_le_column<R: ClickHouseRead, T: LeScalar>(r: &mut R, n: usize) -> Result<Vec<T>> {
     let total = n.checked_mul(T::WIDTH).ok_or_else(|| {
-        Error::BadResponse("tcp: numeric column byte length overflows usize".into())
+        Error::BadResponse("native: numeric column byte length overflows usize".into())
     })?;
-    let mut raw = vec![0u8; total];
-    r.read_exact(&mut raw).await?;
-    Ok(raw.chunks_exact(T::WIDTH).map(T::from_le_slice).collect())
+    let raw = read_exact_grown(r, total).await?;
+    let mut out = with_cap(n)?;
+    out.extend(raw.chunks_exact(T::WIDTH).map(T::from_le_slice));
+    Ok(out)
 }
 
 /// Read `n` raw 32-byte little-endian values in bulk (the backing store
@@ -113,49 +84,54 @@ async fn read_le_column<R: ClickHouseRead, T: LeScalar>(r: &mut R, n: usize) -> 
 /// scalar). One `read_exact` + a chunked copy.
 async fn read_u256_column<R: ClickHouseRead>(r: &mut R, n: usize) -> Result<Vec<[u8; 32]>> {
     let total = n.checked_mul(32).ok_or_else(|| {
-        Error::BadResponse("tcp: 256-bit column byte length overflows usize".into())
+        Error::BadResponse("native: 256-bit column byte length overflows usize".into())
     })?;
-    let mut raw = vec![0u8; total];
-    r.read_exact(&mut raw).await?;
-    Ok(raw
-        .chunks_exact(32)
-        .map(|c| {
-            let mut a = [0u8; 32];
-            a.copy_from_slice(c);
-            a
-        })
-        .collect())
+    let raw = read_exact_grown(r, total).await?;
+    let mut out = with_cap(n)?;
+    out.extend(raw.chunks_exact(32).map(|c| {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(c);
+        a
+    }));
+    Ok(out)
 }
 
 /// One column of a decoded Native block, runtime-typed.
 ///
-/// Composite variants (Nullable / Array / Tuple / Map / LowCardinality)
-/// hold their child columns boxed so the enum stays a small, recursive
-/// owned value -- the same shape `ColumnType` uses upstream of it.
-///
-/// Numeric variants hold contiguous `Vec<T>` buffers ready for
-/// per-row indexing; this is the simplest shape that preserves the
-/// columnar layout the wire produced. Specialised SIMD or pooled
-/// allocators are deferred follow-ups; the layout is amenable.
+/// Scalar variants hold contiguous buffers in the columnar layout the wire
+/// produced; composite variants box their child columns.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum DecodedColumn {
     // Numeric scalars.
+    /// `UInt8` values in wire order -- `Bool` and `Enum8` decode here too.
     UInt8(Vec<u8>),
+    /// `UInt16` values in wire order -- `Enum16` decodes here too.
     UInt16(Vec<u16>),
+    /// `UInt32` values in wire order.
     UInt32(Vec<u32>),
+    /// `UInt64` values in wire order.
     UInt64(Vec<u64>),
+    /// `Int8` values in wire order.
     Int8(Vec<i8>),
+    /// `Int16` values in wire order.
     Int16(Vec<i16>),
+    /// `Int32` values in wire order.
     Int32(Vec<i32>),
+    /// `Int64` values in wire order.
     Int64(Vec<i64>),
+    /// `Int128` values in wire order.
     Int128(Vec<i128>),
+    /// `UInt128` values in wire order.
     UInt128(Vec<u128>),
     /// 256-bit integers carried as raw little-endian 32-byte values
     /// (Rust has no native i256/u256). Callers interpret as needed.
     Int256(Vec<[u8; 32]>),
+    /// `UInt256` values as raw little-endian 32-byte blocks.
     UInt256(Vec<[u8; 32]>),
+    /// `Float32` values in wire order.
     Float32(Vec<f32>),
+    /// `Float64` values in wire order.
     Float64(Vec<f64>),
 
     /// `Decimal(P, S)` decoded as its backing little-endian integer
@@ -164,77 +140,119 @@ pub enum DecodedColumn {
     /// the value is `backing / 10^scale`. They are NOT on the wire; the
     /// decoder lifts them from the parsed `ColumnType`.
     Decimal32 {
+        /// Total decimal digits, from the column type.
         precision: u8,
+        /// Fractional digits, from the column type.
         scale: u8,
+        /// Backing `Int32` values in wire order.
         values: Vec<i32>,
     },
+    /// `Decimal(P, S)` on an `Int64` backing integer.
     Decimal64 {
+        /// Total decimal digits, from the column type.
         precision: u8,
+        /// Fractional digits, from the column type.
         scale: u8,
+        /// Backing `Int64` values in wire order.
         values: Vec<i64>,
     },
+    /// `Decimal(P, S)` on an `Int128` backing integer.
     Decimal128 {
+        /// Total decimal digits, from the column type.
         precision: u8,
+        /// Fractional digits, from the column type.
         scale: u8,
+        /// Backing `Int128` values in wire order.
         values: Vec<i128>,
     },
+    /// `Decimal(P, S)` on an `Int256` backing integer.
     Decimal256 {
+        /// Total decimal digits, from the column type.
         precision: u8,
+        /// Fractional digits, from the column type.
         scale: u8,
+        /// Backing `Int256` values as raw little-endian 32-byte blocks.
         values: Vec<[u8; 32]>,
     },
 
     // Variable-length scalars.
+    /// `String` values as raw bytes -- `ClickHouse` does not guarantee UTF-8.
     String(Vec<Vec<u8>>),
+    /// One JSON document per row, as UTF-8 text with no length prefix. Carries
+    /// `JSON`, `Object('json')`, `Variant` and `Dynamic` columns, whose wire
+    /// shapes have no single Rust type.
+    Json(Vec<Vec<u8>>),
+    /// `FixedString(N)` rows concatenated -- row `i` is `bytes[i * width..][..width]`.
     FixedString {
+        /// `N` from the column type, in bytes.
         width: usize,
+        /// Every row concatenated, `width` bytes each.
         bytes: Vec<u8>,
     },
 
     // Date / time.
+    /// `Date`: unsigned days since the Unix epoch.
     Date(Vec<u16>),
     /// `Date32`: signed days since the Unix epoch.
     Date32(Vec<i32>),
+    /// `DateTime`: unsigned seconds since the Unix epoch.
     DateTime(Vec<u32>),
     /// `DateTime64`: Int64 ticks at `precision` sub-second digits, with the
     /// optional IANA `timezone` from the type name. Both come from the
     /// parsed `ColumnType`, not the wire.
     DateTime64 {
+        /// Sub-second digits, from the column type.
         precision: u8,
+        /// IANA timezone from the column type, absent when the type omits it.
         timezone: Option<String>,
+        /// `Int64` tick counts in wire order.
         values: Vec<i64>,
     },
 
     // Network.
+    /// `UUID` values as their 16 wire bytes.
     Uuid(Vec<[u8; 16]>),
+    /// `IPv4` addresses as their backing `UInt32`.
     Ipv4(Vec<u32>),
+    /// `IPv6` addresses as their 16 wire bytes.
     Ipv6(Vec<[u8; 16]>),
 
     // Composites.
     /// `mask[i] == 1` => row `i` is null; `child[i]` still exists with a
     /// placeholder value (matching the Native wire shape).
     Nullable {
+        /// One byte per row -- 1 marks the row NULL.
         mask: Vec<u8>,
+        /// Values for every row, null slots included.
         child: Box<DecodedColumn>,
     },
     /// Cumulative end-offsets; row `i` spans `child[offsets[i-1]..offsets[i]]`.
     Array {
+        /// Cumulative element end-offsets, one per row.
         offsets: Vec<u64>,
+        /// Flat element column indexed by `offsets`.
         child: Box<DecodedColumn>,
     },
     /// Per-block dictionary + per-row indices. Resolved at access time;
     /// the cursor narrows to `child[indices[row]]` when iterating.
     LowCardinality {
+        /// Per-block dictionary -- the inner type with `Nullable` stripped.
         dict: Box<DecodedColumn>,
+        /// One unsigned dictionary index per row, at the width the block declared.
         indices: Box<DecodedColumn>,
         /// True when the LC inner type is `Nullable(T)`. Dictionary
         /// index 0 then represents NULL.
         is_nullable_inner: bool,
     },
+    /// One decoded column per tuple field, in declaration order.
     Tuple(Vec<DecodedColumn>),
+    /// `Map(K, V)` as cumulative pair offsets over flat key and value columns.
     Map {
+        /// Cumulative key-value pair end-offsets, one per row.
         offsets: Vec<u64>,
+        /// Flat key column indexed by `offsets`.
         keys: Box<DecodedColumn>,
+        /// Flat value column indexed by `offsets`.
         values: Box<DecodedColumn>,
     },
 
@@ -249,6 +267,9 @@ impl DecodedColumn {
     ///
     /// For composite variants the count is the OUTER row count, not
     /// the cumulative child-element count.
+    // One arm per variant: merging the identical bodies would fold
+    // unrelated wire types (`UInt32`, `DateTime`, `IPv4`) into one pattern.
+    #[allow(clippy::match_same_arms)]
     #[must_use]
     pub fn row_count(&self) -> usize {
         match self {
@@ -270,7 +291,7 @@ impl DecodedColumn {
             Self::Decimal64 { values, .. } => values.len(),
             Self::Decimal128 { values, .. } => values.len(),
             Self::Decimal256 { values, .. } => values.len(),
-            Self::String(v) => v.len(),
+            Self::String(v) | Self::Json(v) => v.len(),
             Self::FixedString { width, bytes } => {
                 if *width == 0 {
                     0
@@ -300,14 +321,15 @@ impl DecodedColumn {
 /// A decoded Native data block: ordered list of columns plus the
 /// `(name, type_name)` schema the server announced.
 ///
-/// The schema is copied per-block so a single cursor can survive the
-/// rare server-side schema renegotiation that mid-stream INSERT-SELECT
-/// can emit. Cost is small (handful of strings per block); we re-tag
-/// every block rather than thread a per-cursor schema slot.
+/// The schema is copied per block so one cursor survives the mid-stream
+/// schema renegotiation an INSERT-SELECT can emit.
 #[derive(Debug, Clone)]
 pub struct DecodedBlock {
+    /// One decoded column per schema entry, in wire order.
     pub columns: Vec<DecodedColumn>,
+    /// `(name, type_name)` per column, as the server announced them.
     pub schema: Vec<(String, String)>,
+    /// Row count the Data packet header declared.
     pub num_rows: u64,
 }
 
@@ -315,6 +337,7 @@ impl DecodedBlock {
     /// The column the server announced under `name`. `None` for a column
     /// the block does not declare, and for the header block, which
     /// declares its columns and carries no values.
+    #[must_use]
     pub fn column(&self, name: &str) -> Option<&DecodedColumn> {
         let index = self.schema.iter().position(|(n, _)| n == name)?;
         self.columns.get(index)
@@ -339,7 +362,7 @@ impl DecodedBlock {
             .iter()
             .position(|(n, _)| n == name)
             .ok_or_else(|| {
-                Error::SchemaMismatch(format!("tcp: block declares no column '{name}'"))
+                Error::SchemaMismatch(format!("native: block declares no column '{name}'"))
             })?;
         match self.columns.get(index) {
             Some(column) => T::from_column(column, name, &self.schema[index].1),
@@ -350,7 +373,7 @@ impl DecodedBlock {
 
 /// Typed read of one [`DecodedColumn`].
 ///
-/// Implemented for the wire types ClickHouse system tables use for
+/// Implemented for the wire types `ClickHouse` system tables use for
 /// schema metadata. Anything else goes through [`DecodedBlock::column`]
 /// and matches on the variant directly.
 pub trait FromColumn: Sized {
@@ -367,14 +390,15 @@ pub trait FromColumn: Sized {
 
 fn wrong_type(name: &str, type_name: &str, expected: &str) -> Error {
     Error::SchemaMismatch(format!(
-        "tcp: column '{name}' is {type_name}, which does not read as {expected}"
+        "native: column '{name}' is {type_name}, which does not read as {expected}"
     ))
 }
 
+/// A `JSON`, `Variant` or `Dynamic` column reads as its per-row document text.
 impl FromColumn for String {
     fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
         match column {
-            DecodedColumn::String(values) => values
+            DecodedColumn::String(values) | DecodedColumn::Json(values) => values
                 .iter()
                 .map(|v| Ok(std::str::from_utf8(v)?.to_owned()))
                 .collect(),
@@ -383,11 +407,11 @@ impl FromColumn for String {
     }
 }
 
-/// Raw `String` bytes -- ClickHouse does not guarantee UTF-8.
+/// Raw `String` bytes -- `ClickHouse` does not guarantee UTF-8.
 impl FromColumn for Vec<u8> {
     fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
         match column {
-            DecodedColumn::String(values) => Ok(values.clone()),
+            DecodedColumn::String(values) | DecodedColumn::Json(values) => Ok(values.clone()),
             _ => Err(wrong_type(name, type_name, "String")),
         }
     }
@@ -420,7 +444,7 @@ impl FromColumn for i64 {
     }
 }
 
-/// `Bool` is UInt8 on the wire; any non-zero byte is true.
+/// `Bool` is `UInt8` on the wire; any non-zero byte is true.
 impl FromColumn for bool {
     fn from_column(column: &DecodedColumn, name: &str, type_name: &str) -> Result<Vec<Self>> {
         match column {
@@ -459,6 +483,9 @@ impl FromColumn for Option<String> {
 /// `server_revision` decides whether the per-column custom-serialization
 /// flag byte is on the wire -- 25.x servers are always above the gate.
 ///
+/// A block at `num_rows == 0` declares its columns and carries no payload for
+/// any of them, the per-type serialization prefix included.
+///
 /// # Errors
 ///
 /// - [`Error::BadResponse`] if a column header is malformed (varuint
@@ -474,22 +501,30 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
     let has_custom_ser = server_revision
         >= crate::native::encode::DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION;
 
-    let mut schema = Vec::with_capacity(usize::try_from(num_columns).unwrap_or(0));
-    let mut columns = Vec::with_capacity(usize::try_from(num_columns).unwrap_or(0));
+    // Both counts are varuints the server chose; five bytes of header can ask
+    // for terabytes of column buffer, so they are capped before anything is
+    // sized from them.
+    if num_columns > MAX_BLOCK_COLUMNS {
+        return Err(refused("columns", num_columns, MAX_BLOCK_COLUMNS));
+    }
+    if num_rows > MAX_BLOCK_ROWS {
+        return Err(refused("rows", num_rows, MAX_BLOCK_ROWS));
+    }
+    let column_count = usize::try_from(num_columns).unwrap_or(0);
+
+    let mut schema = with_cap(column_count)?;
+    let mut columns = with_cap(column_count)?;
 
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
         let type_name = r.read_utf8_string().await?;
         if has_custom_ser {
-            // Custom-serialization flag byte (0 = normal serialisation).
-            // We always treat columns as normal-serialised; a non-zero
-            // flag from a future server build would silently misalign
-            // the body bytes. Surface a clean error rather than risk
-            // a wedged stream pointer.
+            // Only normal serialisation (0) is decoded; a sparse or otherwise
+            // custom-serialised column would misalign the body bytes.
             let flag = r.read_u8().await?;
             if flag != 0 {
                 return Err(Error::BadResponse(format!(
-                    "tcp: column '{name}' uses custom serialization flag {flag} \
+                    "native: column '{name}' uses custom serialization flag {flag} \
                      -- only normal (0) is supported"
                 )));
             }
@@ -498,13 +533,10 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         let col = match ColumnType::parse(&type_name) {
             Some(ct) => decode_column(r, &ct, num_rows, server_revision, 0).await?,
             None => {
-                // Unknown type -- we can't advance the stream pointer
-                // past it without knowing its size. Treat as a protocol
-                // disagreement and surface so the actor poisons the
-                // connection. Letting it slide would misalign every
-                // subsequent packet.
+                // The stream pointer cannot advance past a type of unknown
+                // size, so the connection is poisoned rather than desynced.
                 return Err(Error::BadResponse(format!(
-                    "tcp: server announced unknown column type '{type_name}' for column '{name}'"
+                    "native: server announced unknown column type '{type_name}' for column '{name}'"
                 )));
             }
         };
@@ -520,13 +552,125 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
     })
 }
 
+/// The zero-row shape of `col_type`, for a block that carries no column bytes.
+fn empty_column(col_type: &ColumnType) -> DecodedColumn {
+    match col_type {
+        ColumnType::UInt8 | ColumnType::Enum8 => DecodedColumn::UInt8(Vec::new()),
+        ColumnType::Int8 => DecodedColumn::Int8(Vec::new()),
+        ColumnType::UInt16 | ColumnType::Enum16 => DecodedColumn::UInt16(Vec::new()),
+        ColumnType::Int16 => DecodedColumn::Int16(Vec::new()),
+        ColumnType::UInt32 => DecodedColumn::UInt32(Vec::new()),
+        ColumnType::Int32 => DecodedColumn::Int32(Vec::new()),
+        ColumnType::UInt64 => DecodedColumn::UInt64(Vec::new()),
+        ColumnType::Int64 => DecodedColumn::Int64(Vec::new()),
+        ColumnType::Int128 => DecodedColumn::Int128(Vec::new()),
+        ColumnType::UInt128 => DecodedColumn::UInt128(Vec::new()),
+        ColumnType::Int256 => DecodedColumn::Int256(Vec::new()),
+        ColumnType::UInt256 => DecodedColumn::UInt256(Vec::new()),
+        ColumnType::Float32 => DecodedColumn::Float32(Vec::new()),
+        ColumnType::Float64 => DecodedColumn::Float64(Vec::new()),
+        ColumnType::Decimal32 { precision, scale } => DecodedColumn::Decimal32 {
+            precision: *precision,
+            scale: *scale,
+            values: Vec::new(),
+        },
+        ColumnType::Decimal64 { precision, scale } => DecodedColumn::Decimal64 {
+            precision: *precision,
+            scale: *scale,
+            values: Vec::new(),
+        },
+        ColumnType::Decimal128 { precision, scale } => DecodedColumn::Decimal128 {
+            precision: *precision,
+            scale: *scale,
+            values: Vec::new(),
+        },
+        ColumnType::Decimal256 { precision, scale } => DecodedColumn::Decimal256 {
+            precision: *precision,
+            scale: *scale,
+            values: Vec::new(),
+        },
+        ColumnType::String => DecodedColumn::String(Vec::new()),
+        ColumnType::Json | ColumnType::NewJson | ColumnType::Variant(_) | ColumnType::Dynamic => {
+            DecodedColumn::Json(Vec::new())
+        }
+        ColumnType::FixedString(width) => DecodedColumn::FixedString {
+            width: *width,
+            bytes: Vec::new(),
+        },
+        ColumnType::Date => DecodedColumn::Date(Vec::new()),
+        ColumnType::Date32 => DecodedColumn::Date32(Vec::new()),
+        ColumnType::DateTime => DecodedColumn::DateTime(Vec::new()),
+        ColumnType::DateTime64 {
+            precision,
+            timezone,
+        } => DecodedColumn::DateTime64 {
+            precision: *precision,
+            timezone: timezone.clone(),
+            values: Vec::new(),
+        },
+        ColumnType::Uuid => DecodedColumn::Uuid(Vec::new()),
+        ColumnType::IPv4 => DecodedColumn::Ipv4(Vec::new()),
+        ColumnType::IPv6 => DecodedColumn::Ipv6(Vec::new()),
+        ColumnType::Nullable(inner) => DecodedColumn::Nullable {
+            mask: Vec::new(),
+            child: Box::new(empty_column(inner)),
+        },
+        ColumnType::Array(inner) => DecodedColumn::Array {
+            offsets: Vec::new(),
+            child: Box::new(empty_column(inner)),
+        },
+        ColumnType::Map(key_type, val_type) => DecodedColumn::Map {
+            offsets: Vec::new(),
+            keys: Box::new(empty_column(key_type)),
+            values: Box::new(empty_column(val_type)),
+        },
+        ColumnType::Tuple(fields) => {
+            DecodedColumn::Tuple(fields.iter().map(empty_column).collect())
+        }
+        ColumnType::LowCardinality(inner) => {
+            // The dictionary on the wire is the inner type with `Nullable`
+            // stripped; slot 0 is then the null sentinel.
+            let dict_type = match inner.as_ref() {
+                ColumnType::Nullable(t) => t.as_ref(),
+                other => other,
+            };
+            DecodedColumn::LowCardinality {
+                dict: Box::new(empty_column(dict_type)),
+                indices: Box::new(DecodedColumn::UInt8(Vec::new())),
+                is_nullable_inner: matches!(inner.as_ref(), ColumnType::Nullable(_)),
+            }
+        }
+        ColumnType::SimpleAggregateFunction(inner) => empty_column(inner),
+        other => DecodedColumn::Unsupported(format!("{other:?}")),
+    }
+}
+
+/// Strip the `RowBinary` length prefix from cells the column reader emits as
+/// length-prefixed strings, leaving the JSON document bytes.
+fn unwrap_json_cells(cells: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+    cells
+        .into_iter()
+        .map(|cell| {
+            let (len, header) = crate::native::io::get_var_uint(&cell)?;
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| header.checked_add(len))
+                .filter(|end| *end <= cell.len())
+                .ok_or_else(|| {
+                    Error::BadResponse("native: JSON cell length runs past the cell".into())
+                })?;
+            Ok(cell[header..end].to_vec())
+        })
+        .collect()
+}
+
 /// Decode one column's values into a [`DecodedColumn`].
 ///
-/// Recursive over composite types; the recursive call sites use
-/// [`Box::pin`] to break the async-fn-cycle Rust would otherwise
-/// reject for infinite future size (the same pattern
-/// [`crate::native::columns::read_column`] uses). `depth` bounds that
-/// recursion at [`MAX_DECODE_DEPTH`] against hostile deep nesting.
+/// `depth` bounds the recursion at [`MAX_DECODE_DEPTH`]; the boxed future
+/// breaks the async-fn cycle Rust rejects for infinite future size.
+// One exhaustive arm per `ColumnType`: splitting it would scatter the wire
+// dispatch across functions with no shared reader state.
+#[allow(clippy::too_many_lines)]
 fn decode_column<'a, R: ClickHouseRead + 'a>(
     r: &'a mut R,
     col_type: &'a ColumnType,
@@ -537,26 +681,35 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
     Box::pin(async move {
         if depth > MAX_DECODE_DEPTH {
             return Err(Error::BadResponse(format!(
-                "tcp: column type nesting exceeds {MAX_DECODE_DEPTH} levels"
+                "native: column type nesting exceeds {MAX_DECODE_DEPTH} levels"
             )));
+        }
+        // `NativeWriter` writes a top-level column's payload only when the
+        // block has rows, the serialization prefix included; a nested
+        // sub-column at zero elements still carries its prefix.
+        if depth == 0 && num_rows == 0 {
+            return Ok(empty_column(col_type));
         }
 
         let n = usize::try_from(num_rows).map_err(|_| {
-            Error::BadResponse(format!("tcp: row count {num_rows} exceeds platform usize"))
+            Error::BadResponse(format!(
+                "native: row count {num_rows} exceeds platform usize"
+            ))
         })?;
 
         match col_type {
             ColumnType::UInt8 | ColumnType::Enum8 => {
-                let mut buf = vec![0u8; n];
-                r.read_exact(&mut buf).await?;
+                let buf = read_exact_grown(r, n).await?;
                 Ok(DecodedColumn::UInt8(buf))
             }
             ColumnType::Int8 => {
-                let mut raw = vec![0u8; n];
-                r.read_exact(&mut raw).await?;
+                let raw = read_exact_grown(r, n).await?;
                 // Reinterpret as i8 without an extra copy: i8 and u8
                 // have identical layout, the cast is lossless and the
                 // Vec capacity matches.
+                // An `Int8` column is two's-complement on the wire, so wrapping
+                // the top bit into the sign is the decode, not a defect.
+                #[allow(clippy::cast_possible_wrap)]
                 let buf: Vec<i8> = raw.into_iter().map(|b| b as i8).collect();
                 Ok(DecodedColumn::Int8(buf))
             }
@@ -582,11 +735,8 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
             ColumnType::Float64 => Ok(DecodedColumn::Float64(
                 read_le_column::<_, f64>(r, n).await?,
             )),
-            // Decimal(P, S) wire format is its backing little-endian
-            // integer (32/64/128/256-bit by precision); P + S are carried
-            // on the parsed ColumnType (lifted from the type name), not the
-            // wire bytes -- surface them so callers recover the rational
-            // value as `backing / 10^scale` without re-parsing the schema.
+            // Precision and scale come from the type name, not the wire, and
+            // are surfaced so callers read `backing / 10^scale` directly.
             ColumnType::Decimal32 { precision, scale } => Ok(DecodedColumn::Decimal32 {
                 precision: *precision,
                 scale: *scale,
@@ -607,20 +757,28 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 scale: *scale,
                 values: read_u256_column(r, n).await?,
             }),
-            ColumnType::String | ColumnType::Json => {
-                let mut buf = Vec::with_capacity(n);
+            ColumnType::String => {
+                let mut buf = with_cap(n)?;
                 for _ in 0..n {
                     // read_string applies the MAX_STRING_SIZE cap.
                     buf.push(r.read_string().await?);
                 }
                 Ok(DecodedColumn::String(buf))
             }
+            // Legacy Object('json') is a plain String on the wire carrying one
+            // document per row.
+            ColumnType::Json => {
+                let mut buf = with_cap(n)?;
+                for _ in 0..n {
+                    buf.push(r.read_string().await?);
+                }
+                Ok(DecodedColumn::Json(buf))
+            }
             ColumnType::FixedString(width) => {
-                let total = width
-                    .checked_mul(n)
-                    .ok_or_else(|| Error::BadResponse("tcp: FixedString block overflow".into()))?;
-                let mut bytes = vec![0u8; total];
-                r.read_exact(&mut bytes).await?;
+                let total = width.checked_mul(n).ok_or_else(|| {
+                    Error::BadResponse("native: FixedString block overflow".into())
+                })?;
+                let bytes = read_exact_grown(r, total).await?;
                 Ok(DecodedColumn::FixedString {
                     width: *width,
                     bytes,
@@ -635,11 +793,8 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 precision,
                 timezone,
             } => {
-                // Wire format is identical to Int64 (raw ticks at the
-                // configured precision). Precision + timezone ride on the
-                // parsed ColumnType (lifted from the type name), not the
-                // payload bytes -- surface both so callers can format
-                // ticks without re-parsing the schema string.
+                // Int64 ticks on the wire; precision and timezone come from
+                // the type name and are surfaced for formatting.
                 Ok(DecodedColumn::DateTime64 {
                     precision: *precision,
                     timezone: timezone.clone(),
@@ -647,7 +802,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 })
             }
             ColumnType::Uuid => {
-                let mut buf = Vec::with_capacity(n);
+                let mut buf = with_cap(n)?;
                 for _ in 0..n {
                     let mut slot = [0u8; 16];
                     r.read_exact(&mut slot).await?;
@@ -657,7 +812,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
             }
             ColumnType::IPv4 => Ok(DecodedColumn::Ipv4(read_le_column::<_, u32>(r, n).await?)),
             ColumnType::IPv6 => {
-                let mut buf = Vec::with_capacity(n);
+                let mut buf = with_cap(n)?;
                 for _ in 0..n {
                     let mut slot = [0u8; 16];
                     r.read_exact(&mut slot).await?;
@@ -666,8 +821,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 Ok(DecodedColumn::Ipv6(buf))
             }
             ColumnType::Nullable(inner) => {
-                let mut mask = vec![0u8; n];
-                r.read_exact(&mut mask).await?;
+                let mask = read_exact_grown(r, n).await?;
                 let child = decode_column(r, inner, num_rows, server_revision, depth + 1).await?;
                 Ok(DecodedColumn::Nullable {
                     mask,
@@ -675,13 +829,13 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 })
             }
             ColumnType::Array(inner) => {
-                let mut offsets = Vec::with_capacity(n);
+                let mut offsets = with_cap(n)?;
                 let mut prev: u64 = 0;
                 for _ in 0..n {
                     let end = r.read_u64_le().await?;
                     if end < prev {
                         return Err(Error::BadResponse(
-                            "tcp: Array column offsets are not monotonically increasing".into(),
+                            "native: Array column offsets are not monotonically increasing".into(),
                         ));
                     }
                     prev = end;
@@ -695,7 +849,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 })
             }
             ColumnType::Tuple(fields) => {
-                let mut decoded_fields = Vec::with_capacity(fields.len());
+                let mut decoded_fields = with_cap(fields.len())?;
                 for field in fields {
                     decoded_fields
                         .push(decode_column(r, field, num_rows, server_revision, depth + 1).await?);
@@ -703,13 +857,13 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 Ok(DecodedColumn::Tuple(decoded_fields))
             }
             ColumnType::Map(key_type, val_type) => {
-                let mut offsets = Vec::with_capacity(n);
+                let mut offsets = with_cap(n)?;
                 let mut prev: u64 = 0;
                 for _ in 0..n {
                     let end = r.read_u64_le().await?;
                     if end < prev {
                         return Err(Error::BadResponse(
-                            "tcp: Map column offsets are not monotonically increasing".into(),
+                            "native: Map column offsets are not monotonically increasing".into(),
                         ));
                     }
                     prev = end;
@@ -732,29 +886,27 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 decode_column(r, inner, num_rows, server_revision, depth + 1).await
             }
             ColumnType::NewJson => {
-                // A zero-row block carries no bytes for the column at all,
-                // the serialization version included.
-                if n == 0 {
-                    return Ok(DecodedColumn::String(Vec::new()));
-                }
                 let version = r.read_u64_le().await?;
-                if version != columns::JSON_SERIALIZATION_STRING {
-                    // The path-based serialisations are consumed, not materialised.
-                    let _consumed = columns::read_json_body(r, n, version).await?;
-                    return Ok(DecodedColumn::Unsupported("NewJson".to_string()));
+                if version == columns::JSON_SERIALIZATION_STRING {
+                    let mut buf = with_cap(n)?;
+                    for _ in 0..n {
+                        buf.push(r.read_string().await?);
+                    }
+                    return Ok(DecodedColumn::Json(buf));
                 }
-                let mut buf = Vec::with_capacity(n);
-                for _ in 0..n {
-                    buf.push(r.read_string().await?);
-                }
-                Ok(DecodedColumn::String(buf))
+                // The path-based serialisations reassemble into one JSON
+                // document per row, length-prefixed as RowBinary strings.
+                let cells = columns::read_json_body(r, n, version).await?;
+                Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
-            // Everything else falls back to the `read_column`
-            // path so the wire bytes are consumed (the stream pointer
-            // stays aligned), but the rows aren't materialised into a
-            // typed `DecodedColumn` variant yet. Accessing rows on the
-            // resulting `Unsupported` variant surfaces an error rather
-            // than silently returning a placeholder.
+            ColumnType::Variant(_) | ColumnType::Dynamic => {
+                let cells = columns::read_column(r, col_type, num_rows).await?;
+                Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
+            }
+            // BFloat16, Time, Time64 and Point have no typed variant yet; the
+            // wire bytes are still consumed so the stream pointer stays
+            // aligned, and per-row access on `Unsupported` errors instead of
+            // returning a placeholder.
             other => {
                 let _consumed = columns::read_column(r, other, num_rows).await?;
                 Ok(DecodedColumn::Unsupported(format!("{other:?}")))
@@ -763,9 +915,8 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
     })
 }
 
-/// LowCardinality column wire shape -- per-block dictionary + indices.
-/// Mirrors the encoder layout (which itself matches what the
-/// server emits) byte-for-byte.
+/// `LowCardinality` column wire shape -- per-block dictionary + indices,
+/// byte-for-byte what the encoder writes and the server emits.
 ///
 /// ```text
 /// u64    version (== 1)
@@ -784,7 +935,9 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
     depth: usize,
 ) -> Result<DecodedColumn> {
     let n = usize::try_from(num_rows).map_err(|_| {
-        Error::BadResponse(format!("tcp: row count {num_rows} exceeds platform usize"))
+        Error::BadResponse(format!(
+            "native: row count {num_rows} exceeds platform usize"
+        ))
     })?;
 
     let _version = r.read_u64_le().await?;
@@ -792,12 +945,9 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
     let index_type = (flags & 0x03) as u8;
     let has_global_dict = (flags & 0x100) != 0;
     let has_additional_keys = (flags & 0x200) != 0;
-    // Bit 10 (0x400, NeedUpdateDictionary) signals that the client
-    // should discard any dictionary cached across blocks. This decoder
-    // materialises the dictionary per block (it keeps no cross-block
-    // state), so the bit is a no-op here and is intentionally not
-    // consulted. A future cross-block dictionary-reuse optimisation
-    // would have to honour it.
+    // Bit 10 (0x400, NeedUpdateDictionary) tells the client to discard a
+    // dictionary cached across blocks; this decoder caches none, so it is
+    // deliberately not consulted.
 
     let (dict_type, is_nullable_inner) = if let ColumnType::Nullable(t) = inner {
         (t.as_ref(), true)
@@ -805,25 +955,19 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
         (inner, false)
     };
 
-    // Client-server Native LowCardinality payloads carry per-block
-    // additional keys only: the server sets HAS_ADDITIONAL_KEYS and does
-    // NOT send a shared global dictionary (global dicts are an internal
-    // merge-tree concern). cpp-client and clickhouse-go both reject a
-    // global dictionary here and require the additional-keys bit; the
+    // cpp-client and clickhouse-go both reject a global dictionary on the
+    // client-server path and require the additional-keys bit; the
     // `crate::native::columns` reader applies the same rule.
-    // Accept only the additional-keys shape and fail loud on anything
-    // else (a global dict, or neither flag), rather than mis-decode a
-    // payload no current server emits.
     if has_global_dict {
         return Err(Error::BadResponse(
-            "tcp: LowCardinality global dictionary is not supported on the client-server \
+            "native: LowCardinality global dictionary is not supported on the client-server \
              path (only per-block additional keys)"
                 .into(),
         ));
     }
     if !has_additional_keys {
         return Err(Error::BadResponse(
-            "tcp: LowCardinality block set neither the additional-keys nor the \
+            "native: LowCardinality block set neither the additional-keys nor the \
              global-dictionary flag"
                 .into(),
         ));
@@ -835,14 +979,13 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
     let num_indices = r.read_u64_le().await?;
     if num_indices != num_rows {
         return Err(Error::BadResponse(format!(
-            "tcp: LowCardinality index count {num_indices} != row count {num_rows}"
+            "native: LowCardinality index count {num_indices} != row count {num_rows}"
         )));
     }
 
     let indices = match index_type {
         0 => {
-            let mut buf = vec![0u8; n];
-            r.read_exact(&mut buf).await?;
+            let buf = read_exact_grown(r, n).await?;
             DecodedColumn::UInt8(buf)
         }
         1 => DecodedColumn::UInt16(read_le_column::<_, u16>(r, n).await?),
@@ -850,7 +993,7 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
         3 => DecodedColumn::UInt64(read_le_column::<_, u64>(r, n).await?),
         other => {
             return Err(Error::BadResponse(format!(
-                "tcp: LowCardinality index type {other} is not valid (expected 0..=3)"
+                "native: LowCardinality index type {other} is not valid (expected 0..=3)"
             )));
         }
     };
@@ -870,24 +1013,15 @@ mod tests {
     use crate::native::io::{ClickHouseBytesWrite, ClickHouseWrite};
     use std::io::Cursor;
 
-    // Inlined to keep these decoder tests buildable in default (no-`tcp`)
-    // feature builds. Mirrors `crate::tcp::protocol::DBMS_TCP_PROTOCOL_VERSION`
-    // (= DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS); the decode path here is
-    // revision-insensitive for the cases exercised, so the exact value is
-    // not load-bearing -- it only stands in for "a current TCP revision".
+    // A current TCP revision, above the custom-serialization gate. Inlined so
+    // these tests build without the `tcp` feature.
     const REV: u64 = 54459;
 
-    /// Encode a single-column block via `encode_columns`,
-    /// wrap it as a Native block body (num_columns + num_rows +
-    /// payload), and return the bytes ready to feed into `decode_block`.
-    async fn encode_one_column_block(name: &str, type_name: &str, rows: &[Vec<u8>]) -> Vec<u8> {
+    /// Encode a single-column block body: the column-payload bytes alone, since
+    /// `decode_block` takes the `(num_columns, num_rows)` pair as parameters.
+    fn encode_one_column_block(name: &str, type_name: &str, rows: &[Vec<u8>]) -> Vec<u8> {
         let schema = ColumnSchema::from_headers(&[(name.to_string(), type_name.to_string())])
             .expect("schema parses");
-        // The block-body layout the actor's reader sees AFTER the
-        // Data packet header has been consumed is just the column-
-        // payload bytes; the (num_columns, num_rows) varuint pair
-        // lives in the header and decode_block takes those as
-        // parameters.
         encode_columns(rows, &schema, REV).expect("encode succeeds")
     }
 
@@ -899,7 +1033,7 @@ mod tests {
     #[tokio::test]
     async fn roundtrip_uint64() {
         let rows: Vec<Vec<u8>> = (0u64..5).map(|v| v.to_le_bytes().to_vec()).collect();
-        let bytes = encode_one_column_block("n", "UInt64", &rows).await;
+        let bytes = encode_one_column_block("n", "UInt64", &rows);
         let block = decode_via_cursor(bytes, 5).await;
         match &block.columns[0] {
             DecodedColumn::UInt64(values) => assert_eq!(values, &vec![0u64, 1, 2, 3, 4]),
@@ -947,7 +1081,7 @@ mod tests {
             .iter()
             .map(|v| v.to_le_bytes().to_vec())
             .collect();
-        let bytes = encode_one_column_block("v", "Int32", &rows).await;
+        let bytes = encode_one_column_block("v", "Int32", &rows);
         let block = decode_via_cursor(bytes, 5).await;
         match &block.columns[0] {
             DecodedColumn::Int32(values) => assert_eq!(values, &vec![-3i32, -1, 0, 7, 99]),
@@ -977,7 +1111,7 @@ mod tests {
                 v
             })
             .collect();
-        let bytes = encode_one_column_block("s", "String", &rows).await;
+        let bytes = encode_one_column_block("s", "String", &rows);
         let block = decode_via_cursor(bytes, strings.len() as u64).await;
         match &block.columns[0] {
             DecodedColumn::String(values) => {
@@ -995,7 +1129,7 @@ mod tests {
     async fn roundtrip_fixed_string() {
         let raw = b"abcdefghij"; // 10 bytes, two rows of width 5
         let rows: Vec<Vec<u8>> = raw.chunks(5).map(<[u8]>::to_vec).collect();
-        let bytes = encode_one_column_block("f", "FixedString(5)", &rows).await;
+        let bytes = encode_one_column_block("f", "FixedString(5)", &rows);
         let block = decode_via_cursor(bytes, 2).await;
         match &block.columns[0] {
             DecodedColumn::FixedString { width, bytes } => {
@@ -1008,17 +1142,14 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_nullable_uint8() {
-        // RowBinary Nullable: flag byte (0=value, 1=null) + value ONLY when
-        // not null. A null row is the flag byte alone -- no value follows
-        // (the encoder's trailing-byte guard rejects a spurious value
-        // byte after a null flag). The decoder still zero-fills the null
-        // slot, so the child column reads back [42, 0, 7].
+        // RowBinary Nullable is a flag byte, and a value only when not null;
+        // the encoder zero-fills the null slot, so the child reads [42, 0, 7].
         let rows: Vec<Vec<u8>> = vec![
             vec![0, 42], // value 42
             vec![1],     // null (flag only, canonical RowBinary)
             vec![0, 7],  // value 7
         ];
-        let bytes = encode_one_column_block("n", "Nullable(UInt8)", &rows).await;
+        let bytes = encode_one_column_block("n", "Nullable(UInt8)", &rows);
         let block = decode_via_cursor(bytes, 3).await;
         match &block.columns[0] {
             DecodedColumn::Nullable { mask, child } => {
@@ -1060,7 +1191,7 @@ mod tests {
                 v
             })
             .collect();
-        let bytes = encode_one_column_block("a", "Array(UInt64)", &rows).await;
+        let bytes = encode_one_column_block("a", "Array(UInt64)", &rows);
         let block = decode_via_cursor(bytes, 3).await;
         match &block.columns[0] {
             DecodedColumn::Array { offsets, child } => {
@@ -1099,7 +1230,7 @@ mod tests {
                 v
             })
             .collect();
-        let bytes = encode_one_column_block("lc", "LowCardinality(String)", &rows).await;
+        let bytes = encode_one_column_block("lc", "LowCardinality(String)", &rows);
         let block = decode_via_cursor(bytes, 5).await;
         match &block.columns[0] {
             DecodedColumn::LowCardinality {
@@ -1130,15 +1261,14 @@ mod tests {
     }
 
     fn lc_to_strings(dict: &DecodedColumn, indices: &DecodedColumn) -> Vec<String> {
-        let dict_strings = match dict {
-            DecodedColumn::String(s) => s,
-            _ => panic!("dict must be String"),
+        let DecodedColumn::String(dict_strings) = dict else {
+            panic!("dict must be String")
         };
         let idxs: Vec<usize> = match indices {
-            DecodedColumn::UInt8(v) => v.iter().map(|&x| x as usize).collect(),
-            DecodedColumn::UInt16(v) => v.iter().map(|&x| x as usize).collect(),
+            DecodedColumn::UInt8(v) => v.iter().map(|&x| usize::from(x)).collect(),
+            DecodedColumn::UInt16(v) => v.iter().map(|&x| usize::from(x)).collect(),
             DecodedColumn::UInt32(v) => v.iter().map(|&x| x as usize).collect(),
-            DecodedColumn::UInt64(v) => v.iter().map(|&x| x as usize).collect(),
+            DecodedColumn::UInt64(v) => v.iter().map(|&x| usize::try_from(x).unwrap()).collect(),
             _ => panic!("indices must be unsigned int"),
         };
         idxs.into_iter()
@@ -1185,16 +1315,13 @@ mod tests {
     #[tokio::test]
     async fn row_count_matches_inner_buffers() {
         let rows: Vec<Vec<u8>> = (0u32..8).map(|v| v.to_le_bytes().to_vec()).collect();
-        let bytes = encode_one_column_block("v", "UInt32", &rows).await;
+        let bytes = encode_one_column_block("v", "UInt32", &rows);
         let block = decode_via_cursor(bytes, 8).await;
         assert_eq!(block.columns[0].row_count(), 8);
     }
 
     #[test]
     fn parse_column_type_via_columns_module() {
-        // Sanity-check the parser we're reusing: ColumnType::parse is
-        // visible from this module and recognises every type we list
-        // as v1-supported.
         for ty in [
             "UInt8",
             "UInt64",
@@ -1219,17 +1346,17 @@ mod tests {
 
     #[tokio::test]
     async fn decode_column_rejects_excessive_nesting() {
-        // Hand-build Array(Array(...Array(UInt8)...)) deeper than the
-        // cap, bypassing the parser (which caps separately). decode_column
-        // must reject it before recursing without bound. Zero rows means
-        // each Array level reads no offset bytes, so an empty reader is
-        // enough to drive the recursion to the depth guard.
+        // Array(Array(...Array(UInt8)...)) deeper than the cap, built past the
+        // parser, which caps separately. Entry is at depth 1 because the
+        // zero-row short circuit only applies to a top-level column; each Array
+        // level then reads no offset bytes, so an empty reader drives the
+        // recursion all the way to the depth guard.
         let mut ct = ColumnType::UInt8;
         for _ in 0..(MAX_DECODE_DEPTH + 5) {
             ct = ColumnType::Array(Box::new(ct));
         }
         let mut cur = Cursor::new(Vec::new());
-        let err = decode_column(&mut cur, &ct, 0, REV, 0).await.unwrap_err();
+        let err = decode_column(&mut cur, &ct, 0, REV, 1).await.unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("nesting"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
@@ -1390,23 +1517,23 @@ mod tests {
         let payload: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
         match decode_one_typed("Float64", vals.len() as u64, &payload).await {
             DecodedColumn::Float64(v) => {
+                // Bit patterns, not values: a `Float64` column must survive
+                // the wire byte for byte, and NaN never compares equal.
                 assert!(v[0].is_nan());
-                assert_eq!(v[1], f64::INFINITY);
-                assert_eq!(v[2], f64::NEG_INFINITY);
-                assert_eq!(v[3], 1.5);
+                assert_eq!(v[1].to_bits(), f64::INFINITY.to_bits());
+                assert_eq!(v[2].to_bits(), f64::NEG_INFINITY.to_bits());
+                assert_eq!(v[3].to_bits(), 1.5f64.to_bits());
             }
             other => panic!("expected Float64, got {other:?}"),
         }
     }
 
-    /// Hand-build a `LowCardinality(String)` column body with an
-    /// explicit index-size code (0=u8, 1=u16, 2=u32, 3=u64), so we can
-    /// exercise all four index widths without needing a dictionary
-    /// large enough to force the wider codes naturally. `dict` are the
-    /// additional-key strings; `idx` are the per-row dictionary
-    /// positions. Mirrors the wire shape `decode_low_cardinality` reads:
-    /// version, flags (HAS_ADDITIONAL_KEYS | code), additional-keys
-    /// count + strings, index count, then indices at the chosen width.
+    /// `LowCardinality(String)` column body at an explicit index-size code
+    /// (0=u8, 1=u16, 2=u32, 3=u64), so all four widths are reachable without a
+    /// dictionary big enough to force them.
+    // Narrowing IS the payload: an index is written at the width `index_code`
+    // declares, and a dict entry's length byte is the varuint prefix.
+    #[allow(clippy::cast_possible_truncation)]
     fn lc_string_payload(index_code: u8, dict: &[&str], idx: &[u64]) -> Vec<u8> {
         let mut p = Vec::new();
         p.extend_from_slice(&1u64.to_le_bytes()); // version
@@ -1436,11 +1563,8 @@ mod tests {
 
     #[tokio::test]
     async fn lowcardinality_decodes_all_index_widths() {
-        // The same logical column ["a","b","a","c"] encoded with each
-        // of the four index-size codes; the decoder must select the
-        // matching width and reconstruct identical row strings every
-        // time. Catches an index-width misread (a silent-misalignment
-        // edge -- a u16 column read as u8 desyncs the rest of the block).
+        // One logical column at all four index widths; a width misread desyncs
+        // the rest of the block rather than failing loudly.
         let dict = ["a", "b", "c"];
         let idx = [0u64, 1, 0, 2];
         for code in 0u8..=3 {
@@ -1471,10 +1595,8 @@ mod tests {
 
     #[tokio::test]
     async fn lowcardinality_nullable_index_zero_is_null() {
-        // LC(Nullable(String)) reserves dictionary slot 0 as the NULL
-        // sentinel; rows referencing index 0 are NULL. The decoder
-        // flags is_nullable_inner=true and leaves the null reading to
-        // the caller (index 0 == null).
+        // LC(Nullable(String)) reserves dictionary slot 0 as the NULL sentinel;
+        // the decoder flags it and leaves the null reading to the caller.
         let dict = ["", "x", "y"]; // slot 0 = null placeholder
         let idx = [0u64, 1, 0, 2];
         let payload = lc_string_payload(0, &dict, &idx);
@@ -1508,10 +1630,8 @@ mod tests {
 
     #[tokio::test]
     async fn roundtrip_nested_array_array_uint64() {
-        // Array(Array(UInt64)) over two rows: [[1,2],[3]] and [[4,5,6]].
-        // Outer offsets count inner arrays (cumulative); inner offsets
-        // count u64s (cumulative). Exercises the recursive Array path
-        // and the offset bookkeeping across two nesting levels.
+        // [[1,2],[3]] and [[4,5,6]]: outer offsets count inner arrays, inner
+        // offsets count u64s, both cumulative.
         let mut payload = Vec::new();
         for v in [2u64, 3] {
             payload.extend_from_slice(&v.to_le_bytes()); // outer offsets
@@ -1546,11 +1666,13 @@ mod tests {
         }
     }
 
+    // The single-byte key lengths ARE the varuint prefix -- every test key is
+    // one byte long.
+    #[allow(clippy::cast_possible_truncation)]
     #[tokio::test]
     async fn roundtrip_map_string_uint64() {
-        // Map(String, UInt64) over two rows: {"a":1,"b":2} and {"c":3}.
-        // Wire shape: row offsets (cumulative pair count), then the keys
-        // column, then the values column -- both flat over total pairs.
+        // {"a":1,"b":2} and {"c":3}: cumulative pair offsets, then a flat keys
+        // column, then a flat values column.
         let mut payload = Vec::new();
         for v in [2u64, 3] {
             payload.extend_from_slice(&v.to_le_bytes()); // offsets
@@ -1589,9 +1711,7 @@ mod tests {
 
     #[tokio::test]
     async fn nullable_all_null_uint8() {
-        // Native Nullable shape: n mask bytes (1 = null) then the child
-        // column. An all-null mask over a zero-filled child -- the
-        // companion to roundtrip_nullable_uint8's interleaved case.
+        // n mask bytes (1 = null) then the child column, all-null this time.
         let payload = vec![1u8, 1, 1, /* child */ 0, 0, 0];
         let col = decode_one_typed("Nullable(UInt8)", 3, &payload).await;
         match col {
@@ -1742,10 +1862,7 @@ mod tests {
 
     #[tokio::test]
     async fn fixed_string_preserves_nul_and_padding() {
-        // FixedString(4) is raw fixed-width bytes: embedded NULs and
-        // trailing zero-padding are data, never terminators. Row 0 is
-        // "a\0b\0" (embedded + trailing NUL), row 1 is "ab\0\0"
-        // (zero-padded short value). Both must survive byte-for-byte.
+        // Embedded NULs and trailing zero-padding are data, never terminators.
         let raw = [b'a', 0, b'b', 0, b'a', b'b', 0, 0];
         let col = decode_one_typed("FixedString(4)", 2, &raw).await;
         match col {
@@ -1755,5 +1872,225 @@ mod tests {
             }
             other => panic!("expected FixedString, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn lowcardinality_header_block_consumes_no_column_bytes() {
+        // A zero-row block carries no payload for the column, the
+        // LowCardinality version and flags words included.
+        let mut body: Vec<u8> = Vec::new();
+        body.put_string(b"lc");
+        body.put_string(b"LowCardinality(String)");
+        body.push(0); // custom-serialization flag
+        let len = body.len();
+        let mut cursor = Cursor::new(body);
+        let block = decode_block(&mut cursor, 1, 0, REV).await.unwrap();
+        assert_eq!(cursor.position(), len as u64, "read past the column header");
+        assert_eq!(block.columns[0].row_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn decode_block_rejects_an_implausible_row_count() {
+        let mut cursor = Cursor::new(Vec::new());
+        let err = decode_block(&mut cursor, 1, MAX_BLOCK_ROWS + 1, REV)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("rows, above the"), "{err}");
+        assert_eq!(cursor.position(), 0, "rejected before reading a byte");
+    }
+
+    #[tokio::test]
+    async fn decode_block_rejects_an_implausible_column_count() {
+        let mut cursor = Cursor::new(Vec::new());
+        let err = decode_block(&mut cursor, MAX_BLOCK_COLUMNS + 1, 1, REV)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("columns, above the"), "{err}");
+        assert_eq!(cursor.position(), 0, "rejected before reading a byte");
+    }
+
+    #[tokio::test]
+    async fn roundtrip_nullable_lowcardinality() {
+        // LC(Nullable(String)) over ["a", NULL, "a"]: the dictionary reserves
+        // slot 0 for NULL, so the two "a" rows share slot 1.
+        let payload = lc_string_payload(0, &["", "a"], &[1, 0, 1]);
+        match decode_one_typed("LowCardinality(Nullable(String))", 3, &payload).await {
+            DecodedColumn::LowCardinality {
+                dict,
+                indices,
+                is_nullable_inner,
+            } => {
+                assert!(is_nullable_inner);
+                match indices.as_ref() {
+                    DecodedColumn::UInt8(v) => assert_eq!(v, &vec![1u8, 0, 1]),
+                    other => panic!("expected UInt8 indices, got {other:?}"),
+                }
+                match dict.as_ref() {
+                    DecodedColumn::String(d) => assert_eq!(d.len(), 2),
+                    other => panic!("expected String dict, got {other:?}"),
+                }
+            }
+            other => panic!("expected LowCardinality, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_map_nullable_value() {
+        // One row: {"k": NULL}. The value sub-column is a full Nullable column,
+        // so it carries a mask byte and a placeholder value.
+        let mut payload = 1u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[1, b'k']); // keys
+        payload.extend_from_slice(&[1, 0]); // null mask, then the placeholder
+        match decode_one_typed("Map(String, Nullable(UInt8))", 1, &payload).await {
+            DecodedColumn::Map {
+                offsets, values, ..
+            } => {
+                assert_eq!(offsets, vec![1u64]);
+                match values.as_ref() {
+                    DecodedColumn::Nullable { mask, .. } => assert_eq!(mask, &vec![1u8]),
+                    other => panic!("expected Nullable values, got {other:?}"),
+                }
+            }
+            other => panic!("expected Map, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn roundtrip_array_of_tuple() {
+        // One row of two (UInt8, UInt16) pairs: the offsets, then the tuple's
+        // two field sub-columns flat over both elements.
+        let mut payload = 2u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[1, 2]); // the UInt8 field
+        payload.extend_from_slice(&[3, 0, 4, 0]); // the UInt16 field
+        match decode_one_typed("Array(Tuple(UInt8, UInt16))", 1, &payload).await {
+            DecodedColumn::Array { offsets, child } => {
+                assert_eq!(offsets, vec![2u64]);
+                match child.as_ref() {
+                    DecodedColumn::Tuple(fields) => {
+                        assert_eq!(fields.len(), 2);
+                        match (&fields[0], &fields[1]) {
+                            (DecodedColumn::UInt8(a), DecodedColumn::UInt16(b)) => {
+                                assert_eq!(a, &vec![1u8, 2]);
+                                assert_eq!(b, &vec![3u16, 4]);
+                            }
+                            other => panic!("expected (UInt8, UInt16), got {other:?}"),
+                        }
+                    }
+                    other => panic!("expected Tuple child, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn variant_and_dynamic_read_as_json_documents() {
+        // Variant(UInt8, String) over [7, "q"]: mode word, discriminators, then
+        // each arm's rows.
+        let mut payload = 0u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0, 1]);
+        payload.push(7);
+        payload.extend_from_slice(&[1, b'q']);
+        match decode_one_typed("Variant(UInt8, String)", 2, &payload).await {
+            DecodedColumn::Json(docs) => {
+                assert_eq!(docs, vec![b"7".to_vec(), br#""q""#.to_vec()]);
+            }
+            other => panic!("expected Json, got {other:?}"),
+        }
+    }
+
+    /// Upper bounds on what the property test may generate. A declared count is
+    /// server-controlled, so the generator stays inside what a real block can
+    /// carry: a test that allocates from an unbounded generated value is a
+    /// defect in the test, not a finding about the decoder.
+    const PROP_MAX_ROWS: u64 = 1_024;
+    const PROP_MAX_COLUMNS: u64 = 64;
+    const PROP_MAX_WIRE_BYTES: usize = 64 * 1_024;
+
+    /// A three-column block body covering a fixed width, a length-prefixed type
+    /// and a composite, so a truncation can land inside any of them.
+    fn valid_block_body() -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        body.put_string(b"n");
+        body.put_string(b"UInt64");
+        body.push(0);
+        body.extend_from_slice(&7u64.to_le_bytes());
+        body.put_string(b"s");
+        body.put_string(b"String");
+        body.push(0);
+        body.put_string(b"hello");
+        body.put_string(b"a");
+        body.put_string(b"Array(UInt8)");
+        body.push(0);
+        body.extend_from_slice(&2u64.to_le_bytes());
+        body.extend_from_slice(&[1, 2]);
+        body
+    }
+
+    /// Truncated and byte-flipped block bodies, at row and column counts drawn
+    /// from the generator. Every input must either decode or error; none may
+    /// panic, hang, or commit memory the wire never backs.
+    #[test]
+    fn decode_block_survives_truncation_and_garbage() {
+        use proptest::prelude::*;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+        let body = valid_block_body();
+
+        let mut runner = proptest::test_runner::TestRunner::default();
+        let strategy = (
+            0..=body.len(),
+            any::<u8>(),
+            0..body.len(),
+            1..=PROP_MAX_ROWS,
+            1..=PROP_MAX_COLUMNS,
+        );
+        runner
+            .run(&strategy, |(cut, noise, at, rows, columns)| {
+                let mut wire = body[..cut].to_vec();
+                // Flip one byte inside the surviving prefix so the case covers
+                // garbage as well as a clean truncation.
+                if at < wire.len() {
+                    wire[at] = noise;
+                }
+                let outcome = runtime.block_on(async {
+                    decode_block(&mut Cursor::new(wire), columns, rows, REV).await
+                });
+                if let Ok(block) = outcome {
+                    prop_assert_eq!(block.schema.len(), block.columns.len());
+                }
+                Ok(())
+            })
+            .expect("no input panics the decoder");
+    }
+
+    /// The same guarantee for a body that was never valid to begin with.
+    #[test]
+    fn decode_block_survives_arbitrary_bytes() {
+        use proptest::prelude::*;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("a current-thread runtime");
+
+        let mut runner = proptest::test_runner::TestRunner::default();
+        let strategy = (
+            proptest::collection::vec(any::<u8>(), 0..=PROP_MAX_WIRE_BYTES),
+            1..=PROP_MAX_ROWS,
+            1..=PROP_MAX_COLUMNS,
+        );
+        runner
+            .run(&strategy, |(wire, rows, columns)| {
+                let outcome = runtime.block_on(async {
+                    decode_block(&mut Cursor::new(wire), columns, rows, REV).await
+                });
+                if let Ok(block) = outcome {
+                    prop_assert_eq!(block.schema.len(), block.columns.len());
+                }
+                Ok(())
+            })
+            .expect("no input panics the decoder");
     }
 }

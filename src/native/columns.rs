@@ -1,140 +1,162 @@
-//! Native binary column type system and data reader.
+//! Native column type parser and reader.
 //!
-//! Reads ClickHouse native binary column data and re-serializes it as
-//! RowBinary so the existing `rowbinary::deserialize_row` machinery can consume it.
-//!
-//! RowBinary and native binary formats are identical for scalar types -- the
-//! only difference is layout (columnar vs row-oriented). Nullable is the only
-//! type that differs structurally.
+//! Reads native columnar data and re-serialises each cell as `RowBinary`, the
+//! shape `rowbinary::deserialize_row` consumes. The two formats agree byte for
+//! byte on scalars and differ only in layout; `Nullable` is the one type whose
+//! structure differs, and `Variant`, `Dynamic` and `JSON` are rendered as one
+//! JSON document per row.
 
 use tokio::io::AsyncReadExt;
 
-use crate::error::{Error, Result};
-use crate::native::io::ClickHouseRead;
+use std::fmt::Write as _;
 
-/// Supported ClickHouse column types for native transport.
+use crate::error::{Error, Result};
+use crate::native::io::{
+    ClickHouseBytesWrite, ClickHouseRead, VAR_UINT_MAX_BYTES, read_exact_grown, with_cap,
+};
+
+/// Supported `ClickHouse` column types for native transport.
 ///
-/// `#[non_exhaustive]` because ClickHouse adds new column types
-/// regularly (BFloat16, Variant, Dynamic, NewJson, etc. all
-/// already appear here). New variants are an additive forward-
-/// compatible change; without the attribute, every addition would
-/// be a breaking change for external code that exhaustively matches.
+/// `#[non_exhaustive]` so a new server type stays an additive change for code
+/// that matches on this enum.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ColumnType {
+    /// One raw byte per row.
     UInt8,
+    /// Two raw little-endian bytes per row.
     UInt16,
+    /// Four raw little-endian bytes per row.
     UInt32,
+    /// Eight raw little-endian bytes per row.
     UInt64,
+    /// One raw byte per row, read signed.
     Int8,
+    /// Two raw little-endian bytes per row, read signed.
     Int16,
+    /// Four raw little-endian bytes per row, read signed.
     Int32,
+    /// Eight raw little-endian bytes per row, read signed.
     Int64,
+    /// Sixteen raw little-endian bytes per row, read signed.
     Int128,
+    /// Sixteen raw little-endian bytes per row.
     UInt128,
+    /// Thirty-two raw little-endian bytes per row, read signed.
     Int256,
+    /// Thirty-two raw little-endian bytes per row.
     UInt256,
+    /// IEEE-754 binary32, four little-endian bytes per row.
     Float32,
+    /// IEEE-754 binary64, eight little-endian bytes per row.
     Float64,
-    /// BFloat16 -- 16-bit brain float, 2 bytes on wire.
+    /// Brain float, the top two bytes of an `f32` bit pattern.
     BFloat16,
-    /// Decimal32/64/128/256 -- wire format identical to Int32/64/128/256
-    /// (raw LE backing integer). `precision` (total significant digits)
-    /// and `scale` (fractional digits) are parsed from the type name, not
-    /// the wire; the rational value is `backing / 10^scale`. The variant
-    /// (32/64/128/256) still selects the backing-integer width.
+    /// A raw little-endian backing integer whose width the variant selects;
+    /// `precision` and `scale` come from the type name and give the value as
+    /// `backing / 10^scale`.
     Decimal32 {
+        /// Total significant digits.
         precision: u8,
+        /// Fractional digits.
         scale: u8,
     },
+    /// [`ColumnType::Decimal32`] over an `Int64` backing integer.
     Decimal64 {
+        /// Total significant digits.
         precision: u8,
+        /// Fractional digits.
         scale: u8,
     },
+    /// [`ColumnType::Decimal32`] over an `Int128` backing integer.
     Decimal128 {
+        /// Total significant digits.
         precision: u8,
+        /// Fractional digits.
         scale: u8,
     },
+    /// [`ColumnType::Decimal32`] over a 256-bit backing integer.
     Decimal256 {
+        /// Total significant digits.
         precision: u8,
+        /// Fractional digits.
         scale: u8,
     },
+    /// Varuint length then that many bytes, per row.
     String,
+    /// Exactly N raw bytes per row, with no length prefix.
     FixedString(usize),
+    /// Sixteen bytes: two little-endian `u64` halves, most significant first.
     Uuid,
-    /// IPv4 -- stored as 4-byte little-endian UInt32.
+    /// A four-byte little-endian `UInt32`.
     IPv4,
-    /// IPv6 -- stored as 16 bytes.
+    /// Sixteen bytes in network order.
     IPv6,
+    /// Unsigned days since the Unix epoch, two little-endian bytes.
     Date,
+    /// Signed days since the Unix epoch, four little-endian bytes.
     Date32,
+    /// Unsigned seconds since the Unix epoch, four little-endian bytes.
     DateTime,
-    /// `DateTime64(precision [, timezone])` -- Int64 ticks at the given
-    /// sub-second `precision` (0..=9). `timezone` is the optional IANA
-    /// name from the type args (e.g. `'UTC'`). Both are parsed from the
-    /// type name, not the wire.
+    /// `Int64` ticks at a sub-second `precision` of 0..=9, with an optional
+    /// IANA `timezone`; both come from the type name, not the wire.
     DateTime64 {
+        /// Sub-second digits, 0..=9.
         precision: u8,
+        /// IANA timezone name from the type arguments.
         timezone: Option<String>,
     },
-    /// Time -- stored as UInt32 (seconds since midnight).
+    /// Seconds since midnight, as a `UInt32`.
     Time,
-    /// Time64 -- stored as Int64 (ticks since midnight at given precision).
+    /// Ticks since midnight at the declared precision, as an `Int64`.
     Time64,
+    /// One null-flag byte per row, then a full-width value column.
     Nullable(Box<ColumnType>),
+    /// A per-block dictionary and per-row indices into it.
     LowCardinality(Box<ColumnType>),
-    /// Enum8/Enum16 -- wire-compatible with UInt8/UInt16 respectively.
+    /// Wire-compatible with `UInt8`.
     Enum8,
+    /// Wire-compatible with `UInt16`.
     Enum16,
-    /// SimpleAggregateFunction(func, T) -- wire-compatible with inner type T.
+    /// `SimpleAggregateFunction(func, T)`, wire-compatible with the inner `T`.
     SimpleAggregateFunction(Box<ColumnType>),
-    /// Array(T) -- n cumulative u64 offsets, then all values packed as T column.
+    /// `n` cumulative `u64` offsets, then all elements packed as a `T` column.
     Array(Box<ColumnType>),
-    /// Tuple(T1, T2, ...) -- each field stored as a separate columnar block.
+    /// Each field stored as its own columnar block, in field order.
     Tuple(Vec<ColumnType>),
-    /// Map(K, V) -- n cumulative u64 offsets, then K column, then V column.
+    /// `n` cumulative `u64` offsets, then the key column, then the value column.
     Map(Box<ColumnType>, Box<ColumnType>),
-    /// JSON (legacy Object('json')) -- wire format is a length-prefixed String.
+    /// Legacy `Object('json')`, a length-prefixed String on the wire.
     Json,
-    /// Point -- pair of Float64 (16 bytes), ClickHouse geo type.
+    /// A pair of `Float64` stored as two columns, x values then y values.
     Point,
-    /// Variant(T1, T2, ...) -- discriminated union (ClickHouse 24.x+).
-    /// Wire prefix: u64 version (=0).
-    /// Wire data: `u8[n]` discriminators (255=NULL, 0..k-1 = type index in definition order),
-    ///            then per-variant sub-columns in definition order.
+    /// Variant(T1, T2, ...) -- discriminated union; u64 version, then `u8[n]`
+    /// discriminators, then the sub-columns in definition order.
     Variant(Vec<ColumnType>),
-    /// New JSON type (ClickHouse 24.x+). Complex path-based columnar format.
-    /// Wire prefix: u64 JSON version (1=string, 2=object-v2, 3=object-v3).
-    /// Wire data (v2): per-path Dynamic v2 headers + discriminators + values + nxu64 shared data.
+    /// `JSON` -- u64 version (1 = one document string per row, 2 and 3 the
+    /// path-based object formats).
     NewJson,
-    /// Standalone Dynamic type (ClickHouse 24.x+).
-    /// Wire prefix: u64 version (1=deprecated, 2=intermediate, 3=flat).
-    /// Wire data: discriminators + per-type column data.
+    /// Standalone `Dynamic` -- u64 version (1 deprecated, 2 intermediate,
+    /// 3 flat), then discriminators and per-type column data.
     Dynamic,
 }
 
-/// Upper bound on type-name nesting depth accepted by
-/// [`ColumnType::parse`]. The parser recurses once per wrapper
-/// (`Array`, `Tuple`, `Map`, `Nullable`, `LowCardinality`, ...), so a
-/// hostile server sending a pathologically deep `type_name` (e.g.
-/// `Array(Array(...))` thousands deep) could otherwise overflow the
-/// stack before any value bytes are read. 32 is far above any real
-/// ClickHouse type; deeper inputs are rejected as unparseable.
+/// Upper bound on type-name nesting [`ColumnType::parse`] accepts. The parser
+/// recurses once per wrapper, and `type_name` is server-controlled and capped
+/// only at `MAX_STRING_SIZE`, so a deep name would otherwise blow the stack.
 const MAX_TYPE_PARSE_DEPTH: usize = 32;
 
 impl ColumnType {
-    /// Parse a ClickHouse type name into `ColumnType`.
+    /// Parse a `ClickHouse` type name into `ColumnType`.
     ///
-    /// Returns `None` for unsupported types, and for type names whose
-    /// parenthesis nesting exceeds [`MAX_TYPE_PARSE_DEPTH`] -- the
-    /// recursion-depth guard against hostile server input (the
-    /// `type_name` field is server-controlled and length-capped only
-    /// at `MAX_STRING_SIZE`).
+    /// `None` for an unsupported type, and for nesting past
+    /// [`MAX_TYPE_PARSE_DEPTH`].
+    // One arm per ClickHouse type name; splitting it would scatter the mapping.
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn parse(type_str: &str) -> Option<Self> {
         let type_str = type_str.trim();
 
-        // Bound recursion: max parenthesis depth is an upper bound on
-        // how deep `parse` will recurse (one level per type wrapper).
+        // Parenthesis depth is an upper bound on the recursion below.
         if max_paren_depth(type_str) > MAX_TYPE_PARSE_DEPTH {
             return None;
         }
@@ -293,8 +315,7 @@ impl ColumnType {
 
         match type_str {
             // Bool is an alias for UInt8 (true=1, false=0) on the wire.
-            "Bool" => Some(Self::UInt8),
-            "UInt8" => Some(Self::UInt8),
+            "Bool" | "UInt8" => Some(Self::UInt8),
             "UInt16" => Some(Self::UInt16),
             "UInt32" => Some(Self::UInt32),
             "UInt64" => Some(Self::UInt64),
@@ -369,16 +390,15 @@ impl ColumnType {
     }
 }
 
-// Strip "TypeName(" prefix and ")" suffix, returning the contents.
+/// Strip a `TypeName(` prefix and its `)` suffix, returning the contents.
+///
+/// Borrowing rather than building the prefix keeps `ColumnType::parse` free of
+/// the 13 `String` allocations per column per block it otherwise makes.
 fn strip_outer<'a>(s: &'a str, name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}(");
-    s.strip_prefix(prefix.as_str())?.strip_suffix(')')
+    s.strip_prefix(name)?.strip_prefix('(')?.strip_suffix(')')
 }
 
-/// Maximum parenthesis nesting depth in `s`. Used by
-/// [`ColumnType::parse`] as a cheap upper bound on its own recursion
-/// depth so a hostile, deeply-nested `type_name` is rejected before
-/// the recursive descent can overflow the stack.
+/// Maximum parenthesis nesting depth in `s`.
 fn max_paren_depth(s: &str) -> usize {
     let mut depth = 0usize;
     let mut max = 0usize;
@@ -435,23 +455,69 @@ fn find_first_comma_at_depth0(s: &str) -> Option<usize> {
     None
 }
 
-/// Per-row RowBinary bytes for a single column's values.
+/// Per-row `RowBinary` bytes for a single column's values.
 ///
 /// Each element is the RowBinary-encoded bytes for that row's field value.
 pub(crate) type ColumnData = Vec<Vec<u8>>;
 
+/// Upper bound on composite nesting the reader descends, matching
+/// [`MAX_TYPE_PARSE_DEPTH`]. Variant, Dynamic and JSON columns carry type names
+/// on the wire, so nesting is not bounded by the declared column type alone.
+const MAX_READ_DEPTH: usize = 32;
+
+/// Upper bound on the arms of a `Variant`; 255 is the server's own limit,
+/// because discriminator 255 is reserved for NULL.
+const MAX_VARIANT_TYPES: usize = 255;
+
+/// Upper bound on the concrete types a `Dynamic` or JSON path may declare. One
+/// slot below [`MAX_VARIANT_TYPES`] because `SharedVariant` is implicit.
+const MAX_WIRE_TYPES: usize = 254;
+
+/// Upper bound on the dynamic paths one JSON column may declare, comfortably
+/// above the server's `max_dynamic_paths`.
+const MAX_JSON_PATHS: usize = 1 << 16;
+
 /// Read all `num_rows` values for `col_type` from the native binary stream.
 ///
-/// Returns per-row RowBinary bytes ready for concatenation with other column data.
+/// Returns per-row `RowBinary` bytes ready for concatenation with other column
+/// data. `NativeWriter` emits no bytes at all for a top-level column of a
+/// zero-row block, the per-type serialization prefix included; a nested
+/// sub-column at zero elements still carries its prefix.
 ///
-/// Uses `Box::pin` internally for the recursive async cases (Nullable, LowCardinality).
+/// # Errors
+///
+/// [`Error::BadResponse`] for a malformed header, an offset list that steps
+/// backwards, or a wire count above its cap; I/O errors propagate untouched.
 pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
     reader: &'a mut R,
     col_type: &'a ColumnType,
     num_rows: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ColumnData>> + Send + 'a>> {
+    read_column_at(reader, col_type, num_rows, 0)
+}
+
+/// `depth` bounds the recursion; the boxed future breaks the async-fn cycle
+/// Rust would otherwise reject for infinite future size.
+fn read_column_at<'a, R: ClickHouseRead + 'a>(
+    reader: &'a mut R,
+    col_type: &'a ColumnType,
+    num_rows: u64,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ColumnData>> + Send + 'a>> {
     Box::pin(async move {
-        let n = num_rows as usize;
+        if depth > MAX_READ_DEPTH {
+            return Err(Error::BadResponse(format!(
+                "native protocol: column type nesting exceeds {MAX_READ_DEPTH} levels"
+            )));
+        }
+        if depth == 0 && num_rows == 0 {
+            return Ok(ColumnData::new());
+        }
+        let n = usize::try_from(num_rows).map_err(|_| {
+            Error::BadResponse(format!(
+                "native protocol: row count {num_rows} exceeds platform usize"
+            ))
+        })?;
 
         match col_type {
             ColumnType::UInt8
@@ -484,13 +550,16 @@ pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
             | ColumnType::Int256
             | ColumnType::UInt256
             | ColumnType::Decimal256 { .. } => {
-                let size = col_type.fixed_size().expect("size is known for fixed type");
+                let size = col_type.fixed_size().ok_or_else(|| {
+                    Error::BadResponse(format!(
+                        "native protocol: {col_type:?} has no fixed wire width"
+                    ))
+                })?;
                 read_fixed_column(reader, n, size).await
             }
 
-            // Point = Tuple(Float64, Float64) in the native columnar format:
-            // all N x-values come first, then all N y-values.
-            // Transpose here so each row becomes the 16 raw bytes [f64(x) || f64(y)].
+            // Point is Tuple(Float64, Float64) on the wire: all N x-values then
+            // all N y-values, transposed here into 16 raw bytes per row.
             ColumnType::Point => {
                 let x_col = read_fixed_column(reader, n, 8).await?;
                 let y_col = read_fixed_column(reader, n, 8).await?;
@@ -505,24 +574,26 @@ pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
             }
 
             ColumnType::String | ColumnType::Json => read_string_column(reader, n).await,
-            ColumnType::FixedString(size) => read_fixed_string_column(reader, n, *size).await,
-            ColumnType::Nullable(inner) => read_nullable_column(reader, n, inner).await,
+            // RowBinary carries FixedString(N) as N raw bytes, no length prefix
+            // (upstream `rowbinary/de.rs` reads it as `[u8; N]`).
+            ColumnType::FixedString(size) => read_fixed_column(reader, n, *size).await,
+            ColumnType::Nullable(inner) => read_nullable_column(reader, n, inner, depth).await,
             ColumnType::LowCardinality(inner) => {
-                read_low_cardinality_column(reader, n, inner).await
+                read_low_cardinality_column(reader, n, inner, depth).await
             }
             ColumnType::SimpleAggregateFunction(inner) => {
-                read_column(reader, inner, num_rows).await
+                read_column_at(reader, inner, num_rows, depth + 1).await
             }
-            ColumnType::Array(inner) => read_array_column(reader, n, inner).await,
-            ColumnType::Tuple(fields) => read_tuple_column(reader, n, fields).await,
+            ColumnType::Array(inner) => read_array_column(reader, n, inner, depth).await,
+            ColumnType::Tuple(fields) => read_tuple_column(reader, n, fields, depth).await,
             ColumnType::Map(key_type, val_type) => {
-                read_map_column(reader, n, key_type, val_type).await
+                read_map_column(reader, n, key_type, val_type, depth).await
             }
             ColumnType::Variant(variant_types) => {
-                read_variant_column(reader, n, variant_types).await
+                read_variant_column(reader, n, variant_types, depth).await
             }
-            ColumnType::NewJson => read_json_column(reader, n).await,
-            ColumnType::Dynamic => read_dynamic_column(reader, n).await,
+            ColumnType::NewJson => read_json_column(reader, n, depth).await,
+            ColumnType::Dynamic => read_dynamic_column(reader, n, depth).await,
         }
     })
 }
@@ -532,60 +603,42 @@ async fn read_fixed_column<R: ClickHouseRead>(
     n: usize,
     size: usize,
 ) -> Result<ColumnData> {
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for _ in 0..n {
-        let mut buf = vec![0u8; size];
-        reader.read_exact(&mut buf).await?;
-        result.push(buf);
-    }
-    Ok(result)
-}
-
-async fn read_fixed_string_column<R: ClickHouseRead>(
-    reader: &mut R,
-    n: usize,
-    size: usize,
-) -> Result<ColumnData> {
-    let mut result = Vec::with_capacity(n);
-    for _ in 0..n {
-        let mut buf = vec![0u8; size];
-        reader.read_exact(&mut buf).await?;
-        // Re-encode as RowBinary String: varint(len) + bytes
-        let mut row = Vec::with_capacity(size + 9);
-        write_var_uint(size as u64, &mut row);
-        row.extend_from_slice(&buf);
-        result.push(row);
+        result.push(read_exact_grown(reader, size).await?);
     }
     Ok(result)
 }
 
 async fn read_string_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<ColumnData> {
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for _ in 0..n {
-        // read_string() returns raw bytes (varint length already consumed)
         let s = reader.read_string().await?;
-        // Re-encode as RowBinary: varint(len) + bytes
-        let mut row = Vec::with_capacity(s.len() + 9);
-        write_var_uint(s.len() as u64, &mut row);
-        row.extend_from_slice(&s);
-        result.push(row);
+        result.push(rowbinary_string(&s));
     }
     Ok(result)
+}
+
+/// Wrap `bytes` as a `RowBinary` String cell: varuint length then the bytes.
+fn rowbinary_string(bytes: &[u8]) -> Vec<u8> {
+    let mut row = Vec::with_capacity(bytes.len() + VAR_UINT_MAX_BYTES);
+    row.put_string(bytes);
+    row
 }
 
 async fn read_nullable_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     inner: &ColumnType,
+    depth: usize,
 ) -> Result<ColumnData> {
-    // Native: N null-flags (1 byte each: 1=null, 0=has-value) then N values
-    let mut null_flags = vec![0u8; n];
-    reader.read_exact(&mut null_flags).await?;
+    // Native: N null-flags (1 byte each: 1=null, 0=has-value) then N values.
+    let null_flags = read_exact_grown(reader, n).await?;
 
-    // All N values are always present (native sends placeholder for nulls too)
-    let inner_data = read_column(reader, inner, n as u64).await?;
+    // Every slot carries value bytes, nulls included.
+    let inner_data = read_column_at(reader, inner, n as u64, depth + 1).await?;
 
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for (flag, value) in null_flags.into_iter().zip(inner_data.into_iter()) {
         if flag != 0 {
             // NULL -- RowBinary: 1 byte = 1
@@ -601,60 +654,34 @@ async fn read_nullable_column<R: ClickHouseRead>(
     Ok(result)
 }
 
-/// LowCardinality column reader.
-///
-/// Wire format uses fixed uint64 (little-endian) for sizes, not varint.
-///
-/// ```text
-/// u64      state_and_type
-///            bits 0-1: index size (0=U8, 1=U16, 2=U32, 3=U64)
-///            bit  8:   has global dictionary
-///            bit  9:   has additional keys (new rows not in global dict)
-/// if bit 8 set:
-///   u64      global_dict_size
-///   global_dict_size x inner_type values
-/// if bit 9 set:
-///   u64      additional_keys_size
-///   additional_keys_size x inner_type values
-/// u64      num_indices   (must equal num_rows)
-/// num_indices x index_bytes  (indices into combined dict)
-/// ```
+/// `LowCardinality` column reader; the wire shape is documented on
+/// [`crate::native::decode`]'s `decode_low_cardinality`.
 async fn read_low_cardinality_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     inner: &ColumnType,
+    depth: usize,
 ) -> Result<ColumnData> {
     use tokio::io::AsyncReadExt as _;
 
-    // Wire format starts with a serialization version u64 (= 1).
     let _version = reader.read_u64_le().await?;
 
     let state = reader.read_u64_le().await?;
     let index_type = (state & 0x03) as u8;
-    // Bit 8: NEED_GLOBAL_DICTIONARY -- server sends a shared global dict
     let has_global_dict = (state & 0x100) != 0;
-    // Bit 9: HAS_ADDITIONAL_KEYS -- server sends per-block additional keys
     let has_additional_keys = (state & 0x200) != 0;
 
-    // For LowCardinality(Nullable(T)), the dictionary on the wire is of type T
-    // (not Nullable(T)).  Index 0 is a special null-sentinel entry (the default
-    // T value, e.g. "" for String).  All other indices reference non-null T values.
+    // LowCardinality(Nullable(T)) carries a T dictionary whose slot 0 is the
+    // null sentinel, so the wire type is always the unwrapped T.
     let (dict_type, is_nullable_inner) = if let ColumnType::Nullable(t) = inner {
         (t.as_ref(), true)
     } else {
         (inner, false)
     };
 
-    // Client-server Native LowCardinality payloads carry per-block
-    // additional keys only: the server sets HAS_ADDITIONAL_KEYS and does
-    // NOT send a shared global dictionary (global dicts are an internal
-    // merge-tree concern). cpp-client and clickhouse-go both reject a
-    // global dictionary on this path and require the additional-keys
-    // bit; we match them -- accept only the additional-keys shape and
-    // fail loud on anything else (a global dict, or neither flag),
-    // rather than silently mis-decoding a payload no current server
-    // emits. The TCP streaming decoder (`crate::native::decode`) applies
-    // the same rule.
+    // cpp-client and clickhouse-go both reject a global dictionary on the
+    // client-server path and require the additional-keys bit; the streaming
+    // decoder in `crate::native::decode` applies the same rule.
     if has_global_dict {
         return Err(Error::BadResponse(
             "native protocol: LowCardinality global dictionary is not supported on the \
@@ -670,7 +697,8 @@ async fn read_low_cardinality_column<R: ClickHouseRead>(
         ));
     }
     let additional_keys_size = reader.read_u64_le().await?;
-    let dict: ColumnData = read_column(reader, dict_type, additional_keys_size).await?;
+    let dict: ColumnData =
+        read_column_at(reader, dict_type, additional_keys_size, depth + 1).await?;
 
     let num_indices = reader.read_u64_le().await?;
     if num_indices != n as u64 {
@@ -692,11 +720,11 @@ async fn read_low_cardinality_column<R: ClickHouseRead>(
     };
 
     let dict_size = dict.len();
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for _ in 0..n {
-        let idx = read_index(reader, index_bytes).await? as usize;
+        let idx = usize::try_from(read_index(reader, index_bytes).await?).unwrap_or(usize::MAX);
         if is_nullable_inner {
-            // Index 0 = null sentinel -> RowBinary null; other indices = Some(T).
+            // Index 0 is the null sentinel; every other index is a Some(T).
             if idx == 0 {
                 result.push(vec![0x01u8]); // RowBinary Nullable null flag
             } else {
@@ -721,41 +749,28 @@ async fn read_low_cardinality_column<R: ClickHouseRead>(
     Ok(result)
 }
 
-/// Array(T) column reader.
+/// Array(T) column reader, `varuint(count) + count x T` per `RowBinary` row.
 ///
-/// Native wire format:
 /// ```text
-/// n x u64   cumulative end-offsets (last value = total element count)
-/// total_elements x T   values packed as a regular T column
+/// n x u64             cumulative end-offsets (last = total element count)
+/// total_elements x T  values packed as a regular T column
 /// ```
-/// Output RowBinary per row: varuint(count) + count x T_rowbinary
 async fn read_array_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     inner: &ColumnType,
+    depth: usize,
 ) -> Result<ColumnData> {
-    use tokio::io::AsyncReadExt as _;
-
-    let mut offsets = Vec::with_capacity(n);
-    for _ in 0..n {
-        offsets.push(reader.read_u64_le().await?);
-    }
-
+    let offsets = read_offsets(reader, n).await?;
     let total = offsets.last().copied().unwrap_or(0);
-    let all_values = read_column(reader, inner, total).await?;
+    let all_values = read_column_at(reader, inner, total, depth + 1).await?;
 
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     let mut prev = 0usize;
     for &end in &offsets {
-        let end = end as usize;
-        if end < prev {
-            return Err(Error::BadResponse(
-                "array offsets are not monotonically increasing".to_string(),
-            ));
-        }
-        let count = end - prev;
+        let end = checked_span(end, prev, all_values.len(), "Array")?;
         let mut row = Vec::new();
-        write_var_uint(count as u64, &mut row);
+        row.put_var_uint((end - prev) as u64);
         for v in &all_values[prev..end] {
             row.extend_from_slice(v);
         }
@@ -765,18 +780,44 @@ async fn read_array_column<R: ClickHouseRead>(
     Ok(result)
 }
 
-/// Tuple(T1, T2, ...) column reader.
+/// Read `n` cumulative end-offsets.
+async fn read_offsets<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<Vec<u64>> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mut offsets = with_cap(n)?;
+    for _ in 0..n {
+        offsets.push(reader.read_u64_le().await?);
+    }
+    Ok(offsets)
+}
+
+/// Narrow one cumulative end-offset to a slice bound.
 ///
-/// Native wire format: each field is its own complete columnar block in field order.
-/// Output RowBinary per row: T1_bytes + T2_bytes + ... (simple concatenation).
+/// An offset below its predecessor, or past the elements the sub-column
+/// actually carries, would index out of range.
+fn checked_span(end: u64, prev: usize, available: usize, what: &str) -> Result<usize> {
+    let end = usize::try_from(end).unwrap_or(usize::MAX);
+    if end < prev || end > available {
+        return Err(Error::BadResponse(format!(
+            "native protocol: {what} column offset {end} is outside \
+             {prev}..={available}"
+        )));
+    }
+    Ok(end)
+}
+
+/// Tuple(T1, T2, ...) column reader: each field is its own columnar block in
+/// field order, concatenated per `RowBinary` row.
 async fn read_tuple_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     fields: &[ColumnType],
+    depth: usize,
 ) -> Result<ColumnData> {
-    let mut rows = vec![Vec::new(); n];
+    let mut rows: ColumnData = with_cap(n)?;
+    rows.resize_with(n, Vec::new);
     for field_type in fields {
-        let field_data = read_column(reader, field_type, n as u64).await?;
+        let field_data = read_column_at(reader, field_type, n as u64, depth + 1).await?;
         for (row, cell) in rows.iter_mut().zip(field_data.into_iter()) {
             row.extend_from_slice(&cell);
         }
@@ -784,44 +825,32 @@ async fn read_tuple_column<R: ClickHouseRead>(
     Ok(rows)
 }
 
-/// Map(K, V) column reader.
+/// Map(K, V) column reader, `varuint(count) + count x (K + V)` per `RowBinary` row.
 ///
-/// Native wire format:
 /// ```text
-/// n x u64   cumulative end-offsets
-/// total_entries x K   key column
-/// total_entries x V   value column
+/// n x u64            cumulative end-offsets
+/// total_entries x K  key column
+/// total_entries x V  value column
 /// ```
-/// Output RowBinary per row: varuint(count) + count x (K_bytes + V_bytes)
 async fn read_map_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     key_type: &ColumnType,
     val_type: &ColumnType,
+    depth: usize,
 ) -> Result<ColumnData> {
-    use tokio::io::AsyncReadExt as _;
-
-    let mut offsets = Vec::with_capacity(n);
-    for _ in 0..n {
-        offsets.push(reader.read_u64_le().await?);
-    }
-
+    let offsets = read_offsets(reader, n).await?;
     let total = offsets.last().copied().unwrap_or(0);
-    let keys = read_column(reader, key_type, total).await?;
-    let vals = read_column(reader, val_type, total).await?;
+    let keys = read_column_at(reader, key_type, total, depth + 1).await?;
+    let vals = read_column_at(reader, val_type, total, depth + 1).await?;
 
-    let mut result = Vec::with_capacity(n);
+    let pairs = keys.len().min(vals.len());
+    let mut result = with_cap(n)?;
     let mut prev = 0usize;
     for &end in &offsets {
-        let end = end as usize;
-        if end < prev {
-            return Err(Error::BadResponse(
-                "map offsets are not monotonically increasing".to_string(),
-            ));
-        }
-        let count = end - prev;
+        let end = checked_span(end, prev, pairs, "Map")?;
         let mut row = Vec::new();
-        write_var_uint(count as u64, &mut row);
+        row.put_var_uint((end - prev) as u64);
         for i in prev..end {
             row.extend_from_slice(&keys[i]);
             row.extend_from_slice(&vals[i]);
@@ -832,30 +861,30 @@ async fn read_map_column<R: ClickHouseRead>(
     Ok(result)
 }
 
-/// Variant(T1, T2, ...) column reader.
+/// Variant(T1, T2, ...) column reader, one RowBinary-String JSON cell per row.
 ///
-/// Wire format:
 /// ```text
-/// u64      version (= 0)
-/// n x u8   discriminators  (255 = NULL, 0..k-1 = type index in definition order)
-/// for each variant type Ti in order:
-///   [rows where discriminator == i, in original row order]
+/// u64      version
+/// n x u8   discriminators  (255 = NULL, else the type index in definition order)
+/// per type, in definition order: the rows whose discriminator selected it
 /// ```
-/// Output: per-row JSON string encoded as RowBinary String.
 async fn read_variant_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     variant_types: &[ColumnType],
+    depth: usize,
 ) -> Result<ColumnData> {
-    use tokio::io::AsyncReadExt as _;
-
-    // Wire prefix: u64 version = 0
-    let _version = reader.read_u64_le().await?;
-
-    let mut discriminators = vec![0u8; n];
-    reader.read_exact(&mut discriminators).await?;
-
     let k = variant_types.len();
+    if k > MAX_VARIANT_TYPES {
+        return Err(Error::BadResponse(format!(
+            "native protocol: Variant declares {k} arms, above the {MAX_VARIANT_TYPES} cap"
+        )));
+    }
+
+    read_variant_mode(reader).await?;
+
+    let discriminators = read_exact_grown(reader, n).await?;
+
     let mut type_counts = vec![0u64; k];
     for &d in &discriminators {
         if (d as usize) < k {
@@ -863,26 +892,23 @@ async fn read_variant_column<R: ClickHouseRead>(
         }
     }
 
-    let mut type_values: Vec<ColumnData> = Vec::with_capacity(k);
+    let mut type_values: Vec<ColumnData> = with_cap(k)?;
     for (i, col_type) in variant_types.iter().enumerate() {
-        type_values.push(read_column(reader, col_type, type_counts[i]).await?);
+        type_values.push(read_column_at(reader, col_type, type_counts[i], depth + 1).await?);
     }
 
     let mut type_cursors = vec![0usize; k];
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for &d in &discriminators {
-        let json_bytes: Vec<u8> = if d == 255 || (d as usize) >= k {
+        let idx = d as usize;
+        let json_bytes: Vec<u8> = if d == NULL_DISCRIMINATOR || idx >= k {
             b"null".to_vec()
         } else {
-            let idx = d as usize;
             let cursor = type_cursors[idx];
             type_cursors[idx] += 1;
-            rowbinary_to_json(&type_values[idx][cursor], &variant_types[idx])
+            cell_to_json(type_values[idx].get(cursor), &variant_types[idx])
         };
-        let mut row = Vec::with_capacity(json_bytes.len() + 9);
-        write_var_uint(json_bytes.len() as u64, &mut row);
-        row.extend_from_slice(&json_bytes);
-        result.push(row);
+        result.push(rowbinary_string(&json_bytes));
     }
     Ok(result)
 }
@@ -891,69 +917,127 @@ async fn read_variant_column<R: ClickHouseRead>(
 /// `output_format_native_write_json_as_string=1` selects.
 pub(crate) const JSON_SERIALIZATION_STRING: u64 = 1;
 
-/// New JSON column (ClickHouse 24.x+) reader.
-async fn read_json_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<ColumnData> {
+/// Discriminator reserved for NULL in the `Variant` and Dynamic v1/v2 formats.
+const NULL_DISCRIMINATOR: u8 = 255;
+
+/// `DiscriminatorsSerializationMode::BASIC` -- one plain discriminator byte per
+/// row (`SerializationVariant.h:58`). `COMPACT` prepends a row count and a
+/// per-granule format byte, which this reader does not walk.
+const VARIANT_MODE_BASIC: u64 = 0;
+
+/// Read and check the `Variant` discriminator-serialization mode.
+async fn read_variant_mode<R: ClickHouseRead>(reader: &mut R) -> Result<()> {
+    use tokio::io::AsyncReadExt as _;
+
+    let mode = reader.read_u64_le().await?;
+    if mode != VARIANT_MODE_BASIC {
+        return Err(Error::BadResponse(format!(
+            "native protocol: Variant discriminator serialization mode {mode} is not supported \
+             (only basic, 0)"
+        )));
+    }
+    Ok(())
+}
+
+/// Marker type name for values spilled out of a `Dynamic` type list.
+const SHARED_VARIANT: &str = "SharedVariant";
+
+/// New JSON column (`ClickHouse` 24.x+) reader.
+async fn read_json_column<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    depth: usize,
+) -> Result<ColumnData> {
     use tokio::io::AsyncReadExt as _;
 
     let version = reader.read_u64_le().await?;
-    read_json_body(reader, n, version).await
+    read_json_body_at(reader, n, version, depth).await
 }
 
 /// JSON column payload, after the u64 serialization version:
 /// - `1`: each row is a plain JSON string (String column format)
 /// - `2`: path-based object format with Dynamic v1/v2 sub-columns + shared data
 /// - `3`: path-based object format with Dynamic v3 sub-columns (no shared data)
+///
+/// # Errors
+///
+/// As [`read_column`], plus [`Error::BadResponse`] for an unknown `version`.
 pub(crate) async fn read_json_body<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     version: u64,
 ) -> Result<ColumnData> {
+    read_json_body_at(reader, n, version, 0).await
+}
+
+async fn read_json_body_at<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    version: u64,
+    depth: usize,
+) -> Result<ColumnData> {
     match version {
         JSON_SERIALIZATION_STRING => read_string_column(reader, n).await,
-        2 => read_json_object_v2_column(reader, n).await,
-        3 => read_json_object_v3_column(reader, n).await,
+        2 => read_json_object_v2_column(reader, n, depth).await,
+        3 => read_json_object_v3_column(reader, n, depth).await,
         _ => Err(Error::BadResponse(format!(
             "native protocol: unsupported JSON serialization version: {version}"
         ))),
     }
 }
 
-/// JSON v2 object column reader.
+/// Read a varuint header count, rejecting anything above `cap` before it sizes
+/// a list no payload has to back.
+async fn read_capped_count<R: ClickHouseRead>(
+    reader: &mut R,
+    cap: usize,
+    what: &str,
+) -> Result<usize> {
+    let raw = reader.read_var_uint().await?;
+    let count = usize::try_from(raw).unwrap_or(usize::MAX);
+    if count > cap {
+        return Err(Error::BadResponse(format!(
+            "native protocol: {what} count {raw} is above the {cap} cap"
+        )));
+    }
+    Ok(count)
+}
+
+/// Render one cell as JSON, or `null` when the sub-column ran short.
+fn cell_to_json(cell: Option<&Vec<u8>>, col_type: &ColumnType) -> Vec<u8> {
+    cell.map_or_else(|| b"null".to_vec(), |c| rowbinary_to_json(c, col_type))
+}
+
+/// JSON v2 object column reader, after the u64 version has been consumed.
 ///
-/// Wire format (after the u64 version=2 already consumed):
 /// ```text
 /// varuint   numDynamicPaths
 /// String[]  pathNames (sorted alphabetically)
-/// for each path:
-///   u64     dynVersion (1 or 2)
-///   [if dynVersion==1: varuint maxTypes]
-///   varuint numTypes (server types, excluding SharedVariant)
-///   String[] typeNames
-///   u64     variantVersion (= 0)
-/// for each path:
-///   u8[n]   discriminators (index in sorted(typeNames+"SharedVariant"), 255=NULL)
-///   for each type in sorted order: column data
-/// n x u64   shared data (discard)
+/// per path: u64 dynVersion; [v1 only: varuint maxTypes];
+///           varuint numTypes; String[] typeNames; u64 variantVersion
+/// per path: u8[n] discriminators (into sorted(typeNames + "SharedVariant"),
+///           255 = NULL), then the sub-columns in sorted order
+/// n x u64   shared data
 /// ```
 async fn read_json_object_v2_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
+    depth: usize,
 ) -> Result<ColumnData> {
     use tokio::io::AsyncReadExt as _;
 
-    let num_paths = reader.read_var_uint().await? as usize;
-    let mut path_names: Vec<String> = Vec::with_capacity(num_paths);
+    let num_paths = read_capped_count(reader, MAX_JSON_PATHS, "JSON dynamic path").await?;
+    let mut path_names: Vec<String> = with_cap(num_paths)?;
     for _ in 0..num_paths {
         path_names.push(reader.read_utf8_string().await?);
     }
 
-    // Read Dynamic v1/v2 header for each path.
-    // sorted_types[p] = Vec<(type_name, col_type)> in sorted order (SharedVariant included).
-    let mut path_sorted_types: Vec<Vec<(String, ColumnType)>> = Vec::with_capacity(num_paths);
+    // One sorted (type_name, col_type) list per path, `SharedVariant` included,
+    // in the order the discriminators index.
+    let mut path_sorted_types: Vec<Vec<(String, ColumnType)>> = with_cap(num_paths)?;
     for path_name in &path_names {
         let dyn_version = reader.read_u64_le().await?;
         if dyn_version == 1 {
-            // v1 has an extra maxTypes field before numTypes
             let _max_types = reader.read_var_uint().await?;
         } else if dyn_version != 2 {
             return Err(Error::BadResponse(format!(
@@ -961,41 +1045,34 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
             )));
         }
 
-        let num_types = reader.read_var_uint().await? as usize;
-        let mut type_names: Vec<String> = Vec::with_capacity(num_types + 1);
+        let num_types = read_capped_count(reader, MAX_WIRE_TYPES, "Dynamic type").await?;
+        let mut type_names: Vec<String> = with_cap(num_types + 1)?;
         for _ in 0..num_types {
             type_names.push(reader.read_utf8_string().await?);
         }
-        // SharedVariant is implicit -- add and sort to get the discriminator indices.
-        type_names.push("SharedVariant".to_string());
+        type_names.push(SHARED_VARIANT.to_owned());
         type_names.sort();
 
-        let _variant_version = reader.read_u64_le().await?;
+        read_variant_mode(reader).await?;
 
-        let types: Vec<(String, ColumnType)> = type_names
+        let types = type_names
             .into_iter()
             .map(|name| {
-                let ct = if name == "SharedVariant" {
-                    ColumnType::String
-                } else {
-                    ColumnType::parse(&name).unwrap_or(ColumnType::String)
-                };
-                (name, ct)
+                let ct = wire_type(&name)?;
+                Ok((name, ct))
             })
-            .collect();
+            .collect::<Result<Vec<(String, ColumnType)>>>()?;
 
         path_sorted_types.push(types);
     }
 
-    // Read data for each path: discriminators then per-type column values.
-    let mut path_discriminators: Vec<Vec<u8>> = Vec::with_capacity(num_paths);
-    let mut path_values: Vec<Vec<ColumnData>> = Vec::with_capacity(num_paths);
+    let mut path_discriminators: Vec<Vec<u8>> = with_cap(num_paths)?;
+    let mut path_values: Vec<Vec<ColumnData>> = with_cap(num_paths)?;
 
     for types in &path_sorted_types {
         let k = types.len();
 
-        let mut discriminators = vec![0u8; n];
-        reader.read_exact(&mut discriminators).await?;
+        let discriminators = read_exact_grown(reader, n).await?;
 
         let mut type_counts = vec![0u64; k];
         for &d in &discriminators {
@@ -1004,27 +1081,30 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
             }
         }
 
-        let mut col_values: Vec<ColumnData> = Vec::with_capacity(k);
+        let mut col_values: Vec<ColumnData> = with_cap(k)?;
         for (i, (_, col_type)) in types.iter().enumerate() {
-            col_values.push(read_column(reader, col_type, type_counts[i]).await?);
+            col_values.push(read_column_at(reader, col_type, type_counts[i], depth + 1).await?);
         }
 
         path_discriminators.push(discriminators);
         path_values.push(col_values);
     }
 
-    // Discard shared data: n x u64 (one u64 per row, unused by us).
-    for _ in 0..n {
-        let _ = reader.read_u64_le().await?;
-    }
+    // Shared data is Array(Tuple(String, String)) -- the paths that spilled past
+    // `max_dynamic_paths` and their values (`SerializationObjectSharedData.cpp`
+    // MAP mode, `DataTypeObject.cpp:583`). Reading only the offsets would
+    // desynchronise the block the moment a row actually spills.
+    let shared_offsets = read_offsets(reader, n).await?;
+    let spilled = shared_offsets.last().copied().unwrap_or(0);
+    read_column_at(reader, &ColumnType::String, spilled, depth + 1).await?;
+    read_column_at(reader, &ColumnType::String, spilled, depth + 1).await?;
 
-    // Build per-row JSON objects by reassembling path values.
     let mut path_cursors: Vec<Vec<usize>> = path_sorted_types
         .iter()
         .map(|types| vec![0usize; types.len()])
         .collect();
 
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for row_i in 0..n {
         let mut json = b"{".to_vec();
         let mut first = true;
@@ -1033,8 +1113,8 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
             let disc = path_discriminators[path_idx][row_i] as usize;
             let k = path_sorted_types[path_idx].len();
 
-            if disc == 255 || disc >= k {
-                // Absent / NULL -- omit key from output.
+            // Absent or NULL: the key is omitted from the object.
+            if disc == NULL_DISCRIMINATOR as usize || disc >= k {
                 continue;
             }
 
@@ -1042,8 +1122,8 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
             path_cursors[path_idx][disc] += 1;
 
             let (type_name, col_type) = &path_sorted_types[path_idx][disc];
-            if type_name == "SharedVariant" {
-                // SharedVariant stores overflow values in an opaque binary format; skip.
+            // SharedVariant spill values are an opaque binary encoding.
+            if type_name == SHARED_VARIANT {
                 continue;
             }
 
@@ -1054,91 +1134,78 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
 
             json.extend_from_slice(&json_quote_bytes(path_name.as_bytes()));
             json.push(b':');
-
-            let cell = &path_values[path_idx][disc][cursor];
-            json.extend_from_slice(&rowbinary_to_json(cell, col_type));
+            json.extend_from_slice(&cell_to_json(
+                path_values[path_idx][disc].get(cursor),
+                col_type,
+            ));
         }
 
         json.push(b'}');
-
-        let mut row = Vec::with_capacity(json.len() + 9);
-        write_var_uint(json.len() as u64, &mut row);
-        row.extend_from_slice(&json);
-        result.push(row);
+        result.push(rowbinary_string(&json));
     }
 
     Ok(result)
 }
 
-/// JSON v3 object column reader (new flat format, ClickHouse 25.6+).
+/// `SharedVariant` spill values ride as a String sub-column; any other name the
+/// parser rejects would desynchronise the stream, so it fails loud.
+fn wire_type(name: &str) -> Result<ColumnType> {
+    if name == SHARED_VARIANT {
+        return Ok(ColumnType::String);
+    }
+    ColumnType::parse(name).ok_or_else(|| {
+        Error::BadResponse(format!(
+            "native protocol: unsupported nested column type '{name}'"
+        ))
+    })
+}
+
+/// JSON v3 object column reader, after the u64 version has been consumed.
 ///
-/// Wire format (after the u64 version=3 already consumed):
 /// ```text
 /// varuint   numDynamicPaths
 /// String[]  pathNames
-/// for each path:
-///   varuint numTypes
-///   String[] typeNames
-/// for each path:
-///   discriminators (u8/u16/u32/u64 depending on numTypes+1)
-///   for each type in order: column data
+/// per path: u64 dynVersion; varuint numTypes; String[] typeNames
+/// per path: discriminators (width by numTypes + 1), then the sub-columns in
+///           declaration order
 /// ```
-/// No shared data section in v3.
+/// There is no shared-data section in v3.
 async fn read_json_object_v3_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
+    depth: usize,
 ) -> Result<ColumnData> {
-    let num_paths = reader.read_var_uint().await? as usize;
-    let mut path_names: Vec<String> = Vec::with_capacity(num_paths);
+    use tokio::io::AsyncReadExt as _;
+
+    let num_paths = read_capped_count(reader, MAX_JSON_PATHS, "JSON dynamic path").await?;
+    let mut path_names: Vec<String> = with_cap(num_paths)?;
     for _ in 0..num_paths {
         path_names.push(reader.read_utf8_string().await?);
     }
 
-    let mut path_col_types: Vec<Vec<ColumnType>> = Vec::with_capacity(num_paths);
-    let mut path_total_types: Vec<usize> = Vec::with_capacity(num_paths);
-
+    let mut path_col_types: Vec<Vec<ColumnType>> = with_cap(num_paths)?;
     for _ in 0..num_paths {
-        let num_types = reader.read_var_uint().await? as usize;
-        let mut col_types: Vec<ColumnType> = Vec::with_capacity(num_types);
-        for _ in 0..num_types {
-            let name = reader.read_utf8_string().await?;
-            col_types.push(ColumnType::parse(&name).unwrap_or(ColumnType::String));
+        // Each path opens with the flattened Dynamic version before its types.
+        let dyn_version = reader.read_u64_le().await?;
+        if dyn_version != DYNAMIC_FLATTENED {
+            return Err(Error::BadResponse(format!(
+                "native protocol: unexpected Dynamic version {dyn_version} in a JSON v3 path"
+            )));
         }
-        path_total_types.push(num_types);
-        path_col_types.push(col_types);
+        path_col_types.push(read_flat_wire_types(reader).await?);
     }
 
-    let mut path_discriminators: Vec<Vec<usize>> = Vec::with_capacity(num_paths);
-    let mut path_values: Vec<Vec<ColumnData>> = Vec::with_capacity(num_paths);
+    let mut path_discriminators: Vec<Vec<usize>> = with_cap(num_paths)?;
+    let mut path_values: Vec<Vec<ColumnData>> = with_cap(num_paths)?;
 
-    for (p, col_types) in path_col_types.iter().enumerate() {
-        let total_types = path_total_types[p];
-        // NULL discriminator = total_types; discriminator range = [0, total_types].
-        let disc_size = if total_types <= 254 {
-            1usize
-        } else if total_types <= 65535 {
-            2
-        } else if total_types <= u32::MAX as usize {
-            4
-        } else {
-            8
-        };
+    for col_types in &path_col_types {
+        let total_types = col_types.len();
+        let (discriminators, type_counts) =
+            read_discriminators(reader, n, total_types, index_width(total_types)).await?;
 
-        let mut discriminators: Vec<usize> = Vec::with_capacity(n);
-        for _ in 0..n {
-            discriminators.push(read_index(reader, disc_size).await? as usize);
-        }
-
-        let mut type_counts = vec![0u64; total_types];
-        for &d in &discriminators {
-            if d < total_types {
-                type_counts[d] += 1;
-            }
-        }
-
-        let mut col_values: Vec<ColumnData> = Vec::with_capacity(total_types);
+        let mut col_values: Vec<ColumnData> = with_cap(total_types)?;
         for (i, col_type) in col_types.iter().enumerate() {
-            col_values.push(read_column(reader, col_type, type_counts[i]).await?);
+            col_values.push(read_column_at(reader, col_type, type_counts[i], depth + 1).await?);
         }
 
         path_discriminators.push(discriminators);
@@ -1150,17 +1217,15 @@ async fn read_json_object_v3_column<R: ClickHouseRead>(
         .map(|types| vec![0usize; types.len()])
         .collect();
 
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for row_i in 0..n {
         let mut json = b"{".to_vec();
         let mut first = true;
 
         for (path_idx, path_name) in path_names.iter().enumerate() {
             let disc = path_discriminators[path_idx][row_i];
-            let total_types = path_total_types[path_idx];
-
-            if disc >= total_types {
-                // NULL -- omit key.
+            // NULL is the type count itself in v3, so the key is omitted.
+            if disc >= path_col_types[path_idx].len() {
                 continue;
             }
 
@@ -1174,37 +1239,91 @@ async fn read_json_object_v3_column<R: ClickHouseRead>(
 
             json.extend_from_slice(&json_quote_bytes(path_name.as_bytes()));
             json.push(b':');
-
-            let cell = &path_values[path_idx][disc][cursor];
-            let col_type = &path_col_types[path_idx][disc];
-            json.extend_from_slice(&rowbinary_to_json(cell, col_type));
+            json.extend_from_slice(&cell_to_json(
+                path_values[path_idx][disc].get(cursor),
+                &path_col_types[path_idx][disc],
+            ));
         }
 
         json.push(b'}');
-
-        let mut row = Vec::with_capacity(json.len() + 9);
-        write_var_uint(json.len() as u64, &mut row);
-        row.extend_from_slice(&json);
-        result.push(row);
+        result.push(rowbinary_string(&json));
     }
 
     Ok(result)
 }
 
-/// Standalone Dynamic column (ClickHouse 24.x+) reader.
+/// Read a flattened Dynamic type list, which carries no `SharedVariant` and is
+/// indexed in declaration order, so the whole 255-slot range is concrete types.
+async fn read_flat_wire_types<R: ClickHouseRead>(reader: &mut R) -> Result<Vec<ColumnType>> {
+    let count = read_capped_count(reader, MAX_VARIANT_TYPES, "Dynamic type").await?;
+    let mut types = with_cap(count)?;
+    for _ in 0..count {
+        let name = reader.read_utf8_string().await?;
+        types.push(wire_type(&name)?);
+    }
+    Ok(types)
+}
+
+/// Serialization version a flattened Dynamic sub-column announces, which each
+/// JSON v3 path carries ahead of its type list
+/// (`SerializationDynamic.cpp:151`).
+const DYNAMIC_FLATTENED: u64 = 3;
+
+/// Discriminator width `ClickHouse` picks for `slots` concrete types plus NULL.
+///
+/// `getSmallestIndexesType(slots + 1)` in `DataTypesNumber.cpp:126` takes the
+/// narrowest unsigned type whose range covers the slot count, so the u8 arm
+/// runs to 255 types inclusive.
+fn index_width(slots: usize) -> usize {
+    if slots <= 255 {
+        1
+    } else if slots <= 65_535 {
+        2
+    } else if u32::try_from(slots).is_ok() {
+        4
+    } else {
+        8
+    }
+}
+
+/// Read `n` discriminators of `width` bytes and tally the rows each of `slots`
+/// sub-columns owns.
+async fn read_discriminators<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    slots: usize,
+    width: usize,
+) -> Result<(Vec<usize>, Vec<u64>)> {
+    let mut discriminators: Vec<usize> = with_cap(n)?;
+    let mut counts = vec![0u64; slots];
+    for _ in 0..n {
+        let disc = usize::try_from(read_index(reader, width).await?).unwrap_or(usize::MAX);
+        if disc < slots {
+            counts[disc] += 1;
+        }
+        discriminators.push(disc);
+    }
+    Ok((discriminators, counts))
+}
+
+/// Standalone Dynamic column (`ClickHouse` 24.x+) reader.
 ///
 /// Dispatches based on the wire serialization version prefix:
-/// - `1`: deprecated format (maxTypes + totalTypes + sorted types + SharedVariant + variantVersion)
-/// - `2`: intermediate format (totalTypes + sorted types + SharedVariant + variantVersion)
-/// - `3`: flat format (totalTypes + types, NULL = totalTypes, no SharedVariant)
-async fn read_dynamic_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<ColumnData> {
+/// - `1`: deprecated format (maxTypes + totalTypes + sorted types + `SharedVariant` + variantVersion)
+/// - `2`: intermediate format (totalTypes + sorted types + `SharedVariant` + variantVersion)
+/// - `3`: flat format (totalTypes + types, NULL = totalTypes, no `SharedVariant`)
+async fn read_dynamic_column<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    depth: usize,
+) -> Result<ColumnData> {
     use tokio::io::AsyncReadExt as _;
 
     let version = reader.read_u64_le().await?;
     match version {
-        1 => read_dynamic_v1v2_column(reader, n, true).await,
-        2 => read_dynamic_v1v2_column(reader, n, false).await,
-        3 => read_dynamic_v3_column(reader, n).await,
+        1 => read_dynamic_v1v2_column(reader, n, true, depth).await,
+        2 => read_dynamic_v1v2_column(reader, n, false, depth).await,
+        3 => read_dynamic_v3_column(reader, n, depth).await,
         _ => Err(Error::BadResponse(format!(
             "native protocol: unsupported Dynamic serialization version: {version}"
         ))),
@@ -1214,43 +1333,35 @@ async fn read_dynamic_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Res
 /// Dynamic v1/v2 column reader.
 ///
 /// v1 has an extra `maxTypes` varuint before `totalTypes`; v2 does not.
-/// Both add "SharedVariant" to the type list and sort alphabetically.
+/// Both add `SharedVariant` to the type list and sort alphabetically.
 /// NULL discriminator = 255.
 async fn read_dynamic_v1v2_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     has_max_types: bool,
+    depth: usize,
 ) -> Result<ColumnData> {
-    use tokio::io::AsyncReadExt as _;
-
     if has_max_types {
         let _max_types = reader.read_var_uint().await?;
     }
 
-    let total_types = reader.read_var_uint().await? as usize;
-    let mut type_names: Vec<String> = Vec::with_capacity(total_types + 1);
+    let total_types = read_capped_count(reader, MAX_WIRE_TYPES, "Dynamic type").await?;
+    let mut type_names: Vec<String> = with_cap(total_types + 1)?;
     for _ in 0..total_types {
         type_names.push(reader.read_utf8_string().await?);
     }
-    type_names.push("SharedVariant".to_string());
+    type_names.push(SHARED_VARIANT.to_owned());
     type_names.sort();
 
-    let _variant_version = reader.read_u64_le().await?;
+    read_variant_mode(reader).await?;
 
-    let col_types: Vec<ColumnType> = type_names
+    let col_types = type_names
         .iter()
-        .map(|name| {
-            if name == "SharedVariant" {
-                ColumnType::String
-            } else {
-                ColumnType::parse(name).unwrap_or(ColumnType::String)
-            }
-        })
-        .collect();
+        .map(|name| wire_type(name))
+        .collect::<Result<Vec<ColumnType>>>()?;
 
     let k = col_types.len();
-    let mut discriminators = vec![0u8; n];
-    reader.read_exact(&mut discriminators).await?;
+    let discriminators = read_exact_grown(reader, n).await?;
 
     let mut type_counts = vec![0u64; k];
     for &d in &discriminators {
@@ -1259,98 +1370,69 @@ async fn read_dynamic_v1v2_column<R: ClickHouseRead>(
         }
     }
 
-    let mut type_values: Vec<ColumnData> = Vec::with_capacity(k);
+    let mut type_values: Vec<ColumnData> = with_cap(k)?;
     for (i, col_type) in col_types.iter().enumerate() {
-        type_values.push(read_column(reader, col_type, type_counts[i]).await?);
+        type_values.push(read_column_at(reader, col_type, type_counts[i], depth + 1).await?);
     }
 
     let mut type_cursors = vec![0usize; k];
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for &d in &discriminators {
-        let json_bytes: Vec<u8> = if d == 255 || (d as usize) >= k {
+        let idx = d as usize;
+        let json_bytes: Vec<u8> = if d == NULL_DISCRIMINATOR || idx >= k {
             b"null".to_vec()
         } else {
-            let idx = d as usize;
             let cursor = type_cursors[idx];
             type_cursors[idx] += 1;
-            if type_names[idx] == "SharedVariant" {
+            // SharedVariant spill values are an opaque binary encoding.
+            if type_names[idx] == SHARED_VARIANT {
                 b"null".to_vec()
             } else {
-                rowbinary_to_json(&type_values[idx][cursor], &col_types[idx])
+                cell_to_json(type_values[idx].get(cursor), &col_types[idx])
             }
         };
-        let mut row = Vec::with_capacity(json_bytes.len() + 9);
-        write_var_uint(json_bytes.len() as u64, &mut row);
-        row.extend_from_slice(&json_bytes);
-        result.push(row);
+        result.push(rowbinary_string(&json_bytes));
     }
     Ok(result)
 }
 
-/// Dynamic v3 column reader (new flat format, ClickHouse 25.6+).
+/// Dynamic v3 column reader (new flat format, `ClickHouse` 25.6+).
 ///
-/// No SharedVariant; NULL discriminator = totalTypes.
-/// Discriminator width scales with totalTypes: u8/u16/u32/u64.
-async fn read_dynamic_v3_column<R: ClickHouseRead>(reader: &mut R, n: usize) -> Result<ColumnData> {
-    let total_types = reader.read_var_uint().await? as usize;
-    let mut type_names: Vec<String> = Vec::with_capacity(total_types);
-    let mut col_types: Vec<ColumnType> = Vec::with_capacity(total_types);
-    for _ in 0..total_types {
-        let name = reader.read_utf8_string().await?;
-        col_types.push(ColumnType::parse(&name).unwrap_or(ColumnType::String));
-        type_names.push(name);
-    }
+/// No `SharedVariant`; NULL discriminator = totalTypes, and the discriminator
+/// width scales with it.
+async fn read_dynamic_v3_column<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    depth: usize,
+) -> Result<ColumnData> {
+    let col_types = read_flat_wire_types(reader).await?;
+    let total_types = col_types.len();
+    let (discriminators, type_counts) =
+        read_discriminators(reader, n, total_types, index_width(total_types)).await?;
 
-    let disc_size = if total_types <= 254 {
-        1usize
-    } else if total_types <= 65535 {
-        2
-    } else if total_types <= u32::MAX as usize {
-        4
-    } else {
-        8
-    };
-    let null_disc = total_types;
-
-    let mut discriminators: Vec<usize> = Vec::with_capacity(n);
-    for _ in 0..n {
-        discriminators.push(read_index(reader, disc_size).await? as usize);
-    }
-
-    let mut type_counts = vec![0u64; total_types];
-    for &d in &discriminators {
-        if d < total_types {
-            type_counts[d] += 1;
-        }
-    }
-
-    let mut type_values: Vec<ColumnData> = Vec::with_capacity(total_types);
+    let mut type_values: Vec<ColumnData> = with_cap(total_types)?;
     for (i, col_type) in col_types.iter().enumerate() {
-        type_values.push(read_column(reader, col_type, type_counts[i]).await?);
+        type_values.push(read_column_at(reader, col_type, type_counts[i], depth + 1).await?);
     }
 
     let mut type_cursors = vec![0usize; total_types];
-    let mut result = Vec::with_capacity(n);
+    let mut result = with_cap(n)?;
     for &d in &discriminators {
-        let json_bytes: Vec<u8> = if d == null_disc || d > total_types {
+        // NULL is the type count itself in v3.
+        let json_bytes: Vec<u8> = if d >= total_types {
             b"null".to_vec()
         } else {
             let cursor = type_cursors[d];
             type_cursors[d] += 1;
-            rowbinary_to_json(&type_values[d][cursor], &col_types[d])
+            cell_to_json(type_values[d].get(cursor), &col_types[d])
         };
-        let mut row = Vec::with_capacity(json_bytes.len() + 9);
-        write_var_uint(json_bytes.len() as u64, &mut row);
-        row.extend_from_slice(&json_bytes);
-        result.push(row);
+        result.push(rowbinary_string(&json_bytes));
     }
     Ok(result)
 }
 
-/// Convert a RowBinary-encoded value for `col_type` into JSON bytes.
-///
-/// Returns `b"null"` on any parse error rather than propagating -- callers should
-/// treat this as a best-effort JSON representation for use in Dynamic/Variant columns.
+/// Convert a RowBinary-encoded value for `col_type` into JSON bytes,
+/// best-effort: any parse failure renders as `null` rather than propagating.
 fn rowbinary_to_json(bytes: &[u8], col_type: &ColumnType) -> Vec<u8> {
     match rowbinary_to_json_inner(bytes, col_type) {
         Ok((json, _)) => json,
@@ -1362,156 +1444,109 @@ fn rowbinary_to_json(bytes: &[u8], col_type: &ColumnType) -> Vec<u8> {
 #[allow(clippy::too_many_lines)]
 fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u8>, usize), ()> {
     macro_rules! fixed {
-        ($n:expr, $t:ty, $fmt:expr) => {{
-            if bytes.len() < $n {
-                return Err(());
-            }
-            let v = <$t>::from_le_bytes(bytes[..$n].try_into().unwrap());
-            (format!($fmt, v).into_bytes(), $n)
+        ($n:expr, $t:ty) => {{
+            (
+                <$t>::from_le_bytes(head::<$n>(bytes)?)
+                    .to_string()
+                    .into_bytes(),
+                $n,
+            )
         }};
     }
 
     Ok(match col_type {
-        ColumnType::UInt8 => fixed!(1, u8, "{}"),
-        ColumnType::UInt16 => fixed!(2, u16, "{}"),
-        ColumnType::UInt32 | ColumnType::IPv4 | ColumnType::Time => fixed!(4, u32, "{}"),
-        ColumnType::UInt64 => fixed!(8, u64, "{}"),
-        ColumnType::Int8 => {
-            if bytes.is_empty() {
-                return Err(());
-            }
-            ((bytes[0] as i8).to_string().into_bytes(), 1)
+        ColumnType::UInt8 => fixed!(1, u8),
+        ColumnType::UInt16 | ColumnType::Date => fixed!(2, u16),
+        ColumnType::UInt32 | ColumnType::Time => fixed!(4, u32),
+        ColumnType::UInt64 => fixed!(8, u64),
+        // A signed wire byte reinterpreted from its unsigned wire form.
+        #[allow(clippy::cast_possible_wrap)]
+        ColumnType::Int8 | ColumnType::Enum8 => {
+            let [b] = head::<1>(bytes)?;
+            ((b as i8).to_string().into_bytes(), 1)
         }
-        ColumnType::Int16 => fixed!(2, i16, "{}"),
-        ColumnType::Int32 | ColumnType::Decimal32 { .. } => fixed!(4, i32, "{}"),
-        ColumnType::Date32 => fixed!(4, i32, "{}"),
-        ColumnType::Int64 | ColumnType::Time64 | ColumnType::Decimal64 { .. } => {
-            fixed!(8, i64, "{}")
-        }
-        ColumnType::Int128 | ColumnType::Decimal128 { .. } => {
-            if bytes.len() < 16 {
-                return Err(());
-            }
-            let v = i128::from_le_bytes(bytes[..16].try_into().unwrap());
-            (v.to_string().into_bytes(), 16)
-        }
-        ColumnType::UInt128 => {
-            if bytes.len() < 16 {
-                return Err(());
-            }
-            let v = u128::from_le_bytes(bytes[..16].try_into().unwrap());
-            (v.to_string().into_bytes(), 16)
-        }
+        ColumnType::Int16 | ColumnType::Enum16 => fixed!(2, i16),
+        ColumnType::Int32 | ColumnType::Decimal32 { .. } | ColumnType::Date32 => fixed!(4, i32),
+        ColumnType::Int64 | ColumnType::Time64 | ColumnType::Decimal64 { .. } => fixed!(8, i64),
+        ColumnType::Int128 | ColumnType::Decimal128 { .. } => fixed!(16, i128),
+        ColumnType::UInt128 => fixed!(16, u128),
+        // A 32-byte big integer has no JSON number form, so it renders as hex.
         ColumnType::Int256 | ColumnType::UInt256 | ColumnType::Decimal256 { .. } => {
-            // 32-byte big integer -- emit as hex string for safety
-            if bytes.len() < 32 {
-                return Err(());
+            let raw = head::<32>(bytes)?;
+            let mut hex = String::with_capacity(66);
+            hex.push('"');
+            for b in raw.iter().rev() {
+                let _ = write!(hex, "{b:02x}");
             }
-            let hex: String = bytes[..32]
-                .iter()
-                .rev()
-                .map(|b| format!("{b:02x}"))
-                .collect();
-            (format!("\"{hex}\"").into_bytes(), 32)
+            hex.push('"');
+            (hex.into_bytes(), 32)
         }
         ColumnType::Float32 => {
-            if bytes.len() < 4 {
-                return Err(());
-            }
-            let v = f32::from_le_bytes(bytes[..4].try_into().unwrap());
-            (format_float_json(v as f64).into_bytes(), 4)
+            let v = f32::from_le_bytes(head::<4>(bytes)?);
+            (format_float_json(f64::from(v)).into_bytes(), 4)
         }
         ColumnType::Float64 => {
-            if bytes.len() < 8 {
-                return Err(());
-            }
-            let v = f64::from_le_bytes(bytes[..8].try_into().unwrap());
+            let v = f64::from_le_bytes(head::<8>(bytes)?);
             (format_float_json(v).into_bytes(), 8)
         }
+        // BFloat16 is the top half of an f32's bit pattern.
         ColumnType::BFloat16 => {
-            // BFloat16 is u16 mantissa -- convert via f32
-            if bytes.len() < 2 {
-                return Err(());
-            }
-            let raw = u16::from_le_bytes([bytes[0], bytes[1]]);
-            let v = f32::from_bits((raw as u32) << 16);
-            (format_float_json(v as f64).into_bytes(), 2)
+            let raw = u16::from_le_bytes(head::<2>(bytes)?);
+            let v = f32::from_bits(u32::from(raw) << 16);
+            (format_float_json(f64::from(v)).into_bytes(), 2)
         }
-        ColumnType::Date => {
-            if bytes.len() < 2 {
-                return Err(());
-            }
-            let days = u16::from_le_bytes([bytes[0], bytes[1]]) as u32;
-            (format!("\"{days}\"").into_bytes(), 2)
-        }
-        ColumnType::DateTime | ColumnType::DateTime64 { .. } => {
-            let size = col_type.fixed_size().unwrap_or(4);
-            if bytes.len() < size {
-                return Err(());
-            }
-            let v: u64 = match size {
-                4 => u32::from_le_bytes(bytes[..4].try_into().unwrap()) as u64,
-                8 => u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                _ => return Err(()),
-            };
-            (format!("{v}").into_bytes(), size)
-        }
+        // Date, Date32, DateTime and DateTime64 all render as their bare wire
+        // integer: days or ticks since the epoch, at the column's precision.
+        ColumnType::DateTime => fixed!(4, u32),
+        ColumnType::DateTime64 { .. } => fixed!(8, i64),
+        // Two little-endian u64 halves, most significant first.
         ColumnType::Uuid => {
-            if bytes.len() < 16 {
-                return Err(());
-            }
-            // UUID in RowBinary: two u64 little-endian (msb first, lsb second).
-            let hi = u64::from_le_bytes(bytes[..8].try_into().unwrap());
-            let lo = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            let hi = u64::from_le_bytes(head::<8>(bytes)?);
+            let lo = u64::from_le_bytes(head::<8>(bytes.get(8..).ok_or(())?)?);
+            let hex = format!("{hi:016x}{lo:016x}");
             let s = format!(
-                "\"{:08x}-{:04x}-{:04x}-{:04x}-{:012x}\"",
-                (hi >> 32) as u32,
-                (hi >> 16) as u16,
-                hi as u16,
-                (lo >> 48) as u16,
-                lo & 0x0000_ffff_ffff_ffff
+                "\"{}-{}-{}-{}-{}\"",
+                &hex[0..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..32]
             );
             (s.into_bytes(), 16)
         }
-        ColumnType::IPv6 => {
-            if bytes.len() < 16 {
-                return Err(());
-            }
-            let hex: String = bytes[..16]
-                .chunks(2)
-                .map(|c| format!("{:02x}{:02x}", c[0], c[1]))
-                .collect::<Vec<_>>()
-                .join(":");
-            (format!("\"[{hex}]\"").into_bytes(), 16)
+        // IPv4 is a UInt32 on the wire, rendered in dotted-quad form.
+        ColumnType::IPv4 => {
+            let addr = std::net::Ipv4Addr::from(u32::from_le_bytes(head::<4>(bytes)?));
+            (format!("\"{addr}\"").into_bytes(), 4)
         }
+        // IPv6 is 16 network-order bytes, rendered in RFC 5952 compressed form.
+        ColumnType::IPv6 => {
+            let addr = std::net::Ipv6Addr::from(head::<16>(bytes)?);
+            (format!("\"{addr}\"").into_bytes(), 16)
+        }
+        // Point is a pair of little-endian f64.
         ColumnType::Point => {
-            // 2 x f64 LE
-            if bytes.len() < 16 {
-                return Err(());
-            }
-            let x = f64::from_le_bytes(bytes[..8].try_into().unwrap());
-            let y = f64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            let x = f64::from_le_bytes(head::<8>(bytes)?);
+            let y = f64::from_le_bytes(head::<8>(bytes.get(8..).ok_or(())?)?);
             (
                 format!("[{},{}]", format_float_json(x), format_float_json(y)).into_bytes(),
                 16,
             )
         }
-        ColumnType::Enum8 => {
-            if bytes.is_empty() {
-                return Err(());
-            }
-            ((bytes[0] as i8).to_string().into_bytes(), 1)
-        }
-        ColumnType::Enum16 => fixed!(2, i16, "{}"),
-        // String types: RowBinary format = varuint(len) + bytes
-        ColumnType::String | ColumnType::FixedString(_) | ColumnType::Json => {
-            let (len, hdr) = read_var_uint_from_slice(bytes).ok_or(())?;
-            let len = len as usize;
-            let end = hdr + len;
-            if bytes.len() < end {
-                return Err(());
-            }
+        // RowBinary carries String as varuint(len) + bytes.
+        ColumnType::String | ColumnType::Json => {
+            let (len, hdr) = slice_var_uint(bytes)?;
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| hdr.checked_add(len))
+                .filter(|end| *end <= bytes.len())
+                .ok_or(())?;
             (json_quote_bytes(&bytes[hdr..end]), end)
+        }
+        // RowBinary carries FixedString(N) as N raw bytes, no length prefix.
+        ColumnType::FixedString(width) => {
+            let cell = bytes.get(..*width).ok_or(())?;
+            (json_quote_bytes(cell), *width)
         }
         ColumnType::Nullable(inner) => {
             if bytes.is_empty() {
@@ -1530,7 +1565,7 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
         }
         ColumnType::SimpleAggregateFunction(inner) => rowbinary_to_json_inner(bytes, inner)?,
         ColumnType::Array(inner) => {
-            let (count, hdr) = read_var_uint_from_slice(bytes).ok_or(())?;
+            let (count, hdr) = slice_var_uint(bytes)?;
             let mut pos = hdr;
             let mut json = b"[".to_vec();
             for i in 0..count {
@@ -1559,7 +1594,7 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
             (json, pos)
         }
         ColumnType::Map(key_type, val_type) => {
-            let (count, hdr) = read_var_uint_from_slice(bytes).ok_or(())?;
+            let (count, hdr) = slice_var_uint(bytes)?;
             let mut pos = hdr;
             let mut json = b"{".to_vec();
             for i in 0..count {
@@ -1577,25 +1612,37 @@ fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u
             json.push(b'}');
             (json, pos)
         }
-        // Dynamic/Variant/NewJson cells are already JSON strings (varuint + bytes)
+        // Dynamic, Variant and JSON cells already hold JSON text, length-
+        // prefixed as RowBinary strings, so they are spliced in verbatim.
         ColumnType::Dynamic | ColumnType::NewJson | ColumnType::Variant(_) => {
-            let (len, hdr) = read_var_uint_from_slice(bytes).ok_or(())?;
-            let len = len as usize;
-            let end = hdr + len;
-            if bytes.len() < end {
-                return Err(());
-            }
+            let (len, hdr) = slice_var_uint(bytes)?;
+            let end = usize::try_from(len)
+                .ok()
+                .and_then(|len| hdr.checked_add(len))
+                .filter(|end| *end <= bytes.len())
+                .ok_or(())?;
             (bytes[hdr..end].to_vec(), end)
         }
     })
 }
 
-/// Format a float for JSON: avoids NaN/Infinity (not valid JSON), uses finite repr.
+/// [`crate::native::io::get_var_uint`] in the `Result<_, ()>` domain this
+/// best-effort renderer works in.
+fn slice_var_uint(bytes: &[u8]) -> Result<(u64, usize), ()> {
+    crate::native::io::get_var_uint(bytes).map_err(|_| ())
+}
+
+/// The leading `N` bytes of a cell, or `Err` when it is short.
+fn head<const N: usize>(bytes: &[u8]) -> Result<[u8; N], ()> {
+    bytes.get(..N).ok_or(())?.try_into().map_err(|_| ())
+}
+
+/// Format a float for JSON; NaN and infinity have no JSON form and render as
+/// `null`.
 fn format_float_json(v: f64) -> String {
     if v.is_nan() || v.is_infinite() {
         "null".to_string()
     } else {
-        // Use Rust's default float formatting (no trailing zeros)
         format!("{v}")
     }
 }
@@ -1636,59 +1683,19 @@ fn json_quote_bytes(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Read a varuint (LEB128) from a byte slice. Returns `(value, bytes_consumed)`.
-fn read_var_uint_from_slice(bytes: &[u8]) -> Option<(u64, usize)> {
-    let mut value = 0u64;
-    let mut shift = 0u32;
-    for (i, &b) in bytes.iter().enumerate() {
-        value |= ((b & 0x7f) as u64) << shift;
-        if b & 0x80 == 0 {
-            return Some((value, i + 1));
-        }
-        shift += 7;
-        if shift >= 63 {
-            return None;
-        } // overflow guard
-    }
-    None // ran out of bytes
-}
-
-async fn read_index<R: ClickHouseRead>(reader: &mut R, bytes: usize) -> Result<u64> {
-    Ok(match bytes {
+/// Read one little-endian index or discriminator of `width` bytes.
+async fn read_index<R: ClickHouseRead>(reader: &mut R, width: usize) -> Result<u64> {
+    Ok(match width {
         1 => u64::from(reader.read_u8().await?),
         2 => u64::from(reader.read_u16_le().await?),
         4 => u64::from(reader.read_u32_le().await?),
         8 => reader.read_u64_le().await?,
-        _ => unreachable!(),
+        other => {
+            return Err(Error::BadResponse(format!(
+                "native protocol: {other}-byte index width is not a wire width"
+            )));
+        }
     })
-}
-
-/// Write a LEB128 varint (ClickHouse 63-bit variant) into a buffer.
-pub(crate) fn write_var_uint(mut value: u64, buf: &mut Vec<u8>) {
-    loop {
-        let byte = (value & 0x7F) as u8;
-        value >>= 7;
-        if value == 0 {
-            buf.push(byte);
-            break;
-        }
-        buf.push(byte | 0x80);
-    }
-}
-
-/// Transpose columnar data into row-oriented RowBinary bytes.
-///
-/// `column_data` contains one `ColumnData` per column.
-/// Returns one `Vec<u8>` per row, suitable for `rowbinary::deserialize_row()`.
-pub(crate) fn transpose_to_rowbinary(column_data: Vec<ColumnData>, num_rows: u64) -> Vec<Vec<u8>> {
-    let n = num_rows as usize;
-    let mut rows = vec![Vec::new(); n];
-    for col in column_data {
-        for (row_idx, cell) in col.into_iter().enumerate().take(n) {
-            rows[row_idx].extend_from_slice(&cell);
-        }
-    }
-    rows
 }
 
 #[cfg(test)]
@@ -1697,16 +1704,12 @@ mod tests {
 
     #[test]
     fn parse_rejects_pathologically_deep_nesting() {
-        // A hostile server can send a deeply-nested type name to try to
-        // overflow the parser's recursive descent. The depth guard
-        // rejects it as unparseable rather than recursing.
         let deep = format!("{}UInt8{}", "Array(".repeat(1000), ")".repeat(1000));
         assert!(ColumnType::parse(&deep).is_none());
     }
 
     #[test]
     fn parse_accepts_realistic_nesting() {
-        // Comfortably within MAX_TYPE_PARSE_DEPTH.
         assert!(
             ColumnType::parse("Array(Map(String, Tuple(UInt8, Array(Nullable(String)))))")
                 .is_some()
@@ -1719,5 +1722,293 @@ mod tests {
         assert_eq!(max_paren_depth("Array(UInt8)"), 1);
         assert_eq!(max_paren_depth("Array(Array(UInt8))"), 2);
         assert_eq!(max_paren_depth("Tuple(UInt8, Array(String))"), 2);
+    }
+
+    /// One `LowCardinality(String)` block: version, flags, dictionary, indices.
+    fn lc_string(dict: &[&str], idx: &[u8]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&1u64.to_le_bytes());
+        p.extend_from_slice(&0x200u64.to_le_bytes()); // HAS_ADDITIONAL_KEYS | u8 indices
+        p.extend_from_slice(&(dict.len() as u64).to_le_bytes());
+        for s in dict {
+            p.push(u8::try_from(s.len()).expect("test strings stay under 128 bytes"));
+            p.extend_from_slice(s.as_bytes());
+        }
+        p.extend_from_slice(&(idx.len() as u64).to_le_bytes());
+        p.extend_from_slice(idx);
+        p
+    }
+
+    /// `(type name, wire bytes, row count)`: the reader must consume every byte
+    /// listed and no more, so a desync inside one column shows up here rather
+    /// than as a corrupt column later in the block.
+    fn byte_exact_cases() -> Vec<(&'static str, Vec<u8>, u64)> {
+        vec![
+            ("UInt8", vec![1, 2, 3], 3),
+            ("Int64", vec![0u8; 16], 2),
+            ("Float64", vec![0u8; 8], 1),
+            ("Decimal(18, 4)", vec![0u8; 8], 1),
+            ("Date", vec![0u8; 4], 2),
+            ("DateTime64(3, 'UTC')", vec![0u8; 8], 1),
+            ("UUID", vec![0u8; 16], 1),
+            ("IPv4", vec![0u8; 4], 1),
+            ("IPv6", vec![0u8; 16], 1),
+            ("Point", vec![0u8; 32], 2),
+            ("String", vec![1, b'a', 0, 2, b'b', b'c'], 3),
+            ("FixedString(3)", b"abcdef".to_vec(), 2),
+            ("Nullable(UInt8)", vec![0, 1, 7, 0], 2),
+            (
+                "LowCardinality(String)",
+                lc_string(&["a", "b"], &[0, 1, 0]),
+                3,
+            ),
+            (
+                "LowCardinality(Nullable(String))",
+                lc_string(&["", "x"], &[0, 1]),
+                2,
+            ),
+            // Two rows of two u64 elements each.
+            (
+                "Array(UInt64)",
+                {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&1u64.to_le_bytes());
+                    p.extend_from_slice(&2u64.to_le_bytes());
+                    p.extend_from_slice(&[0u8; 16]);
+                    p
+                },
+                2,
+            ),
+            // One row of one (UInt8, String) pair.
+            (
+                "Array(Tuple(UInt8, String))",
+                {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&1u64.to_le_bytes());
+                    p.push(9);
+                    p.extend_from_slice(&[1, b'z']);
+                    p
+                },
+                1,
+            ),
+            // One row of one String -> Nullable(UInt8) pair.
+            (
+                "Map(String, Nullable(UInt8))",
+                {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&1u64.to_le_bytes());
+                    p.extend_from_slice(&[1, b'k']);
+                    p.extend_from_slice(&[0, 5]);
+                    p
+                },
+                1,
+            ),
+            ("Variant(UInt8, String)", variant_payload(), 2),
+            ("Dynamic", dynamic_v2_payload(), 2),
+            ("Dynamic", dynamic_v3_payload(), 2),
+            ("JSON", json_v3_payload(), 2),
+            ("JSON", json_v2_payload(&[]), 2),
+            // The same block with one row spilled into shared data.
+            ("JSON", json_v2_payload(&[("x", "1")]), 2),
+        ]
+    }
+
+    /// JSON v2: version, one path, its Dynamic v2 header, discriminators and
+    /// data, then the `Array(Tuple(String, String))` shared-data section
+    /// carrying `spilled`.
+    fn json_v2_payload(spilled: &[(&str, &str)]) -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u64.to_le_bytes()); // JSON version
+        p.push(1); // varuint: one dynamic path
+        p.extend_from_slice(&[1, b'a']);
+        p.extend_from_slice(&2u64.to_le_bytes()); // Dynamic v2
+        p.push(1); // varuint: one declared type
+        p.extend_from_slice(&[5, b'U', b'I', b'n', b't', b'8']);
+        p.extend_from_slice(&0u64.to_le_bytes()); // basic discriminators
+        // sorted(["SharedVariant", "UInt8"]) puts UInt8 at index 1.
+        p.extend_from_slice(&[1, 255]);
+        p.push(8); // the one UInt8 value
+        // Shared data: cumulative offsets, then the paths, then the values.
+        p.extend_from_slice(&0u64.to_le_bytes());
+        p.extend_from_slice(&(spilled.len() as u64).to_le_bytes());
+        for (path, _) in spilled {
+            p.push(u8::try_from(path.len()).expect("test paths stay under 128 bytes"));
+            p.extend_from_slice(path.as_bytes());
+        }
+        for (_, value) in spilled {
+            p.push(u8::try_from(value.len()).expect("test values stay under 128 bytes"));
+            p.extend_from_slice(value.as_bytes());
+        }
+        p
+    }
+
+    /// `Variant(UInt8, String)`: mode word, discriminators, then each arm.
+    fn variant_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u64.to_le_bytes()); // basic discriminators
+        p.extend_from_slice(&[0, 1]); // row 0 = UInt8, row 1 = String
+        p.push(7); // the one UInt8
+        p.extend_from_slice(&[1, b'q']); // the one String
+        p
+    }
+
+    /// Dynamic v2: version, type count, names, mode word, discriminators, data.
+    /// `SharedVariant` sorts ahead of `UInt8`, so discriminator 1 is the `UInt8`.
+    fn dynamic_v2_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&2u64.to_le_bytes());
+        p.push(1); // varuint: one declared type
+        p.extend_from_slice(&[5, b'U', b'I', b'n', b't', b'8']);
+        p.extend_from_slice(&0u64.to_le_bytes()); // basic discriminators
+        p.extend_from_slice(&[1, 255]); // UInt8 then NULL
+        p.push(3); // the one UInt8 value
+        p
+    }
+
+    /// Dynamic v3: version, type count, names, then flat discriminators.
+    fn dynamic_v3_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&3u64.to_le_bytes());
+        p.push(1);
+        p.extend_from_slice(&[5, b'U', b'I', b'n', b't', b'8']);
+        p.extend_from_slice(&[0, 1]); // UInt8 then NULL (NULL == the type count)
+        p.push(4);
+        p
+    }
+
+    /// JSON v3: version, one path, the path's flattened Dynamic header, then
+    /// its discriminators and data.
+    fn json_v3_payload() -> Vec<u8> {
+        let mut p = Vec::new();
+        p.extend_from_slice(&3u64.to_le_bytes()); // JSON version
+        p.push(1); // varuint: one dynamic path
+        p.extend_from_slice(&[1, b'a']);
+        p.extend_from_slice(&3u64.to_le_bytes()); // flattened Dynamic version
+        p.push(1); // varuint: one type
+        p.extend_from_slice(&[5, b'U', b'I', b'n', b't', b'8']);
+        p.extend_from_slice(&[0, 1]); // UInt8 then NULL
+        p.push(6);
+        p
+    }
+
+    #[tokio::test]
+    async fn read_column_consumes_exactly_the_declared_bytes() {
+        for (type_name, wire, rows) in byte_exact_cases() {
+            let col_type =
+                ColumnType::parse(type_name).unwrap_or_else(|| panic!("{type_name} parses"));
+            let len = wire.len();
+            let mut cursor = std::io::Cursor::new(wire);
+            let cells = read_column(&mut cursor, &col_type, rows)
+                .await
+                .unwrap_or_else(|e| panic!("{type_name}: {e}"));
+            assert_eq!(
+                cursor.position(),
+                len as u64,
+                "{type_name} did not consume its whole payload"
+            );
+            assert_eq!(cells.len() as u64, rows, "{type_name} row count");
+        }
+    }
+
+    #[tokio::test]
+    async fn array_column_rejects_offsets_beyond_the_element_count() {
+        // Offsets [6, 5] step backwards, so row 1 would index past the elements
+        // the column actually carries.
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&6u64.to_le_bytes());
+        wire.extend_from_slice(&5u64.to_le_bytes());
+        wire.extend_from_slice(&[0u8; 5]);
+        let col_type = ColumnType::Array(Box::new(ColumnType::UInt8));
+        let err = read_column(&mut std::io::Cursor::new(wire), &col_type, 2)
+            .await
+            .expect_err("a backwards offset must reject");
+        assert!(err.to_string().contains("Array column offset"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn map_column_rejects_offsets_beyond_the_pair_count() {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&6u64.to_le_bytes());
+        wire.extend_from_slice(&5u64.to_le_bytes());
+        wire.extend_from_slice(&[0u8; 5]); // keys
+        wire.extend_from_slice(&[0u8; 5]); // values
+        let col_type = ColumnType::Map(Box::new(ColumnType::UInt8), Box::new(ColumnType::UInt8));
+        let err = read_column(&mut std::io::Cursor::new(wire), &col_type, 2)
+            .await
+            .expect_err("a backwards offset must reject");
+        assert!(err.to_string().contains("Map column offset"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn dynamic_v3_null_discriminator_is_skipped() {
+        // NULL is the type count itself in v3, so row 1 renders as `null` and
+        // consumes no value byte.
+        let col_type = ColumnType::Dynamic;
+        let cells = read_column(
+            &mut std::io::Cursor::new(dynamic_v3_payload()),
+            &col_type,
+            2,
+        )
+        .await
+        .expect("v3 payload decodes");
+        assert_eq!(cells[0], b"\x014".to_vec(), "row 0 is the UInt8 value");
+        assert_eq!(cells[1], b"\x04null".to_vec(), "row 1 is NULL");
+    }
+
+    #[tokio::test]
+    async fn a_zero_row_top_level_column_reads_no_bytes() {
+        // `NativeWriter` writes no payload for a zero-row block, the
+        // LowCardinality prefix included.
+        let col_type = ColumnType::LowCardinality(Box::new(ColumnType::String));
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        let cells = read_column(&mut cursor, &col_type, 0)
+            .await
+            .expect("a zero-row column reads nothing");
+        assert!(cells.is_empty());
+        assert_eq!(cursor.position(), 0);
+    }
+
+    #[test]
+    fn ipv6_renders_in_compressed_form() {
+        let mut raw = [0u8; 16];
+        raw[15] = 1;
+        let json = rowbinary_to_json(&raw, &ColumnType::IPv6);
+        assert_eq!(json, br#""::1""#.to_vec());
+    }
+
+    #[test]
+    fn ipv4_renders_in_dotted_quad_form() {
+        let raw = 0x0100_007fu32.to_le_bytes();
+        let json = rowbinary_to_json(&raw, &ColumnType::IPv4);
+        assert_eq!(json, br#""1.0.0.127""#.to_vec());
+    }
+
+    #[test]
+    fn date_and_datetime_render_as_bare_wire_integers() {
+        assert_eq!(
+            rowbinary_to_json(&1u16.to_le_bytes(), &ColumnType::Date),
+            b"1"
+        );
+        assert_eq!(
+            rowbinary_to_json(&1u32.to_le_bytes(), &ColumnType::DateTime),
+            b"1"
+        );
+    }
+
+    #[test]
+    fn fixed_string_renders_as_raw_bytes_with_no_length_prefix() {
+        let json = rowbinary_to_json(b"abc", &ColumnType::FixedString(3));
+        assert_eq!(json, br#""abc""#.to_vec());
+    }
+
+    #[test]
+    fn index_width_matches_the_server_ladder() {
+        // `getSmallestIndexesType(slots + 1)` keeps u8 up to 255 types.
+        assert_eq!(index_width(0), 1);
+        assert_eq!(index_width(254), 1);
+        assert_eq!(index_width(255), 1);
+        assert_eq!(index_width(256), 2);
+        assert_eq!(index_width(65_535), 2);
+        assert_eq!(index_width(65_536), 4);
     }
 }

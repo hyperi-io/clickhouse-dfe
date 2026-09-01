@@ -1,79 +1,39 @@
-//! ClickHouse Native columnar format primitive.
+//! `ClickHouse` Native columnar block format -- the `format=Native` payload
+//! encoding, independent of the transport that carries it.
 //!
-//! The Native format is ClickHouse's columnar block payload encoding
-//! (`format=Native` URL parameter, `Format::Native` constant). This
-//! module implements a transport-agnostic primitive: it reads and
-//! writes Native-format blocks against any
-//! [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] (or [`bytes::Buf`]/
-//! [`bytes::BufMut`]) source.
-//!
-//! # Why this is its own module (vs. `rowbinary`)
-//!
-//! Upstream's `src/rowbinary/` is row-oriented: every field of every
-//! row is dispatched through `serde::Serialize`. That works fine for
-//! small inserts but loses the perf benefits of ClickHouse's columnar
-//! layout, where each column is a contiguous run of typed values that
-//! the server can write into its merge tree without a server-side
+//! Upstream's `src/rowbinary/` is row-oriented; this module is the columnar
+//! primitive that lets the server write blocks into its merge tree without a
 //! rows-to-columns transpose.
-//!
-//! `src/native/` exists to provide the columnar primitive: bulk
-//! column-buffer writes using little-endian wire-format encoding
-//! (LLVM-optimised on x86_64 where the conversion is the identity;
-//! explicit byte-swap on big-endian hosts), amortised varint
-//! length-prefix writes for strings, sparse-column wire format.
-//! Explicit SIMD intrinsics are a deferred follow-up; the layout
-//! is designed to be amenable so adding them is mechanical.
 //!
 //! # Module map
 //!
-//! - [`block_info`]: per-block flags (sub-block, bucket num).
-//! - [`columns`]: typed column representations (numeric, string,
-//!   array, nullable, low-cardinality, map, ...) and their
-//!   serialise/deserialise impls.
-//! - [`sparse`]: sparse-column wire format (offset list +
-//!   non-default values) for columns the server emits as sparse.
-//! - [`encode`]: high-level INSERT-block encoder (HTTP and TCP
-//!   transports both feed bytes through this).
-//! - [`compression`]: LZ4 / ZSTD framing for native blocks.
-//! - [`io`]: extension traits over [`tokio::io::AsyncRead`]/
-//!   [`tokio::io::AsyncWrite`] adding ClickHouse-specific helpers (varint, length-
-//!   prefixed string, etc.). Also a synchronous bytes-based variant
-//!   for in-memory composition.
+//! - [`columns`]: type-name parser and the column reader that re-serialises
+//!   native cells as `RowBinary`.
+//! - [`encode`]: INSERT-block encoder, shared by the HTTP and TCP transports.
+//! - `decode`: SELECT-block decoder producing the typed column buffers
+//!   [`DecodedBlock`] carries.
+//! - [`sparse`]: sparse-column wire format (offset list + non-default values).
+//! - [`io`]: varint and length-prefixed-string helpers over
+//!   [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] and [`bytes::BufMut`].
 //!
-//! # Transport agnostic
-//!
-//! The Native format is **not** the TCP transport. The TCP transport in
-//! `src/tcp/` speaks a wire protocol that happens to use Native format
-//! for data blocks. HTTP can also carry Native-format blocks via the
-//! `format=Native` URL parameter. This module is the shared
-//! format-encoder/decoder both use.
+//! The TCP transport in `src/tcp/` is a separate wire protocol that happens to
+//! carry Native-format data blocks; HTTP carries the same blocks under
+//! `format=Native`.
 
-// The codec is complete, so some symbols have no in-tree caller when the
-// `tcp` feature is off.
-#![allow(dead_code)]
+// The reader and decoder exist for the TCP transport; a build without it
+// carries the codec with no in-tree caller. Scoped to that build so dead code
+// still warns in the default one.
+#![cfg_attr(not(feature = "tcp"), allow(dead_code))]
+// Every name in this module's docs is a Rust or wire type, so the crate-root
+// relaxation for README prose is reversed here.
+#![warn(clippy::doc_markdown)]
 
-pub mod block_info;
 pub mod columns;
-#[cfg(feature = "lz4")]
-pub mod compression;
 pub(crate) mod decode;
 pub mod encode;
 pub mod io;
 pub mod sparse;
 
-// Convenience re-exports. Callers composing `format=Native` request
-// bodies typically need these together.
-pub use block_info::BlockInfo;
 pub use columns::ColumnType;
-pub use encode::{ColumnSchema, encode_columns};
-
-// Decoder primitives -- in-tree consumers are the TCP cursor in
-// src/tcp/cursor.rs, the streaming actor in src/tcp/connection_actor.rs,
-// and the reader in src/tcp/reader.rs. `decode_block` stays
-// pub(crate) -- it's the reader sub-task's entry point and not
-// useful directly to external code -- but the decoded types are
-// part of the streaming surface that callers iterate, so they are
-// re-exported here.
-#[allow(unused_imports)]
-pub(crate) use decode::decode_block;
 pub use decode::{DecodedBlock, DecodedColumn, FromColumn};
+pub use encode::{ColumnSchema, encode_columns};

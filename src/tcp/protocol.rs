@@ -40,7 +40,6 @@ pub(crate) const DBMS_MIN_REVISION_WITH_OPENTELEMETRY: u64 = 54442;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_DISTRIBUTED_DEPTH: u64 = 54448;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_INITIAL_QUERY_START_TIME: u64 = 54449;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARALLEL_REPLICAS: u64 = 54453;
-pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CUSTOM_SERIALIZATION: u64 = 54454;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM: u64 = 54458;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_QUOTA_KEY: u64 = 54458;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS: u64 = 54459;
@@ -132,17 +131,6 @@ impl ServerPacketId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum QueryProcessingStage {
     Complete = 2,
-}
-
-/// Block compression method negotiated in the Query packet. Only `None`
-/// is wired this branch; `Lz4` / `Zstd` are filled in by the writer
-/// branch alongside the lz4/zstd feature gates.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum NativeCompressionMethod {
-    #[default]
-    None,
-    Lz4,
-    Zstd,
 }
 
 /// Chunked-protocol mode negotiation values, sent during the handshake

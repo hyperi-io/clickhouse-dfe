@@ -9,6 +9,9 @@
 //! Smoke tests. Nothing here opens a connection, so the suite is hermetic and
 //! needs no ClickHouse server.
 
+// The prose here names a product, not a code item.
+#![allow(clippy::doc_markdown)]
+
 /// The crates.io dependency is the only link to upstream, so a build that
 /// cannot reach `clickhouse::Client` has lost the thing this crate extends.
 #[test]

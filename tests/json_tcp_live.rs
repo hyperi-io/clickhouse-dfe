@@ -17,6 +17,9 @@
 //! ```
 
 #![cfg(all(feature = "tcp", feature = "tls", feature = "dynamic"))]
+// A panic in a live test IS the failure signal, and the helpers below sit
+// outside `#[test]` so clippy's in-test exemption does not reach them.
+#![allow(clippy::pedantic, clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::OnceLock;
 

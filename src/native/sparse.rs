@@ -1,10 +1,10 @@
-//! Sparse serialization for ClickHouse native protocol.
+//! Sparse serialization for `ClickHouse` native protocol.
 //!
 //! Optimization for columns with many default values -- only non-default values
 //! are stored along with their positions. Wire format:
 //!
-//! 1. Offsets: VarUInt group sizes (count of defaults before each non-default)
-//!    - Final group has `END_OF_GRANULE_FLAG` (2^62) ORed in
+//! 1. Offsets: `VarUInt` group sizes (count of defaults before each non-default)
+//!    - Final group has `END_OF_GRANULE_FLAG` (2^62) `ORed` in
 //! 2. Values: Only the non-default values
 //!
 //! Example: `[0, 0, 5, 0, 3, 0, 0, 0]` -> offsets [2, 1, 3|END], values [5, 3]
@@ -12,7 +12,7 @@
 use crate::error::Result;
 use crate::native::io::{ClickHouseBytesRead, ClickHouseRead};
 
-/// End-of-granule marker (bit 62). When set, this is the final VarUInt in the offsets stream.
+/// End-of-granule marker (bit 62). When set, this is the final `VarUInt` in the offsets stream.
 pub(crate) const END_OF_GRANULE_FLAG: u64 = 1 << 62;
 
 /// State for sparse deserialization across multiple reads.
@@ -29,6 +29,7 @@ pub(crate) struct SparseDeserializeState {
 /// Must loop until `END_OF_GRANULE_FLAG` -- can't stop early even if we have enough
 /// rows, or the stream will be misaligned for the next column.
 #[allow(clippy::cast_possible_truncation)]
+#[allow(dead_code)] // No caller until sparse columns are wired into the decoder.
 pub(crate) async fn read_sparse_offsets<R: ClickHouseRead>(
     reader: &mut R,
     num_rows: usize,

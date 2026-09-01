@@ -15,3 +15,8 @@ cognitive-complexity-threshold = 25
 type-complexity-threshold = 350
 
 too-many-lines-threshold = 150
+
+# A panic in a test IS the failure signal, so `unwrap_used` / `expect_used`
+# stay deny-level for library code only.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true

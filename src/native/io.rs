@@ -1,18 +1,164 @@
-//! Extension traits for reading/writing ClickHouse native wire protocol primitives.
+//! Extension traits for reading/writing `ClickHouse` native wire protocol primitives.
 //!
-//! Provides VarUInt and length-prefixed string encoding used by the native TCP protocol.
+//! Provides `VarUInt` and length-prefixed string encoding used by the native TCP protocol.
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{Error, Result};
 
-/// Hard cap on length-prefixed string and byte-array fields in the
-/// native wire format. 1 GiB matches the ClickHouse server's default
-/// `max_string_size` and protects against malformed/hostile data
-/// causing huge allocations on read.
-pub(crate) const MAX_STRING_SIZE: usize = 1 << 30;
+/// Hard cap on length-prefixed string and byte-array fields, matching the
+/// server's default `max_string_size`.
+pub(crate) const MAX_STRING_SIZE: u64 = 1 << 30;
 
-/// Extension trait on AsyncRead for ClickHouse wire protocol.
+/// A u64 needs at most 10 seven-bit groups (10 * 7 = 70 >= 64), which is
+/// also where the server's `readVarUInt` stops.
+pub(crate) const VAR_UINT_MAX_BYTES: usize = 10;
+
+/// Scratch buffer wide enough for any encoded `VarUInt`.
+type VarUintBuf = [u8; VAR_UINT_MAX_BYTES];
+
+/// Encode `value` into `buf`, returning the number of bytes written.
+fn encode_var_uint(mut value: u64, buf: &mut VarUintBuf) -> usize {
+    let mut pos = 0;
+    loop {
+        #[allow(clippy::cast_possible_truncation)]
+        let mut byte = (value & 0x7F) as u8;
+        value >>= 7;
+        if value > 0 {
+            byte |= 0x80;
+        }
+        buf[pos] = byte;
+        pos += 1;
+        if value == 0 {
+            return pos;
+        }
+    }
+}
+
+/// Incremental `VarUInt` decoder, fed one byte at a time.
+///
+/// The state is shared rather than the loop because the readers below take
+/// their bytes from an `AsyncRead`, a `bytes::Buf` and a plain slice.
+#[derive(Default)]
+struct VarUintDecoder {
+    out: u64,
+    index: usize,
+}
+
+impl VarUintDecoder {
+    /// Absorb one byte. `Ok(Some(v))` when the value is complete,
+    /// `Ok(None)` when more bytes are needed.
+    fn push(&mut self, octet: u8) -> Result<Option<u64>> {
+        self.out |= u64::from(octet & 0x7F) << (7 * self.index);
+        self.index += 1;
+        if (octet & 0x80) == 0 {
+            return Ok(Some(self.out));
+        }
+        // Stopping short of the ceiling would truncate values >= 2^63 and
+        // leave a legitimate final byte unconsumed, misaligning every later
+        // read.
+        if self.index == VAR_UINT_MAX_BYTES {
+            return Err(Self::overflow());
+        }
+        Ok(None)
+    }
+
+    fn overflow() -> Error {
+        Error::BadResponse("native protocol: varint continues past 10 bytes".into())
+    }
+}
+
+/// Decode a `VarUInt` from the front of `bytes`, returning the value and the
+/// byte count it consumed.
+///
+/// The sole slice decoder, so the 10-byte ceiling cannot drift from the two
+/// stream readers.
+///
+/// # Errors
+///
+/// [`Error::NotEnoughData`] if `bytes` ends mid-value, [`Error::BadResponse`]
+/// if the value runs past the ceiling.
+pub(crate) fn get_var_uint(bytes: &[u8]) -> Result<(u64, usize)> {
+    let mut decoder = VarUintDecoder::default();
+    for (i, &octet) in bytes.iter().enumerate() {
+        if let Some(value) = decoder.push(octet)? {
+            return Ok((value, i + 1));
+        }
+    }
+    Err(Error::NotEnoughData)
+}
+
+/// Reject a wire length above [`MAX_STRING_SIZE`], comparing in `u64` so a
+/// 32-bit host cannot truncate its way past the cap.
+fn checked_string_len(len: u64) -> Result<u64> {
+    if len > MAX_STRING_SIZE {
+        return Err(Error::BadResponse(format!(
+            "native protocol: string too large: {len} > {MAX_STRING_SIZE}"
+        )));
+    }
+    Ok(len)
+}
+
+/// [`checked_string_len`] narrowed to an allocation size.
+fn string_len_usize(len: u64) -> Result<usize> {
+    usize::try_from(checked_string_len(len)?).map_err(|_| {
+        Error::BadResponse(format!(
+            "native protocol: string length {len} exceeds platform usize"
+        ))
+    })
+}
+
+/// Empty `Vec<T>` with room for `cap` elements, allocated fallibly because
+/// `cap` derives from a server-controlled count.
+///
+/// # Errors
+///
+/// As [`zeroed`].
+pub(crate) fn with_cap<T>(cap: usize) -> Result<Vec<T>> {
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(cap)
+        .map_err(|_| alloc_refused(cap.saturating_mul(std::mem::size_of::<T>())))?;
+    Ok(buf)
+}
+
+fn alloc_refused(bytes: usize) -> Error {
+    Error::BadResponse(format!(
+        "native protocol: refused a {bytes}-byte column buffer the allocator could not back"
+    ))
+}
+
+/// Bytes claimed up front by [`read_exact_grown`] before any arrive.
+const READ_CHUNK: usize = 64 * 1024;
+
+/// Read exactly `len` bytes, growing the buffer as they arrive.
+///
+/// A declared length is not evidence the bytes exist, so the buffer commits
+/// memory only in proportion to what the stream delivers: a short or hostile
+/// length costs one chunk, not its full claim.
+///
+/// # Errors
+///
+/// [`Error::BadResponse`] when the allocator cannot back a chunk; I/O errors,
+/// an unexpected EOF included, propagate.
+pub(crate) async fn read_exact_grown<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    len: usize,
+) -> Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    let mut left = len;
+    while left > 0 {
+        let chunk = left.min(READ_CHUNK);
+        let start = buf.len();
+        buf.try_reserve(chunk)
+            .map_err(|_| alloc_refused(start.saturating_add(chunk)))?;
+        buf.resize(start + chunk, 0);
+        reader.read_exact(&mut buf[start..]).await?;
+        left -= chunk;
+    }
+    Ok(buf)
+}
+
+/// Extension trait on `AsyncRead` for `ClickHouse` wire protocol.
 pub(crate) trait ClickHouseRead: AsyncRead + Unpin + Send + Sync {
     fn read_var_uint(&mut self) -> impl Future<Output = Result<u64>> + Send + '_;
 
@@ -29,44 +175,23 @@ pub(crate) trait ClickHouseRead: AsyncRead + Unpin + Send + Sync {
 
 impl<T: AsyncRead + Unpin + Send + Sync> ClickHouseRead for T {
     async fn read_var_uint(&mut self) -> Result<u64> {
-        let mut out = 0u64;
-        // A u64 needs at most 10 seven-bit groups (10 * 7 = 70 >= 64);
-        // the server's `readVarUInt` loops to 10. The 10th byte carries
-        // only the high bit of the value. Stopping at 9 (as an earlier
-        // revision did) both truncated values >= 2^63 and, worse, left
-        // a legitimate 10th byte unconsumed -- misaligning every
-        // subsequent read.
-        for i in 0..10u64 {
+        let mut decoder = VarUintDecoder::default();
+        loop {
             let mut octet = [0u8];
             self.read_exact(&mut octet[..]).await?;
-            out |= u64::from(octet[0] & 0x7F) << (7 * i);
-            if (octet[0] & 0x80) == 0 {
-                return Ok(out);
+            if let Some(value) = decoder.push(octet[0])? {
+                return Ok(value);
             }
         }
-        Err(Error::BadResponse(
-            "native protocol: varint continues past 10 bytes".into(),
-        ))
     }
 
     async fn read_string(&mut self) -> Result<Vec<u8>> {
-        #[allow(clippy::cast_possible_truncation)]
-        let len = self.read_var_uint().await? as usize;
-        if len > MAX_STRING_SIZE {
-            return Err(Error::BadResponse(format!(
-                "native protocol: string too large: {len} > {MAX_STRING_SIZE}"
-            )));
-        }
-        if len == 0 {
-            return Ok(vec![]);
-        }
-        let mut buf = vec![0u8; len];
-        self.read_exact(&mut buf).await?;
-        Ok(buf)
+        let len = string_len_usize(self.read_var_uint().await?)?;
+        read_exact_grown(self, len).await
     }
 }
 
-/// Extension trait on AsyncWrite for ClickHouse wire protocol.
+/// Extension trait on `AsyncWrite` for `ClickHouse` wire protocol.
 pub(crate) trait ClickHouseWrite: AsyncWrite + Unpin + Send + Sync {
     fn write_var_uint(&mut self, value: u64) -> impl Future<Output = Result<()>> + Send + '_;
 
@@ -77,24 +202,10 @@ pub(crate) trait ClickHouseWrite: AsyncWrite + Unpin + Send + Sync {
 }
 
 impl<T: AsyncWrite + Unpin + Send + Sync> ClickHouseWrite for T {
-    async fn write_var_uint(&mut self, mut value: u64) -> Result<()> {
-        let mut buf = [0u8; 10]; // up to 10 bytes for the full u64 range
-        let mut pos = 0;
-
-        #[allow(clippy::cast_possible_truncation)]
-        while pos < 10 {
-            let mut byte = value & 0x7F;
-            value >>= 7;
-            if value > 0 {
-                byte |= 0x80;
-            }
-            buf[pos] = byte as u8;
-            pos += 1;
-            if value == 0 {
-                break;
-            }
-        }
-        self.write_all(&buf[..pos]).await?;
+    async fn write_var_uint(&mut self, value: u64) -> Result<()> {
+        let mut buf = VarUintBuf::default();
+        let len = encode_var_uint(value, &mut buf);
+        self.write_all(&buf[..len]).await?;
         Ok(())
     }
 
@@ -106,8 +217,10 @@ impl<T: AsyncWrite + Unpin + Send + Sync> ClickHouseWrite for T {
     }
 }
 
-/// Sync extension trait on `bytes::Buf` for ClickHouse wire protocol.
-#[allow(dead_code)] // Used as bound in read_sparse_offsets_sync (test-only path); kept for future sync readers
+/// Sync extension trait on `bytes::Buf` for `ClickHouse` wire protocol.
+///
+/// Bound of the sync sparse reader, which only tests drive today.
+#[allow(dead_code)]
 pub(crate) trait ClickHouseBytesRead: bytes::Buf {
     fn try_get_var_uint(&mut self) -> Result<u64>;
     fn try_get_string(&mut self) -> Result<bytes::Bytes>;
@@ -116,41 +229,20 @@ pub(crate) trait ClickHouseBytesRead: bytes::Buf {
 impl<T: bytes::Buf> ClickHouseBytesRead for T {
     #[inline]
     fn try_get_var_uint(&mut self) -> Result<u64> {
-        if !self.has_remaining() {
-            return Err(Error::NotEnoughData);
-        }
-        let b = self.get_u8();
-        let mut out = u64::from(b & 0x7F);
-        if (b & 0x80) == 0 {
-            return Ok(out);
-        }
-
-        for i in 1..10 {
+        let mut decoder = VarUintDecoder::default();
+        loop {
             if !self.has_remaining() {
                 return Err(Error::NotEnoughData);
             }
-            let b = self.get_u8();
-            out |= u64::from(b & 0x7F) << (7 * i);
-            if (b & 0x80) == 0 {
-                return Ok(out);
+            if let Some(value) = decoder.push(self.get_u8())? {
+                return Ok(value);
             }
         }
-
-        Err(Error::BadResponse(
-            "native protocol: varint continues past 10 bytes".into(),
-        ))
     }
 
     #[inline]
     fn try_get_string(&mut self) -> Result<bytes::Bytes> {
-        #[allow(clippy::cast_possible_truncation)]
-        let len = self.try_get_var_uint()? as usize;
-
-        if len > MAX_STRING_SIZE {
-            return Err(Error::BadResponse(format!(
-                "native protocol: string too large: {len}"
-            )));
-        }
+        let len = string_len_usize(self.try_get_var_uint()?)?;
 
         if len == 0 {
             return Ok(bytes::Bytes::new());
@@ -164,32 +256,19 @@ impl<T: bytes::Buf> ClickHouseBytesRead for T {
     }
 }
 
-/// Sync extension trait on `bytes::BufMut` for ClickHouse wire protocol.
+/// Sync extension trait on `bytes::BufMut` for `ClickHouse` wire protocol.
 pub trait ClickHouseBytesWrite: bytes::BufMut {
+    /// Append `value` as a `VarUInt`.
     fn put_var_uint(&mut self, value: u64);
+    /// Append `value` as a `VarUInt` length followed by its bytes.
     fn put_string<V: AsRef<[u8]>>(&mut self, value: V);
 }
 
 impl<T: bytes::BufMut> ClickHouseBytesWrite for T {
-    fn put_var_uint(&mut self, mut value: u64) {
-        let mut buf = [0u8; 10];
-        let mut pos = 0;
-
-        #[allow(clippy::cast_possible_truncation)]
-        while pos < 10 {
-            let mut byte = value & 0x7F;
-            value >>= 7;
-            if value > 0 {
-                byte |= 0x80;
-            }
-            buf[pos] = byte as u8;
-            pos += 1;
-            if value == 0 {
-                break;
-            }
-        }
-
-        self.put_slice(&buf[..pos]);
+    fn put_var_uint(&mut self, value: u64) {
+        let mut buf = VarUintBuf::default();
+        let len = encode_var_uint(value, &mut buf);
+        self.put_slice(&buf[..len]);
     }
 
     fn put_string<V: AsRef<[u8]>>(&mut self, value: V) {
@@ -302,6 +381,31 @@ mod tests {
             "expected BadResponse, got {err:?}"
         );
         assert!(err.to_string().contains("past 10 bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn string_len_boundary_is_inclusive() {
+        assert_eq!(
+            checked_string_len(MAX_STRING_SIZE).expect("the cap itself is accepted"),
+            MAX_STRING_SIZE
+        );
+        let err = checked_string_len(MAX_STRING_SIZE + 1).expect_err("one past the cap rejects");
+        assert!(err.to_string().contains("string too large"), "{err}");
+    }
+
+    #[test]
+    fn get_var_uint_shares_the_ten_byte_ceiling() {
+        assert_eq!(get_var_uint(&[0x00]).expect("zero decodes"), (0, 1));
+        assert_eq!(get_var_uint(&[0xAC, 0x02]).expect("decodes"), (300, 2));
+        // A value that never clears its continuation bit fails at the ceiling,
+        // the same place the two stream readers stop.
+        let err = get_var_uint(&[0x81u8; 12]).expect_err("an over-long varint rejects");
+        assert!(err.to_string().contains("past 10 bytes"), "{err}");
+        // Running out of bytes mid-value is a distinct, recoverable outcome.
+        assert!(matches!(
+            get_var_uint(&[0x81, 0x81]),
+            Err(Error::NotEnoughData)
+        ));
     }
 
     #[test]
