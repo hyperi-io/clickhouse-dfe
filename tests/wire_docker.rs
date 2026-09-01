@@ -8,13 +8,12 @@
 
 //! Type-matrix proof against a real server, not a mock.
 //!
-//! One container per test binary, pinned to the version the devex cluster
-//! runs. The server builds every value, so a failure here is this crate's
-//! decoder rather than its encoder; the encoder is covered separately by the
-//! live suites.
+//! One container per test, pinned to the version the devex cluster runs and
+//! stopped before the test returns. The server builds every value, so a
+//! failure here is this crate's decoder rather than its encoder; the encoder
+//! is covered separately, and by one test that uses the server as its oracle.
 //!
-//! Run with `--test-threads=1`: the tests share one container and one
-//! database.
+//! Run with `--test-threads=1`: one ClickHouse at a time on the host.
 //!
 //! ```text
 //! cargo test --all-features --test wire_docker -- --include-ignored --test-threads=1
@@ -29,7 +28,6 @@ use std::time::Duration;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
-use tokio::sync::OnceCell;
 
 use clickhouse::Client;
 use clickhouse_dfe::native::DecodedBlock;
@@ -42,41 +40,59 @@ const IMAGE_TAG: &str = "26.3.21.7";
 const CONTAINER_MEMORY_BYTES: i64 = 2 * 1024 * 1024 * 1024;
 
 struct Server {
-    _container: ContainerAsync<GenericImage>,
+    container: ContainerAsync<GenericImage>,
     native_port: u16,
     http_port: u16,
 }
 
-static SERVER: OnceCell<Server> = OnceCell::const_new();
-
-async fn server() -> &'static Server {
-    SERVER
-        .get_or_init(|| async {
-            // No log wait: the image writes one line to stdout and its trace
-            // to a file, so no message on that stream marks readiness.
-            // Readiness is the ping loop below; testcontainers' own
-            // `http_wait` would cost a reqwest dependency for one poll.
-            let container = GenericImage::new("clickhouse/clickhouse-server", IMAGE_TAG)
-                .with_exposed_port(9000.tcp())
-                .with_exposed_port(8123.tcp())
-                .with_wait_for(WaitFor::Nothing)
-                .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
-                .with_host_config_modifier(|host| host.memory = Some(CONTAINER_MEMORY_BYTES))
-                .with_startup_timeout(Duration::from_secs(120))
-                .start()
-                .await
-                .expect("the pinned ClickHouse image starts");
-            let native_port = container.get_host_port_ipv4(9000).await.unwrap();
-            let http_port = container.get_host_port_ipv4(8123).await.unwrap();
-            let server = Server {
-                _container: container,
-                native_port,
-                http_port,
-            };
-            await_ready(&server).await;
-            server
-        })
+/// Start a server for ONE test, ready to answer on both ports.
+///
+/// Owned by the test and stopped when it returns. A `static` shared across
+/// the binary would be faster, and was the first shape of this: a `static` is
+/// never dropped at process exit, so every run left a server behind.
+/// `testcontainers`' `watchdog` does not cover a normal exit either.
+async fn server() -> Server {
+    // No log wait: the image writes one line to stdout and its trace to a
+    // file, so no message on that stream marks readiness. Readiness is the
+    // ping loop below; testcontainers' own `http_wait` would cost a reqwest
+    // dependency for one poll.
+    let container = GenericImage::new("clickhouse/clickhouse-server", IMAGE_TAG)
+        .with_exposed_port(9000.tcp())
+        .with_exposed_port(8123.tcp())
+        .with_wait_for(WaitFor::Nothing)
+        .with_env_var("CLICKHOUSE_SKIP_USER_SETUP", "1")
+        .with_host_config_modifier(|host| host.memory = Some(CONTAINER_MEMORY_BYTES))
+        .with_startup_timeout(Duration::from_secs(120))
+        .start()
         .await
+        .expect("the pinned ClickHouse image starts");
+    let native_port = container.get_host_port_ipv4(9000).await.unwrap();
+    let http_port = container.get_host_port_ipv4(8123).await.unwrap();
+    let server = Server {
+        container,
+        native_port,
+        http_port,
+    };
+    await_ready(&server).await;
+    server
+}
+
+impl Server {
+    fn tcp(&self) -> UnifiedClient {
+        UnifiedClient::Tcp(TcpClient::new(format!("127.0.0.1:{}", self.native_port)))
+    }
+
+    fn http(&self) -> UnifiedClient {
+        UnifiedClient::Http(
+            Client::default().with_url(format!("http://127.0.0.1:{}", self.http_port)),
+        )
+    }
+
+    /// Stop the container. `Drop` also stops it, but an explicit call keeps
+    /// the teardown on the test's own timeline rather than a background task.
+    async fn stop(self) {
+        let _ = self.container.rm().await;
+    }
 }
 
 /// Poll until the server answers on both ports, so a test never races the
@@ -97,16 +113,6 @@ async fn await_ready(server: &Server) {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     panic!("the server never answered on both ports; last error: {last}");
-}
-
-async fn tcp() -> UnifiedClient {
-    let s = server().await;
-    UnifiedClient::Tcp(TcpClient::new(format!("127.0.0.1:{}", s.native_port)))
-}
-
-async fn http() -> UnifiedClient {
-    let s = server().await;
-    UnifiedClient::Http(Client::default().with_url(format!("http://127.0.0.1:{}", s.http_port)))
 }
 
 /// One matrix row: a column type and the SQL that produces its values. The
@@ -265,8 +271,8 @@ fn rendered(columns: &Columns, name: &str) -> Result<String, String> {
 #[tokio::test]
 #[ignore = "needs Docker -- see the module docs"]
 async fn every_type_decodes_identically_on_both_transports() {
-    let tcp = tcp().await;
-    let http = http().await;
+    let server = server().await;
+    let (tcp, http) = (server.tcp(), server.http());
     tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
         .await
         .unwrap();
@@ -285,6 +291,8 @@ async fn every_type_decodes_identically_on_both_transports() {
         }
     }
 
+    // Stop before asserting: a panic would skip the teardown.
+    server.stop().await;
     assert!(
         failures.is_empty(),
         "{} cases failed:\n{}",
@@ -347,7 +355,8 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
     use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
 
     const TYPE: &str = "Array(LowCardinality(String))";
-    let client = tcp().await;
+    let server = server().await;
+    let client = server.tcp();
     client
         .execute("CREATE DATABASE IF NOT EXISTS wire")
         .await
@@ -391,11 +400,79 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
         .await
         .expect("read back what this crate wrote");
 
-    assert_eq!(
+    let (by_encoder, by_server) = (
         rendered(&by_encoder, "c").unwrap(),
         rendered(&by_server, "c").unwrap(),
+    );
+    server.stop().await;
+    assert_eq!(
+        by_encoder, by_server,
         "this crate's encoder must lay out {TYPE} the way the server does"
     );
+}
+
+/// A `MergeTree` column that is almost all defaults, merged into one part, is
+/// stored with sparse serialisation. Real tables look like this.
+///
+/// This passes, but it does NOT yet prove the sparse form reached the wire:
+/// the server may have materialised the column before sending, and this
+/// decoder rejects a non-zero custom-serialization flag outright, so it would
+/// have failed loudly if it had. Proving the wire form needs the flag
+/// observed, not just the values -- see S5.T4 step 3.
+#[tokio::test]
+#[ignore = "needs Docker -- see the module docs"]
+async fn a_sparse_column_reads_back_on_both_transports() {
+    const TOTAL: &str = "SELECT sum(c) AS total FROM wire.sparse";
+    // The column itself, where the sparse serialisation reaches the wire
+    // rather than being collapsed by an aggregate.
+    const RAW: &str = "SELECT c FROM wire.sparse ORDER BY n LIMIT 6000";
+
+    let server = server().await;
+    let client = server.tcp();
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    // The default ratio is 0.95; 1 non-default row in 10,000 is well under it.
+    client
+        .execute(
+            "CREATE OR REPLACE TABLE wire.sparse (n UInt64, c UInt64) \
+             ENGINE = MergeTree ORDER BY n \
+             SETTINGS ratio_of_defaults_for_sparse_serialization = 0.9",
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO wire.sparse \
+             SELECT number, if(number = 5000, 42, 0) FROM system.numbers LIMIT 10000",
+        )
+        .await
+        .unwrap();
+    client
+        .execute("OPTIMIZE TABLE wire.sparse FINAL")
+        .await
+        .unwrap();
+
+    let over_tcp = client.fetch_columns(TOTAL).await.expect("tcp reads it");
+    let over_http = server
+        .http()
+        .fetch_columns(TOTAL)
+        .await
+        .expect("http reads it");
+    let values = client
+        .fetch_columns(RAW)
+        .await
+        .expect("tcp reads the column")
+        .get::<u64>("c")
+        .unwrap();
+
+    server.stop().await;
+    assert_eq!(over_tcp.get::<u64>("total").unwrap(), [42]);
+    assert_eq!(over_http.get::<u64>("total").unwrap(), [42]);
+    assert_eq!(values.len(), 6000);
+    assert_eq!(values[5000], 42, "the one non-default row");
+    assert_eq!(values[0], 0);
 }
 
 /// A result set the server splits into several blocks must read back whole
@@ -405,18 +482,17 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
 async fn a_multi_block_result_reads_back_whole_and_in_order() {
     const SQL: &str = "SELECT number AS n FROM system.numbers LIMIT 200000";
 
-    let over_tcp = tcp().await.fetch_columns(SQL).await.unwrap();
-    let over_http = http().await.fetch_columns(SQL).await.unwrap();
-
+    let server = server().await;
+    let over_tcp = server.tcp().fetch_columns(SQL).await.unwrap();
+    let over_http = server.http().fetch_columns(SQL).await.unwrap();
     let ns = over_tcp.get::<u64>("n").unwrap();
+    let http_ns = over_http.get::<u64>("n").unwrap();
+    server.stop().await;
+
     assert_eq!(ns.len(), 200_000, "every row must arrive");
     assert_eq!(ns[0], 0);
     assert_eq!(ns[199_999], 199_999);
-    assert_eq!(
-        over_http.get::<u64>("n").unwrap(),
-        ns,
-        "transports disagree"
-    );
+    assert_eq!(http_ns, ns, "transports disagree");
 }
 
 /// An exception raised part-way through a result set must surface as an
@@ -426,11 +502,13 @@ async fn a_multi_block_result_reads_back_whole_and_in_order() {
 async fn a_mid_stream_exception_surfaces_rather_than_truncating() {
     const SQL: &str = "SELECT throwIf(number = 50000) FROM system.numbers LIMIT 100000";
 
-    let err = tcp()
-        .await
+    let server = server().await;
+    let err = server
+        .tcp()
         .fetch_columns(SQL)
         .await
         .expect_err("the server throws part-way through");
+    server.stop().await;
     assert!(
         format!("{err}").contains("Value passed to 'throwIf'"),
         "the server's own message must reach the caller: {err}"
@@ -442,11 +520,12 @@ async fn a_mid_stream_exception_surfaces_rather_than_truncating() {
 #[tokio::test]
 #[ignore = "needs Docker -- see the module docs"]
 async fn a_failed_query_leaves_the_connection_usable() {
-    let client = tcp().await;
-    let _ = client
-        .fetch_columns("SELECT * FROM wire.no_such_table")
-        .await;
+    let server = server().await;
+    let client = server.tcp();
+    let _ = client.fetch_columns("SELECT * FROM no_such_table").await;
 
     let ok = client.fetch_columns("SELECT 1 AS n").await.unwrap();
-    assert_eq!(ok.get::<u8>("n").unwrap(), [1]);
+    let n = ok.get::<u8>("n").unwrap();
+    server.stop().await;
+    assert_eq!(n, [1]);
 }
