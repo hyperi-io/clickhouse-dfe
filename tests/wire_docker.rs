@@ -125,6 +125,10 @@ struct Case {
     /// reason. The case is then asserted to FAIL, so fixing the codec fails
     /// this test until the marker is removed -- a marker cannot rot into a
     /// silently skipped type.
+    ///
+    /// Empty today. It earned its keep on the nested-prefix defect: four
+    /// shapes carried a marker, and each fix took one off by failing the
+    /// suite rather than passing quietly.
     known_broken: Option<&'static str>,
 }
 
@@ -136,21 +140,6 @@ const fn case(ch_type: &'static str, values: &'static [&'static str]) -> Case {
         known_broken: None,
     }
 }
-
-/// `NativeWriter.cpp:93-94` serialises EVERY nested prefix for a column
-/// before any of its data, while this codec reads and writes each prefix
-/// inline where the child sits. The two orders coincide until an enclosing
-/// type writes data of its own first: a `Tuple` writes nothing before its
-/// fields and round-trips, an `Array` writes its offsets and pushes the
-/// child's prefix out of place. Fixing it means a prefix phase and a data
-/// phase in both directions, mirroring
-/// `ISerialization::serializeBinaryBulkStatePrefix`.
-///
-/// `LowCardinality` is done -- its prefix is a fixed version word the reader
-/// hoists. `Dynamic` and `Variant` carry variable-length prefixes the data
-/// phase reads values out of, so they still go inline.
-const PREFIX_PHASE: &str =
-    "Dynamic/Variant prefixes are not split from data (NativeWriter.cpp:93-94)";
 
 const CASES: &[Case] = &[
     case("UInt8", &["0", "255"]),
@@ -237,11 +226,7 @@ const CASES: &[Case] = &[
     // pushes the child's prefix out of place.
     case("Tuple(LowCardinality(String), UInt8)", &["('a', 1)"]),
     case("Array(JSON)", &[r#"['{"a":1}']"#, "[]"]),
-    Case {
-        ch_type: "Array(Dynamic)",
-        values: &["['x', 42::UInt64]", "[]"],
-        known_broken: Some(PREFIX_PHASE),
-    },
+    case("Array(Dynamic)", &["['x', 42::UInt64]", "[]"]),
     case("Array(Variant(UInt64, String))", &["['x'::String]", "[]"]),
 ];
 

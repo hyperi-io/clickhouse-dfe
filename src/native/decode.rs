@@ -630,10 +630,12 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
             Some(ct) => {
                 // A header block declares its columns and carries no bytes
                 // for any of them, the serialisation prefix included.
+                let mut prefixes = Vec::new();
                 if num_rows > 0 {
-                    decode_prefixes(r, &ct, 0).await?;
+                    decode_prefixes(r, &ct, 0, &mut prefixes).await?;
                 }
-                decode_column(r, &ct, num_rows, server_revision, 0).await?
+                let mut headers = prefixes.into_iter();
+                decode_column(r, &ct, num_rows, server_revision, 0, &mut headers).await?
             }
             None => {
                 // The stream pointer cannot advance past a type of unknown
@@ -673,6 +675,7 @@ fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
     r: &'a mut R,
     col_type: &'a ColumnType,
     depth: usize,
+    headers: &'a mut Vec<columns::DynamicHeader>,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         if depth > MAX_DECODE_DEPTH {
@@ -691,22 +694,39 @@ fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
             ColumnType::Variant(variant_types) => {
                 columns::read_variant_mode(r).await?;
                 for variant in variant_types {
-                    decode_prefixes(r, variant, depth + 1).await?;
+                    decode_prefixes(r, variant, depth + 1, headers).await?;
                 }
             }
             ColumnType::Nullable(inner)
             | ColumnType::Array(inner)
             | ColumnType::SimpleAggregateFunction(inner) => {
-                decode_prefixes(r, inner, depth + 1).await?;
+                decode_prefixes(r, inner, depth + 1, headers).await?;
             }
             ColumnType::Tuple(fields) => {
                 for field in fields {
-                    decode_prefixes(r, field, depth + 1).await?;
+                    decode_prefixes(r, field, depth + 1, headers).await?;
                 }
             }
             ColumnType::Map(key, value) => {
-                decode_prefixes(r, key, depth + 1).await?;
-                decode_prefixes(r, value, depth + 1).await?;
+                decode_prefixes(r, key, depth + 1, headers).await?;
+                decode_prefixes(r, value, depth + 1, headers).await?;
+            }
+            // `SerializationDynamic.cpp:128-168`: the structure version, then
+            // the type list, then the inner Variant's mode. The type list is
+            // the one prefix a data phase reads values back out of, so it is
+            // carried rather than just consumed.
+            ColumnType::Dynamic => {
+                let version = r.read_u64_le().await?;
+                let has_max_types = match version {
+                    1 => true,
+                    2 => false,
+                    other => {
+                        return Err(Error::BadResponse(format!(
+                            "native: unsupported Dynamic serialization version: {other}"
+                        )));
+                    }
+                };
+                headers.push(columns::read_dynamic_v1v2_prefix(r, has_max_types).await?);
             }
             _ => {}
         }
@@ -839,6 +859,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
     num_rows: u64,
     server_revision: u64,
     depth: usize,
+    headers: &'a mut std::vec::IntoIter<columns::DynamicHeader>,
 ) -> Pin<Box<dyn std::future::Future<Output = Result<DecodedColumn>> + Send + 'a>> {
     Box::pin(async move {
         if depth > MAX_DECODE_DEPTH {
@@ -984,7 +1005,8 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
             }
             ColumnType::Nullable(inner) => {
                 let mask = read_exact_grown(r, n).await?;
-                let child = decode_column(r, inner, num_rows, server_revision, depth + 1).await?;
+                let child =
+                    decode_column(r, inner, num_rows, server_revision, depth + 1, headers).await?;
                 Ok(DecodedColumn::Nullable {
                     mask,
                     child: Box::new(child),
@@ -1004,7 +1026,8 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                     offsets.push(end);
                 }
                 let total = offsets.last().copied().unwrap_or(0);
-                let child = decode_column(r, inner, total, server_revision, depth + 1).await?;
+                let child =
+                    decode_column(r, inner, total, server_revision, depth + 1, headers).await?;
                 Ok(DecodedColumn::Array {
                     offsets,
                     child: Box::new(child),
@@ -1013,8 +1036,10 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
             ColumnType::Tuple(fields) => {
                 let mut decoded_fields = with_cap(fields.len())?;
                 for field in fields {
-                    decoded_fields
-                        .push(decode_column(r, field, num_rows, server_revision, depth + 1).await?);
+                    decoded_fields.push(
+                        decode_column(r, field, num_rows, server_revision, depth + 1, headers)
+                            .await?,
+                    );
                 }
                 Ok(DecodedColumn::Tuple(decoded_fields))
             }
@@ -1032,8 +1057,10 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                     offsets.push(end);
                 }
                 let total = offsets.last().copied().unwrap_or(0);
-                let keys = decode_column(r, key_type, total, server_revision, depth + 1).await?;
-                let values = decode_column(r, val_type, total, server_revision, depth + 1).await?;
+                let keys =
+                    decode_column(r, key_type, total, server_revision, depth + 1, headers).await?;
+                let values =
+                    decode_column(r, val_type, total, server_revision, depth + 1, headers).await?;
                 Ok(DecodedColumn::Map {
                     offsets,
                     keys: Box::new(keys),
@@ -1041,11 +1068,12 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 })
             }
             ColumnType::LowCardinality(inner) => {
-                decode_low_cardinality(r, inner, num_rows, server_revision, depth + 1).await
+                decode_low_cardinality(r, inner, num_rows, server_revision, depth + 1, headers)
+                    .await
             }
             ColumnType::SimpleAggregateFunction(inner) => {
                 // Wire-compatible with the inner type T.
-                decode_column(r, inner, num_rows, server_revision, depth + 1).await
+                decode_column(r, inner, num_rows, server_revision, depth + 1, headers).await
             }
             ColumnType::NewJson => {
                 let version = r.read_u64_le().await?;
@@ -1061,8 +1089,18 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 let cells = columns::read_json_body(r, n, version).await?;
                 Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
-            ColumnType::Variant(_) | ColumnType::Dynamic => {
+            ColumnType::Variant(_) => {
                 let cells = columns::read_column_data(r, col_type, num_rows).await?;
+                Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
+            }
+            // The type list came off the wire in the prefix phase, in this
+            // same tree order, so the header at the front of the queue is
+            // this column's.
+            ColumnType::Dynamic => {
+                let header = headers.next().ok_or_else(|| {
+                    Error::BadResponse("native: Dynamic column has no serialisation prefix".into())
+                })?;
+                let cells = columns::read_dynamic_v1v2_body(r, n, &header, depth + 1).await?;
                 Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
             // BFloat16, Time, Time64 and Point have no typed variant yet; the
@@ -1095,6 +1133,7 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
     num_rows: u64,
     server_revision: u64,
     depth: usize,
+    headers: &mut std::vec::IntoIter<columns::DynamicHeader>,
 ) -> Result<DecodedColumn> {
     let n = usize::try_from(num_rows).map_err(|_| {
         Error::BadResponse(format!(
@@ -1136,8 +1175,15 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
         ));
     }
     let additional_keys_size = r.read_u64_le().await?;
-    let combined =
-        decode_column(r, dict_type, additional_keys_size, server_revision, depth).await?;
+    let combined = decode_column(
+        r,
+        dict_type,
+        additional_keys_size,
+        server_revision,
+        depth,
+        headers,
+    )
+    .await?;
 
     let num_indices = r.read_u64_le().await?;
     if num_indices != num_rows {
@@ -1519,7 +1565,9 @@ mod tests {
             ct = ColumnType::Array(Box::new(ct));
         }
         let mut cur = Cursor::new(Vec::new());
-        let err = decode_column(&mut cur, &ct, 0, REV, 1).await.unwrap_err();
+        let err = decode_column(&mut cur, &ct, 0, REV, 1, &mut Vec::new().into_iter())
+            .await
+            .unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("nesting"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
@@ -1536,7 +1584,9 @@ mod tests {
         bytes.extend_from_slice(&0u64.to_le_bytes()); // flags = 0
         let ct = ColumnType::LowCardinality(Box::new(ColumnType::String));
         let mut cur = Cursor::new(bytes);
-        let err = decode_column(&mut cur, &ct, 1, REV, 0).await.unwrap_err();
+        let err = decode_column(&mut cur, &ct, 1, REV, 0, &mut Vec::new().into_iter())
+            .await
+            .unwrap_err();
         match err {
             Error::BadResponse(msg) => assert!(msg.contains("neither"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
