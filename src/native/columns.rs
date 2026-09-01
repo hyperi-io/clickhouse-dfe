@@ -488,6 +488,11 @@ const MAX_JSON_PATHS: usize = 1 << 16;
 ///
 /// [`Error::BadResponse`] for a malformed header, an offset list that steps
 /// backwards, or a wire count above its cap; I/O errors propagate untouched.
+/// Test-only since the prefix phase moved: production reads go through
+/// [`crate::native::decode`], which runs one prefix walk over the whole
+/// column and then calls [`read_column_data`]. This pairs the two here so the
+/// byte-exactness table can drive a payload that carries its own prefix.
+#[cfg(test)]
 pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
     reader: &'a mut R,
     col_type: &'a ColumnType,
@@ -501,12 +506,31 @@ pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
     })
 }
 
+/// The data phase alone, for a caller that has already run [`read_prefixes`]
+/// over the whole column.
+///
+/// [`crate::native::decode`] is that caller: its `Array` arm reads the offsets
+/// before it delegates the child here, so a prefix walk starting at this
+/// point would already be too late. It runs one walk over the whole column
+/// first and then calls this.
+///
+/// # Errors
+///
+/// As [`read_column`].
+pub(crate) fn read_column_data<'a, R: ClickHouseRead + 'a>(
+    reader: &'a mut R,
+    col_type: &'a ColumnType,
+    num_rows: u64,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ColumnData>> + Send + 'a>> {
+    read_column_at(reader, col_type, num_rows, 0)
+}
+
 /// Consume the serialisation prefixes for `col_type`'s whole tree, in the
 /// order the server writes them.
 ///
 /// Mirrors [`crate::native::decode`]'s own prefix phase; see the rationale
-/// there. `LowCardinality` alone is hoisted, because its prefix is a fixed
-/// 8-byte version this reader discards.
+/// there. Test-only for the same reason as [`read_column`].
+#[cfg(test)]
 fn read_prefixes<'a, R: ClickHouseRead + 'a>(
     reader: &'a mut R,
     col_type: &'a ColumnType,
@@ -525,6 +549,15 @@ fn read_prefixes<'a, R: ClickHouseRead + 'a>(
             // recurse into the inner type.
             ColumnType::LowCardinality(_) => {
                 let _version = reader.read_u64_le().await?;
+            }
+            // `SerializationVariant.cpp:161-182`: the discriminator mode,
+            // then every element's prefix. The mode is only validated, never
+            // carried, so hoisting it needs no state.
+            ColumnType::Variant(variant_types) => {
+                read_variant_mode(reader).await?;
+                for variant in variant_types {
+                    read_prefixes(reader, variant, depth + 1).await?;
+                }
             }
             ColumnType::Nullable(inner)
             | ColumnType::Array(inner)
@@ -931,8 +964,8 @@ async fn read_variant_column<R: ClickHouseRead>(
         )));
     }
 
-    read_variant_mode(reader).await?;
-
+    // The mode word is not read here: it is this column's serialisation
+    // prefix, consumed by `read_prefixes` before any of the column's data.
     let discriminators = read_exact_grown(reader, n).await?;
 
     let mut type_counts = vec![0u64; k];
@@ -976,7 +1009,7 @@ const NULL_DISCRIMINATOR: u8 = 255;
 const VARIANT_MODE_BASIC: u64 = 0;
 
 /// Read and check the `Variant` discriminator-serialization mode.
-async fn read_variant_mode<R: ClickHouseRead>(reader: &mut R) -> Result<()> {
+pub(crate) async fn read_variant_mode<R: ClickHouseRead>(reader: &mut R) -> Result<()> {
     use tokio::io::AsyncReadExt as _;
 
     let mode = reader.read_u64_le().await?;

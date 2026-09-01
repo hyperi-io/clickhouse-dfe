@@ -686,6 +686,14 @@ fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
             ColumnType::LowCardinality(_) => {
                 let _version = r.read_u64_le().await?;
             }
+            // `SerializationVariant.cpp:161-182`: the discriminator mode,
+            // then every element's prefix.
+            ColumnType::Variant(variant_types) => {
+                columns::read_variant_mode(r).await?;
+                for variant in variant_types {
+                    decode_prefixes(r, variant, depth + 1).await?;
+                }
+            }
             ColumnType::Nullable(inner)
             | ColumnType::Array(inner)
             | ColumnType::SimpleAggregateFunction(inner) => {
@@ -1054,7 +1062,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
             ColumnType::Variant(_) | ColumnType::Dynamic => {
-                let cells = columns::read_column(r, col_type, num_rows).await?;
+                let cells = columns::read_column_data(r, col_type, num_rows).await?;
                 Ok(DecodedColumn::Json(unwrap_json_cells(cells)?))
             }
             // BFloat16, Time, Time64 and Point have no typed variant yet; the
@@ -1062,7 +1070,7 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
             // aligned, and per-row access on `Unsupported` errors instead of
             // returning a placeholder.
             other => {
-                let _consumed = columns::read_column(r, other, num_rows).await?;
+                let _consumed = columns::read_column_data(r, other, num_rows).await?;
                 Ok(DecodedColumn::Unsupported(format!("{other:?}")))
             }
         }

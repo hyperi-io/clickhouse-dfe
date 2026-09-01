@@ -242,11 +242,7 @@ const CASES: &[Case] = &[
         values: &["['x', 42::UInt64]", "[]"],
         known_broken: Some(PREFIX_PHASE),
     },
-    Case {
-        ch_type: "Array(Variant(UInt64, String))",
-        values: &["['x'::String]", "[]"],
-        known_broken: Some(PREFIX_PHASE),
-    },
+    case("Array(Variant(UInt64, String))", &["['x'::String]", "[]"]),
 ];
 
 /// The decoded shape, rendered. `DecodedColumn` is not `PartialEq`, and the
