@@ -493,7 +493,57 @@ pub(crate) fn read_column<'a, R: ClickHouseRead + 'a>(
     col_type: &'a ColumnType,
     num_rows: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ColumnData>> + Send + 'a>> {
-    read_column_at(reader, col_type, num_rows, 0)
+    Box::pin(async move {
+        if num_rows > 0 {
+            read_prefixes(reader, col_type, 0).await?;
+        }
+        read_column_at(reader, col_type, num_rows, 0).await
+    })
+}
+
+/// Consume the serialisation prefixes for `col_type`'s whole tree, in the
+/// order the server writes them.
+///
+/// Mirrors [`crate::native::decode`]'s own prefix phase; see the rationale
+/// there. `LowCardinality` alone is hoisted, because its prefix is a fixed
+/// 8-byte version this reader discards.
+fn read_prefixes<'a, R: ClickHouseRead + 'a>(
+    reader: &'a mut R,
+    col_type: &'a ColumnType,
+    depth: usize,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    use tokio::io::AsyncReadExt as _;
+
+    Box::pin(async move {
+        if depth > MAX_READ_DEPTH {
+            return Err(Error::BadResponse(format!(
+                "native protocol: column type nesting exceeds {MAX_READ_DEPTH} levels"
+            )));
+        }
+        match col_type {
+            // The dictionary is part of the data phase, so this does not
+            // recurse into the inner type.
+            ColumnType::LowCardinality(_) => {
+                let _version = reader.read_u64_le().await?;
+            }
+            ColumnType::Nullable(inner)
+            | ColumnType::Array(inner)
+            | ColumnType::SimpleAggregateFunction(inner) => {
+                read_prefixes(reader, inner, depth + 1).await?;
+            }
+            ColumnType::Tuple(fields) => {
+                for field in fields {
+                    read_prefixes(reader, field, depth + 1).await?;
+                }
+            }
+            ColumnType::Map(key, value) => {
+                read_prefixes(reader, key, depth + 1).await?;
+                read_prefixes(reader, value, depth + 1).await?;
+            }
+            _ => {}
+        }
+        Ok(())
+    })
 }
 
 /// `depth` bounds the recursion; the boxed future breaks the async-fn cycle
@@ -664,8 +714,8 @@ async fn read_low_cardinality_column<R: ClickHouseRead>(
 ) -> Result<ColumnData> {
     use tokio::io::AsyncReadExt as _;
 
-    let _version = reader.read_u64_le().await?;
-
+    // The version word is not read here: it is this column's serialisation
+    // prefix, consumed by `read_prefixes` before any of the column's data.
     let state = reader.read_u64_le().await?;
     let index_type = (state & 0x03) as u8;
     let has_global_dict = (state & 0x100) != 0;

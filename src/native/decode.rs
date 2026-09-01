@@ -627,7 +627,14 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         }
 
         let col = match ColumnType::parse(&type_name) {
-            Some(ct) => decode_column(r, &ct, num_rows, server_revision, 0).await?,
+            Some(ct) => {
+                // A header block declares its columns and carries no bytes
+                // for any of them, the serialisation prefix included.
+                if num_rows > 0 {
+                    decode_prefixes(r, &ct, 0).await?;
+                }
+                decode_column(r, &ct, num_rows, server_revision, 0).await?
+            }
             None => {
                 // The stream pointer cannot advance past a type of unknown
                 // size, so the connection is poisoned rather than desynced.
@@ -645,6 +652,57 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
         columns,
         schema,
         num_rows,
+    })
+}
+
+/// Consume the serialisation prefixes for `col_type`'s whole tree, in the
+/// order the server writes them.
+///
+/// `NativeWriter.cpp:93-94` calls `serializeBinaryBulkStatePrefix` for the
+/// entire column before `serializeBinaryBulkWithMultipleStreams`, so every
+/// nested prefix precedes ALL of that column's data. Reading a prefix inline
+/// where its child sits agrees with that only when nothing is written ahead of
+/// the child: true inside a `Tuple`, false behind an `Array`'s offsets.
+///
+/// `LowCardinality` alone is hoisted here, because its prefix is a fixed
+/// 8-byte version this decoder discards. `Dynamic`, `Variant` and `JSON`
+/// carry variable-length prefixes the data phase reads values out of, so they
+/// stay inline and are still wrong when nested behind data -- see the
+/// `known_broken` cases in `tests/wire_docker.rs`.
+fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
+    r: &'a mut R,
+    col_type: &'a ColumnType,
+    depth: usize,
+) -> Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    Box::pin(async move {
+        if depth > MAX_DECODE_DEPTH {
+            return Err(Error::BadResponse(format!(
+                "native: column type nesting exceeds {MAX_DECODE_DEPTH} levels"
+            )));
+        }
+        match col_type {
+            // The dictionary is part of the data phase, so this does not
+            // recurse into the inner type.
+            ColumnType::LowCardinality(_) => {
+                let _version = r.read_u64_le().await?;
+            }
+            ColumnType::Nullable(inner)
+            | ColumnType::Array(inner)
+            | ColumnType::SimpleAggregateFunction(inner) => {
+                decode_prefixes(r, inner, depth + 1).await?;
+            }
+            ColumnType::Tuple(fields) => {
+                for field in fields {
+                    decode_prefixes(r, field, depth + 1).await?;
+                }
+            }
+            ColumnType::Map(key, value) => {
+                decode_prefixes(r, key, depth + 1).await?;
+                decode_prefixes(r, value, depth + 1).await?;
+            }
+            _ => {}
+        }
+        Ok(())
     })
 }
 
@@ -1036,7 +1094,8 @@ async fn decode_low_cardinality<R: ClickHouseRead>(
         ))
     })?;
 
-    let _version = r.read_u64_le().await?;
+    // The version word is not read here: it is this column's serialisation
+    // prefix, consumed by `decode_prefixes` before any of the block's data.
     let flags = r.read_u64_le().await?;
     let index_type = (flags & 0x03) as u8;
     let has_global_dict = (flags & 0x100) != 0;

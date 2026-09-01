@@ -139,7 +139,12 @@ const fn case(ch_type: &'static str, values: &'static [&'static str]) -> Case {
 /// child's prefix out of place. Fixing it means a prefix phase and a data
 /// phase in both directions, mirroring
 /// `ISerialization::serializeBinaryBulkStatePrefix`.
-const PREFIX_PHASE: &str = "nested prefixes are not split from data (NativeWriter.cpp:93-94)";
+///
+/// `LowCardinality` is done -- its prefix is a fixed version word the reader
+/// hoists. `Dynamic` and `Variant` carry variable-length prefixes the data
+/// phase reads values out of, so they still go inline.
+const PREFIX_PHASE: &str =
+    "Dynamic/Variant prefixes are not split from data (NativeWriter.cpp:93-94)";
 
 const CASES: &[Case] = &[
     case("UInt8", &["0", "255"]),
@@ -199,18 +204,13 @@ const CASES: &[Case] = &[
     case("Array(Int32)", &["[]", "[-1, 0, 1]"]),
     case("Array(Nullable(UInt8))", &["[NULL, 1]", "[]"]),
     case("Array(Array(String))", &["[]", "[['a'], [], ['b', 'c']]"]),
-    Case {
-        ch_type: "Array(LowCardinality(String))",
-        values: &["[]", "['a', 'b', 'a']"],
-        known_broken: Some(PREFIX_PHASE),
-    },
+    case("Array(LowCardinality(String))", &["[]", "['a', 'b', 'a']"]),
     case("Map(String, Int64)", &["map()", "map('a', 1, 'b', -2)"]),
     case("Map(String, Array(String))", &["map('a', ['x', 'y'])"]),
-    Case {
-        ch_type: "Map(String, LowCardinality(Nullable(String)))",
-        values: &["map('a', NULL, 'b', 'v')"],
-        known_broken: Some(PREFIX_PHASE),
-    },
+    case(
+        "Map(String, LowCardinality(Nullable(String)))",
+        &["map('a', NULL, 'b', 'v')"],
+    ),
     case("Tuple(UInt8, String, Array(Int32))", &["(1, 'a', [1, 2])"]),
     case(
         "Array(Tuple(String, Map(String, UInt8)))",
