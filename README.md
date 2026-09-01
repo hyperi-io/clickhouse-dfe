@@ -28,7 +28,7 @@ Every layer is a feature. Take what you need and pay for nothing else.
 | `tls` | rustls trust for the TCP transport (implies `tcp`) |
 | `lz4` | LZ4 block compression, on both transports |
 | `zstd` | Zstd block compression, on both transports |
-| `dynamic` | Runtime-schema RowBinary insert from `serde_json::Map` rows |
+| `dynamic` | Runtime-schema insert from `serde_json::Map` rows -- `FORMAT RowBinary` over HTTP, `FORMAT Native` over TCP |
 | `unified` | One client over HTTP `clickhouse::Client` and our `TcpClient` (implies `tcp`) |
 | `ext` | Extension traits on `clickhouse::Client` -- ping, kill query, query id, session id, roles, typed server exceptions |
 | `inserter` | Background-actor inserter layer |
