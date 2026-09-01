@@ -100,10 +100,47 @@ struct SysColumn {
     default_kind: String,
 }
 
-/// Fetch a table's schema from `system.columns`.
+/// Quote `value` as a string literal via upstream's identifier escaper -- what
+/// it writes between the delimiters escapes `'` too, so this is exactly what
+/// `Query::bind` produces. The literal has to be in the SQL text: the native
+/// protocol carries `{name:Type}` parameters in a wire section the TCP writer
+/// does not emit (code 456, `Substitution 'x' is not set`).
+fn quote_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    let _ = clickhouse::_priv::sql_escape_identifier(value, &mut escaped);
+    format!("'{}'", &escaped[1..escaped.len() - 1])
+}
+
+/// The `system.columns` projection a schema is read from, on either transport.
+pub(crate) fn system_columns_sql(database: &str, table: &str) -> String {
+    format!(
+        "SELECT name, type AS col_type, default_kind FROM system.columns \
+         WHERE database = {} AND table = {} ORDER BY position",
+        quote_literal(database),
+        quote_literal(table)
+    )
+}
+
+/// Rows to schema, whichever transport read them; empty means no such table.
+pub(crate) fn schema_from_system_columns(
+    full_table: String,
+    rows: impl IntoIterator<Item = (String, String, String)>,
+) -> Result<DynamicSchema, DynamicError> {
+    let columns: Vec<ColumnDef> = rows
+        .into_iter()
+        .map(|(name, col_type, default_kind)| {
+            ColumnDef::with_default_kind(name, col_type, default_kind)
+        })
+        .collect();
+    if columns.is_empty() {
+        return Err(DynamicError::EmptySchema { table: full_table });
+    }
+    Ok(DynamicSchema::from_columns(full_table, columns))
+}
+
+/// Fetch a table's schema from `system.columns` over HTTP.
 ///
-/// Uses a parameterised query (no string interpolation). Columns come back in
-/// declaration order.
+/// Columns come back in declaration order.
 ///
 /// # Errors
 ///
@@ -118,14 +155,7 @@ pub async fn fetch_dynamic_schema(
     let full_table = format!("{database}.{table}");
 
     let rows = client
-        .query(
-            "SELECT name, type AS col_type, default_kind \
-             FROM system.columns \
-             WHERE database = ? AND table = ? \
-             ORDER BY position",
-        )
-        .bind(database)
-        .bind(table)
+        .query_raw(&system_columns_sql(database, table))
         .fetch_all::<SysColumn>()
         .await
         .map_err(|source| DynamicError::SchemaFetch {
@@ -133,16 +163,11 @@ pub async fn fetch_dynamic_schema(
             source,
         })?;
 
-    if rows.is_empty() {
-        return Err(DynamicError::EmptySchema { table: full_table });
-    }
-
-    let columns = rows
-        .into_iter()
-        .map(|r| ColumnDef::with_default_kind(r.name, r.col_type, r.default_kind))
-        .collect();
-
-    Ok(DynamicSchema::from_columns(full_table, columns))
+    schema_from_system_columns(
+        full_table,
+        rows.into_iter()
+            .map(|r| (r.name, r.col_type, r.default_kind)),
+    )
 }
 
 /// TTL-based schema cache, safe to share across insert tasks via `Arc`.

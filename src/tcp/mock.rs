@@ -69,6 +69,24 @@ pub(crate) async fn write_uint64_payload_block(server: &mut TcpStream, values: &
     server.flush().await.unwrap();
 }
 
+/// One `String` column per pair; every column supplies the same row count.
+pub(crate) async fn write_string_payload_block(
+    server: &mut TcpStream,
+    columns: &[(&str, &[&str])],
+) {
+    let rows = columns.first().map_or(0, |(_, values)| values.len());
+    write_data_header(server, columns.len() as u64, rows as u64).await;
+    for (name, values) in columns {
+        server.write_string(name.as_bytes()).await.unwrap();
+        server.write_string(b"String").await.unwrap();
+        AsyncWriteExt::write_u8(server, 0).await.unwrap();
+        for value in *values {
+            server.write_string(value.as_bytes()).await.unwrap();
+        }
+    }
+    server.flush().await.unwrap();
+}
+
 /// Packet id, table name, block-info field pairs and the
 /// `(num_columns, num_rows)` varuint pair that open every Data packet.
 async fn write_data_header(server: &mut TcpStream, num_columns: u64, num_rows: u64) {
