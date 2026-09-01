@@ -227,6 +227,16 @@ impl Columns {
     pub fn is_empty(&self) -> bool {
         self.rows() == 0
     }
+
+    /// The blocks as the server sent them.
+    ///
+    /// [`Self::get`] flattens these, which is what most callers want. Reach
+    /// for the blocks when the split itself matters -- a column type
+    /// [`FromColumn`] has no route for, or per-block accounting.
+    #[must_use]
+    pub fn blocks(&self) -> &[DecodedBlock] {
+        &self.blocks
+    }
 }
 
 /// Decode a `FORMAT Native` body: block info, the column and row counts, then
