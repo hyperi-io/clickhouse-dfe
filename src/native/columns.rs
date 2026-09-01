@@ -1424,6 +1424,30 @@ async fn read_dynamic_v1v2_column<R: ClickHouseRead>(
     has_max_types: bool,
     depth: usize,
 ) -> Result<ColumnData> {
+    let header = read_dynamic_v1v2_prefix(reader, has_max_types).await?;
+    read_dynamic_v1v2_body(reader, n, &header, depth).await
+}
+
+/// The type list a `Dynamic` column's data phase is read against.
+pub(crate) struct DynamicHeader {
+    type_names: Vec<String>,
+}
+
+/// The prefix half of a v1/v2 `Dynamic` column: the type list, then the inner
+/// Variant's discriminator mode.
+///
+/// `SerializationDynamic.cpp:128-168` writes all of this as the column's
+/// serialisation prefix, so for a nested `Dynamic` it precedes the enclosing
+/// column's data rather than sitting where the child does.
+///
+/// # Errors
+///
+/// [`Error::BadResponse`] for a type count above the cap or a discriminator
+/// mode this reader does not support.
+pub(crate) async fn read_dynamic_v1v2_prefix<R: ClickHouseRead>(
+    reader: &mut R,
+    has_max_types: bool,
+) -> Result<DynamicHeader> {
     if has_max_types {
         let _max_types = reader.read_var_uint().await?;
     }
@@ -1438,6 +1462,22 @@ async fn read_dynamic_v1v2_column<R: ClickHouseRead>(
 
     read_variant_mode(reader).await?;
 
+    Ok(DynamicHeader { type_names })
+}
+
+/// The data half of a v1/v2 `Dynamic` column, read against the type list its
+/// prefix declared.
+///
+/// # Errors
+///
+/// As [`read_column`].
+pub(crate) async fn read_dynamic_v1v2_body<R: ClickHouseRead>(
+    reader: &mut R,
+    n: usize,
+    header: &DynamicHeader,
+    depth: usize,
+) -> Result<ColumnData> {
+    let type_names = &header.type_names;
     let col_types = type_names
         .iter()
         .map(|name| wire_type(name))
