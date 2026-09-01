@@ -5,12 +5,8 @@
 # License:   Apache-2.0
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 #
-# Override defaults with HYPERCI_* env vars.
-# Reference: config/defaults.yaml in hyperi-ci.
+# Defaults: config/defaults.yaml in hyperi-ci. Override with HYPERCI_* env vars.
 
-# Category 4 (OSS): public, Apache-2.0, publishes to crates.io. Declared
-# rather than inferred. Apache-2.0 is one of the two options upstream
-# ClickHouse-rs offers, so cherry-picks carry no relicensing step.
 classification: oss
 
 language: rust
@@ -21,16 +17,13 @@ test:
   enabled: true
   coverage: false
   rust:
-    # Require process-per-test isolation rather than taking whatever the
-    # runner has installed.
     nextest: true
 build:
   enabled: true
   strategies:
   - native
   rust:
-    # Every layer is a feature, so the default build exercises almost none of
-    # the crate. Build them all.
+    # Every layer is a feature; the default build covers little of the crate.
     features: all
     targets: []
 publish:

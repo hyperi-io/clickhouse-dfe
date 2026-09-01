@@ -10,12 +10,9 @@
 name = "clickhouse-dfe"
 version = "0.1.0"
 edition = "2024"
-# Upstream's MSRV: anything that builds `clickhouse` must build this beside it.
-# Keep in step with rust-toolchain.toml.
+# Upstream's MSRV. Keep in step with rust-toolchain.toml.
 rust-version = "1.89.0"
 description = "HyperI extensions for the official ClickHouse Rust client: TCP transport, dynamic inserts, unified client"
-# Apache-2.0 is one of upstream's two options, so a file cherry-picked in
-# either direction keeps its own notice and nothing is relicensed.
 license = "Apache-2.0"
 repository = "https://github.com/hyperi-io/clickhouse-dfe"
 publish = true
@@ -28,16 +25,8 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-# The out-of-the-box build: native TCP transport with LZ4 block compression,
-# which is what a ClickHouse server negotiates by default.
 default = ["tcp", "lz4"]
-
-# Native TCP transport -- connection actor, deadpool pool, retry, and the
-# Native-format wire codec in `native`.
 tcp = ["dep:deadpool", "dep:socket2"]
-
-# rustls trust for the TCP transport. Implies `tcp` -- there is no other
-# connection for it to wrap.
 tls = [
     "tcp",
     "dep:rustls",
@@ -46,26 +35,13 @@ tls = [
     "dep:webpki-roots",
     "dep:rustls-native-certs",
 ]
-
-# Block compression. Both codecs need cityhash-rs for the block checksum.
 # `clickhouse/*` moves in step so HTTP and TCP negotiate the same codec.
 lz4 = ["clickhouse/lz4", "dep:lz4_flex", "dep:cityhash-rs"]
 zstd = ["clickhouse/zstd", "dep:zstd", "dep:cityhash-rs"]
-
-# Runtime-schema RowBinary insert from `serde_json::Map` rows, for callers
-# whose table shape is only known at run time.
 dynamic = ["dep:serde_json"]
-
-# One client over HTTP `clickhouse::Client` and our `TcpClient`.
 unified = ["tcp"]
-
-# Extension traits on `clickhouse::Client`, built only on its public API.
 ext = []
-
-# Background-actor inserter layer, built on upstream's inserter.
 inserter = ["clickhouse/inserter"]
-
-# Every layer at once, for `cargo check --features full` and for docs.rs.
 full = [
     "tcp",
     "tls",
@@ -82,7 +58,7 @@ full = [
 clickhouse = { version = "0.15.2", default-features = false }
 
 serde = { version = ">=1.0.228, <2", features = ["derive"] }
-bytes = ">=1.5.0, <2"
+bytes = ">=1.12.1, <2"
 thiserror = ">=2.0.18, <3"
 tracing = { version = ">=0.1.44, <0.2", default-features = false, features = ["std"] }
 futures-util = { version = ">=0.3.31, <0.4", default-features = false }
@@ -90,42 +66,36 @@ tokio = { version = ">=1.50.0, <2", features = ["rt", "macros", "io-util", "sync
 
 # tcp
 deadpool = { version = ">=0.12, <0.13", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
-# 0.6, not the spike's 0.5, so the graph carries one socket2 (and one
-# windows-sys): tokio and hyper-util already resolve to 0.6.
+# 0.6 shares the socket2 that tokio and hyper-util already resolve to.
 socket2 = { version = ">=0.6, <0.7", features = ["all"], optional = true }
 
 # lz4 / zstd
-# Held to 0.11.x to unify with upstream's own lz4_flex, not to pin a fix.
+# 0.11.x unifies with upstream's own lz4_flex.
 lz4_flex = { version = ">=0.11.6, <0.12", default-features = false, features = ["std"], optional = true }
-# Pinned exactly, as upstream pins it: the block checksum must match the
-# server byte for byte, so a changed hash is a wire break.
+# Exact pin as upstream: the block checksum is wire format.
 cityhash-rs = { version = "=1.0.1", optional = true }
 zstd = { version = ">=0.13, <0.14", default-features = false, optional = true }
 
 # tls
 rustls = { version = ">=0.23, <0.24", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"], optional = true }
 tokio-rustls = { version = ">=0.26, <0.27", default-features = false, features = ["aws_lc_rs", "tls12", "logging"], optional = true }
-rustls-pki-types = { version = ">=1.10, <2", features = ["std"], optional = true }
-webpki-roots = { version = ">=0.26, <0.27", optional = true }
+rustls-pki-types = { version = ">=1.15.1, <2", features = ["std"], optional = true }
+# 1.x, not the 0.26 shim over it: the shim carried a second webpki-roots copy.
+webpki-roots = { version = ">=1.0.9, <2", optional = true }
 rustls-native-certs = { version = ">=0.8, <0.9", optional = true }
 
 # dynamic
 serde_json = { version = ">=1.0.149, <2", optional = true }
 
 [dev-dependencies]
-# `test-util` for `clickhouse::test::Mock`. `-native-roots` only picks the trust
-# SOURCE -- upstream wires the HTTPS connector on `-aws-lc`, so both are needed.
+# `-native-roots` only picks the trust source; the HTTPS connector needs `-aws-lc` too.
 clickhouse = { version = "0.15.2", default-features = false, features = ["test-util", "rustls-tls-aws-lc", "rustls-tls-native-roots"] }
 tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
 serde_json = ">=1.0.149, <2"
-# Cluster credentials for the `#[ignore]` live tests.
 dotenvy = ">=0.15.7, <0.16"
-# Compile-time Send/Sync assertions on the transport handles.
 static_assertions = ">=1.1, <2"
 
-# Upstream's lint set, so a file moves between the two crates unchanged.
-# `unsafe_code = "deny"` is the local addition -- the TCP port carries no
-# unsafe, and a stage that needs some has to relax this deliberately.
+# Upstream's lint set plus `unsafe_code = "deny"`.
 [lints.rust]
 rust_2018_idioms = { level = "warn", priority = -1 }
 unreachable_pub = "warn"
