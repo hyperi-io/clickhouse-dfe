@@ -11,6 +11,7 @@
 
 pub mod error;
 pub mod native;
+pub mod worker;
 
 #[cfg(feature = "tcp")]
 pub mod tcp;
@@ -29,3 +30,8 @@ pub mod ext;
 
 #[cfg(feature = "inserter")]
 pub mod inserter;
+
+pub use error::{Error, Result};
+
+#[cfg(feature = "tcp")]
+pub use tcp::TcpClient;

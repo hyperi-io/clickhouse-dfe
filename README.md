@@ -8,6 +8,14 @@ over either transport.
 Pre-release. The API is unstable and will change without a deprecation cycle
 until 1.0.
 
+## Status
+
+The TCP transport is in -- connection actor, deadpool pool, retry, TLS trust and
+the Native-format wire codec.
+
+Typed `fetch::<T>()` and `insert::<T>()` over TCP are not -- they need two small
+upstream re-exports of the RowBinary row serialiser and deserialiser.
+
 ## Layers
 
 Every layer is a feature. Take what you need and pay for nothing else.
