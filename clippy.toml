@@ -1,0 +1,17 @@
+# Project:   clickhouse-dfe
+# File:      clippy.toml
+# Purpose:   Clippy linter configuration
+# Language:  TOML
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+# Wire-codec functions take a lot of small parameters.
+too-many-arguments-threshold = 7
+
+cognitive-complexity-threshold = 25
+
+# Column decoders return deeply nested generic types.
+type-complexity-threshold = 350
+
+too-many-lines-threshold = 150

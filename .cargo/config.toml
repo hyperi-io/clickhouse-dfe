@@ -1,0 +1,12 @@
+# Project:   clickhouse-dfe
+# File:      .cargo/config.toml
+# Purpose:   Cargo build configuration
+# Language:  TOML
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+# Local builds fail on the same warnings CI fails on. Crates.io dependencies
+# are compiled with --cap-lints allow, so this only ever bites this crate.
+[build]
+rustflags = ["-D", "warnings"]

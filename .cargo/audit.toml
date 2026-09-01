@@ -1,0 +1,13 @@
+# Project:   clickhouse-dfe
+# File:      .cargo/audit.toml
+# Purpose:   cargo-audit advisory ignore list for transitive deps
+# Language:  TOML
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+# Ignored advisories -- transitive deps we cannot fix. Review on every
+# dependency update, and delete an entry the moment upstream ships a fix.
+
+[advisories]
+ignore = []

@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>hyperi-io/renovate-config"],
+  "packageRules": [
+    {
+      "description": "rustls, tokio-rustls and the two root stores are one TLS stack -- bumping any of them alone breaks the connector wiring.",
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["/^rustls/", "tokio-rustls", "webpki-roots"],
+      "groupName": "rustls",
+      "minimumReleaseAge": "7 days"
+    }
+  ]
+}
