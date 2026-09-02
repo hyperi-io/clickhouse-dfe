@@ -52,6 +52,9 @@ pub(crate) const DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION: u64 =
 pub(crate) const DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2: u64 = 54462;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS: u64 = 54470;
 pub(crate) const DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL: u64 = 54471;
+/// Despite the name the server reads this Query-packet field from EVERY
+/// client, not only an interserver peer (`TCPHandler.cpp:2245-2250`).
+pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES: u64 = 54472;
 
 /// Active protocol revision this client advertises in Hello. Bump only when
 /// the wire-format support for the higher revision is in, never to "stay

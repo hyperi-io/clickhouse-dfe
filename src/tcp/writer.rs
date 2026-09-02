@@ -24,9 +24,10 @@ use crate::native::io::ClickHouseWrite;
 use crate::tcp::client_info::ClientInfo;
 use crate::tcp::protocol::{
     ClientPacketId, DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM,
-    DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS, DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS,
-    DBMS_MIN_REVISION_WITH_BLOCK_INFO, DBMS_MIN_REVISION_WITH_CLIENT_INFO,
-    DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS, DBMS_MIN_REVISION_WITH_BLOCK_INFO,
+    DBMS_MIN_REVISION_WITH_CLIENT_INFO, DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET,
     DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS, DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES,
     DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL, DBMS_TCP_PROTOCOL_VERSION,
     QueryProcessingStage,
@@ -171,6 +172,15 @@ pub(crate) async fn send_query<W: ClickHouseWrite>(
     }
     // Empty string marks end-of-settings, written unconditionally.
     w.write_string(b"").await?;
+
+    if server_revision.min(DBMS_TCP_PROTOCOL_VERSION)
+        >= DBMS_MIN_PROTOCOL_VERSION_WITH_INTERSERVER_EXTERNALLY_GRANTED_ROLES
+    {
+        // Externally granted roles, empty for an ordinary client. The server
+        // reads this unconditionally at this revision, not only in interserver
+        // mode (`TCPHandler.cpp:2245-2250`), so omitting it stalls the query.
+        w.write_string(b"").await?;
+    }
 
     if server_revision >= DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET {
         // Interserver secret is empty for non-distributed clients.
@@ -404,6 +414,10 @@ mod tests {
             assert_eq!(cur.read_var_uint().await.unwrap(), 0, "settings flags");
             assert_eq!(&cur.read_utf8_string().await.unwrap(), value);
         }
+        assert_eq!(cur.read_utf8_string().await.unwrap(), "");
+
+        // Externally granted roles, empty for an ordinary client. The server
+        // reads it from everyone at this revision, not only interserver peers.
         assert_eq!(cur.read_utf8_string().await.unwrap(), "");
 
         // Interserver secret, empty for a non-distributed client.

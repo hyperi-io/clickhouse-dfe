@@ -29,7 +29,6 @@ pub(crate) struct SparseDeserializeState {
 /// Must loop until `END_OF_GRANULE_FLAG` -- can't stop early even if we have enough
 /// rows, or the stream will be misaligned for the next column.
 #[allow(clippy::cast_possible_truncation)]
-#[allow(dead_code)] // No caller until sparse columns are wired into the decoder.
 pub(crate) async fn read_sparse_offsets<R: ClickHouseRead>(
     reader: &mut R,
     num_rows: usize,

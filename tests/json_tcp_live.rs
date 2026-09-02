@@ -195,12 +195,14 @@ async fn read_docs(client: &TcpClient, sql: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Without `output_format_native_write_json_as_string` the server sends a
-/// serialisation the block decoder cannot read, so the default is what makes
-/// a JSON column readable at all.
+/// `output_format_native_write_json_as_string` picks which serialisation the
+/// server sends, and both now read: with it the column arrives as plain text,
+/// without it as the V2 JSON serialisation the decoder handles natively. The
+/// flag stays the default because the text form costs the server nothing to
+/// produce, not because it is the only readable one.
 #[tokio::test]
 #[ignore = "needs a ClickHouse cluster -- see the module docs"]
-async fn the_json_as_string_flag_is_what_makes_a_json_column_readable() {
+async fn json_reads_with_or_without_the_string_flag() {
     const SQL: &str = r#"SELECT CAST('{"a":1}', 'JSON') AS doc"#;
 
     let docs = read_docs(&client(), SQL)
@@ -208,11 +210,10 @@ async fn the_json_as_string_flag_is_what_makes_a_json_column_readable() {
         .expect("with the flag on, doc reads as String");
     assert_eq!(docs, vec![r#"{"a":1}"#.to_string()]);
 
-    let without = read_docs(&client().with_json_as_string(false), SQL).await;
-    assert!(
-        without.is_err(),
-        "with the flag off the document must not read back, got {without:?}"
-    );
+    let without = read_docs(&client().with_json_as_string(false), SQL)
+        .await
+        .expect("V2 serialisation reads without the flag");
+    assert_eq!(without, vec![r#"{"a":1}"#.to_string()]);
 }
 
 #[tokio::test]

@@ -726,6 +726,64 @@ pub(crate) async fn read_block_info<R: ClickHouseRead>(r: &mut R) -> Result<()> 
     Ok(())
 }
 
+/// Read a column's custom-serialization header and report whether it is sparse.
+///
+/// TWO bytes, not one. `NativeWriter::write` writes the `has_custom_serialization`
+/// bool, and then -- only when it is set -- `SerializationInfo::serialializeKindStackBinary`
+/// writes a SECOND byte naming the kind stack. Reading the flag alone and
+/// treating 1 as "sparse" leaves the kind byte on the wire, and one byte of
+/// drift turns the next column's offsets into garbage; the symptom is an
+/// "unknown server packet id" several columns later, nowhere near the cause.
+///
+/// The kind byte's first four values predate kind stacks, so a stack of exactly
+/// `{Default, Sparse}` reads as 1 on every server that has ever sent sparse.
+/// Everything past that is a serialisation we cannot decode, so it is named and
+/// refused rather than guessed at.
+async fn read_serialization_kind<R: ClickHouseRead>(r: &mut R, name: &str) -> Result<bool> {
+    match r.read_u8().await? {
+        0 => return Ok(false),
+        1 => {}
+        flag => {
+            return Err(Error::BadResponse(format!(
+                "native: column '{name}' has custom-serialization flag {flag} \
+                 -- the server writes a bool here"
+            )));
+        }
+    }
+
+    // KindStackBinarySerializationType, from SerializationInfo.cpp.
+    let kind = match r.read_u8().await? {
+        0 => return Ok(false), // {Default} -- the flag was set, the stack is plain
+        1 => return Ok(true),  // {Default, Sparse}
+        2 => "Detached",
+        3 => "Detached over Sparse",
+        4 => "Replicated",
+        5 => {
+            // A combination stack: varuint length, then one byte per kind.
+            // Consumed so the message can be specific, not to keep reading --
+            // an unsupported serialisation ends the query either way.
+            let num_kinds = r.read_var_uint().await?;
+            if num_kinds > MAX_BLOCK_COLUMNS {
+                return Err(refused("serialization kinds", num_kinds, MAX_BLOCK_COLUMNS));
+            }
+            for _ in 0..num_kinds {
+                let _kind = r.read_u8().await?;
+            }
+            "a combination"
+        }
+        other => {
+            return Err(Error::BadResponse(format!(
+                "native: column '{name}' announced serialization kind {other}, \
+                 which this decoder does not know"
+            )));
+        }
+    };
+    Err(Error::BadResponse(format!(
+        "native: column '{name}' uses {kind} serialization -- \
+         only default and sparse are supported"
+    )))
+}
+
 /// Read one Native-format data block body off the wire.
 ///
 /// Stream pointer position on entry MUST be immediately after the
@@ -772,19 +830,8 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
         let type_name = r.read_utf8_string().await?;
-        // 0 is normal serialisation, 1 is sparse. Anything else is a wire this
-        // decoder does not know, and guessing would misalign the body bytes.
         let sparse = if has_custom_ser {
-            match r.read_u8().await? {
-                0 => false,
-                1 => true,
-                flag => {
-                    return Err(Error::BadResponse(format!(
-                        "native: column '{name}' uses custom serialization flag {flag} \
-                         -- only normal (0) and sparse (1) are supported"
-                    )));
-                }
-            }
+            read_serialization_kind(r, &name).await?
         } else {
             false
         };
@@ -1683,20 +1730,59 @@ mod tests {
         }
     }
 
+    /// The first byte is a bool, so anything but 0 or 1 means the reader and
+    /// the server disagree about where the column header starts.
     #[tokio::test]
     async fn rejects_nonzero_custom_serialization_flag() {
         let mut bytes = Vec::new();
         bytes.write_string(b"x").await.unwrap();
         bytes.write_string(b"UInt8").await.unwrap();
-        // Non-zero flag -- not normal serialisation.
         bytes.push(7u8);
         let mut cur = Cursor::new(bytes);
         let err = decode_block(&mut cur, 1, 0, REV).await.unwrap_err();
         match err {
             Error::BadResponse(msg) => {
-                assert!(msg.contains("custom serialization flag"), "got: {msg}");
+                assert!(msg.contains("custom-serialization flag"), "got: {msg}");
             }
             other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// A kind stack we cannot decode is named, not guessed at -- reading the
+    /// body under the wrong serialisation would desync the whole connection.
+    #[tokio::test]
+    async fn rejects_a_serialization_kind_it_cannot_decode() {
+        for (kind, want) in [(2u8, "Detached"), (4u8, "Replicated")] {
+            let mut bytes = Vec::new();
+            bytes.write_string(b"x").await.unwrap();
+            bytes.write_string(b"UInt8").await.unwrap();
+            bytes.push(1u8);
+            bytes.push(kind);
+            let mut cur = Cursor::new(bytes);
+            let err = decode_block(&mut cur, 1, 0, REV).await.unwrap_err();
+            match err {
+                Error::BadResponse(msg) => assert!(msg.contains(want), "got: {msg}"),
+                other => panic!("expected BadResponse, got {other:?}"),
+            }
+        }
+    }
+
+    /// The custom flag can be set over a plain `{Default}` stack, which is not
+    /// sparse and whose body is an ordinary dense column.
+    #[tokio::test]
+    async fn a_custom_flag_over_a_default_kind_stack_reads_dense() {
+        let mut bytes = Vec::new();
+        bytes.write_string(b"v").await.unwrap();
+        bytes.write_string(b"UInt8").await.unwrap();
+        bytes.push(1u8); // has_custom_serialization
+        bytes.push(0u8); // KindStack {Default}
+        bytes.extend_from_slice(&[4u8, 5u8, 6u8]);
+
+        let mut cur = Cursor::new(bytes);
+        let block = decode_block(&mut cur, 1, 3, REV).await.unwrap();
+        match block.column("v").unwrap() {
+            DecodedColumn::UInt8(values) => assert_eq!(values, &[4, 5, 6]),
+            other => panic!("expected UInt8, got {other:?}"),
         }
     }
 
@@ -1709,7 +1795,8 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.write_string(b"v").await.unwrap();
         bytes.write_string(b"UInt8").await.unwrap();
-        bytes.push(1u8); // sparse
+        bytes.push(1u8); // has_custom_serialization
+        bytes.push(1u8); // KindStack {Default, Sparse}
         // Non-defaults at rows 1 and 3 of 5: one default before each, then one
         // trailing default carrying the end-of-granule flag.
         let mut offsets = Vec::new();
@@ -1736,7 +1823,8 @@ mod tests {
         let mut bytes = Vec::new();
         bytes.write_string(b"v").await.unwrap();
         bytes.write_string(b"Array(UInt8)").await.unwrap();
-        bytes.push(1u8);
+        bytes.push(1u8); // has_custom_serialization
+        bytes.push(1u8); // KindStack {Default, Sparse}
         let mut offsets = Vec::new();
         offsets.put_var_uint(END_OF_GRANULE_FLAG);
         bytes.extend_from_slice(&offsets);

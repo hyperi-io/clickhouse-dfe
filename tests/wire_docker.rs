@@ -897,14 +897,17 @@ async fn a_json_path_that_changes_type_between_rows_reads_back() {
 /// The JSON serialisation this crate does NOT decode, pinned as the clean
 /// error it is rather than left to surprise someone.
 ///
-/// We advertise revision 54459, below the 54473 V2 gate
-/// (`ProtocolDefines.h:109`), so a server sends Object `V1` -- wire value 0,
-/// per `SerializationObject.h:37`. With
-/// `output_format_native_write_json_as_string` on, which is the default, a
-/// JSON column arrives as version 1 (plain strings) and reads fine. Turn it
-/// off and version 0 arrives, which `read_json_body` has no reader for.
+/// A `JSON` column reads with or without the string flag, which is what
+/// advertising 54473 bought.
+///
+/// Below the V2 gate (`ProtocolDefines.h:109`) a server sends Object `V1` --
+/// wire value 0, per `SerializationObject.h:37` -- and this decoder has no
+/// reader for it, so the flag was the only way through. At 54473 the server
+/// sends V2 instead, which it does read, so turning
+/// `output_format_native_write_json_as_string` off now yields the document
+/// rather than an error.
 #[tokio::test]
-async fn json_without_the_string_flag_is_a_clean_error_not_a_misread() {
+async fn json_reads_with_or_without_the_string_flag() {
     const SQL: &str = r#"SELECT CAST('{"a":1}', 'JSON') AS doc"#;
 
     require_docker!();
@@ -925,11 +928,14 @@ async fn json_without_the_string_flag_is_a_clean_error_not_a_misread() {
             .unwrap(),
         [r#"{"a":1}"#]
     );
-    let err = without.expect_err("version 0 has no reader");
-    assert!(
-        format!("{err}").contains("unsupported JSON serialization version: 0"),
-        "the version must be named, not misread: {err}"
-    );
+    // The raw path returns blocks; the payload block is the one with rows.
+    let blocks = without.expect("V2 serialisation reads without the flag");
+    let payload: Vec<String> = blocks
+        .iter()
+        .filter(|b| b.num_rows > 0)
+        .flat_map(|b| b.column_as::<String>("doc").expect("doc reads as text"))
+        .collect();
+    assert_eq!(payload, [r#"{"a":1}"#]);
 }
 
 /// A `MergeTree` column that is almost all defaults, merged into one part, is
