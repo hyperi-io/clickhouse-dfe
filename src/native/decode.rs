@@ -309,6 +309,171 @@ impl DecodedColumn {
             Self::Unsupported(_) => 0,
         }
     }
+
+    /// Scatter a sparsely-serialised column back to its full length.
+    ///
+    /// A sparse column carries only its non-default values; `positions[i]` is
+    /// the row the `i`th of them belongs to. Everything else is the type's
+    /// default, which on the wire means zero, empty, or the epoch.
+    ///
+    /// ClickHouse sparse-serialises scalars only, so a composite arriving this
+    /// way is a wire the decoder does not understand and says so rather than
+    /// guessing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadResponse`] if a position is past `num_rows`, if the value
+    /// count does not match the position count, or for a composite column.
+    pub(crate) fn expand_sparse(self, positions: &[usize], num_rows: usize) -> Result<Self> {
+        if self.row_count() != positions.len() {
+            return Err(Error::BadResponse(format!(
+                "native: sparse column has {} values for {} positions",
+                self.row_count(),
+                positions.len()
+            )));
+        }
+        if let Some(&past) = positions.iter().find(|&&p| p >= num_rows) {
+            return Err(Error::BadResponse(format!(
+                "native: sparse position {past} is past the block's {num_rows} rows"
+            )));
+        }
+
+        macro_rules! scatter {
+            ($variant:ident, $values:expr, $default:expr) => {{
+                let mut out = vec![$default; num_rows];
+                for (value, &row) in $values.into_iter().zip(positions) {
+                    out[row] = value;
+                }
+                Self::$variant(out)
+            }};
+        }
+
+        Ok(match self {
+            Self::UInt8(v) => scatter!(UInt8, v, 0),
+            Self::UInt16(v) => scatter!(UInt16, v, 0),
+            Self::UInt32(v) => scatter!(UInt32, v, 0),
+            Self::UInt64(v) => scatter!(UInt64, v, 0),
+            Self::Int8(v) => scatter!(Int8, v, 0),
+            Self::Int16(v) => scatter!(Int16, v, 0),
+            Self::Int32(v) => scatter!(Int32, v, 0),
+            Self::Int64(v) => scatter!(Int64, v, 0),
+            Self::Int128(v) => scatter!(Int128, v, 0),
+            Self::UInt128(v) => scatter!(UInt128, v, 0),
+            Self::Int256(v) => scatter!(Int256, v, [0u8; 32]),
+            Self::UInt256(v) => scatter!(UInt256, v, [0u8; 32]),
+            Self::Float32(v) => scatter!(Float32, v, 0.0),
+            Self::Float64(v) => scatter!(Float64, v, 0.0),
+            Self::String(v) => scatter!(String, v, Vec::new()),
+            Self::Json(v) => scatter!(Json, v, Vec::new()),
+            Self::Date(v) => scatter!(Date, v, 0),
+            Self::Date32(v) => scatter!(Date32, v, 0),
+            Self::DateTime(v) => scatter!(DateTime, v, 0),
+            Self::Ipv4(v) => scatter!(Ipv4, v, 0),
+            Self::Uuid(v) => scatter!(Uuid, v, [0u8; 16]),
+            Self::Ipv6(v) => scatter!(Ipv6, v, [0u8; 16]),
+            Self::Decimal32 {
+                precision,
+                scale,
+                values,
+            } => {
+                let mut out = vec![0i32; num_rows];
+                for (value, &row) in values.into_iter().zip(positions) {
+                    out[row] = value;
+                }
+                Self::Decimal32 {
+                    precision,
+                    scale,
+                    values: out,
+                }
+            }
+            Self::Decimal64 {
+                precision,
+                scale,
+                values,
+            } => {
+                let mut out = vec![0i64; num_rows];
+                for (value, &row) in values.into_iter().zip(positions) {
+                    out[row] = value;
+                }
+                Self::Decimal64 {
+                    precision,
+                    scale,
+                    values: out,
+                }
+            }
+            Self::Decimal128 {
+                precision,
+                scale,
+                values,
+            } => {
+                let mut out = vec![0i128; num_rows];
+                for (value, &row) in values.into_iter().zip(positions) {
+                    out[row] = value;
+                }
+                Self::Decimal128 {
+                    precision,
+                    scale,
+                    values: out,
+                }
+            }
+            Self::Decimal256 {
+                precision,
+                scale,
+                values,
+            } => {
+                let mut out = vec![[0u8; 32]; num_rows];
+                for (value, &row) in values.into_iter().zip(positions) {
+                    out[row] = value;
+                }
+                Self::Decimal256 {
+                    precision,
+                    scale,
+                    values: out,
+                }
+            }
+            Self::DateTime64 {
+                precision,
+                timezone,
+                values,
+            } => {
+                let mut out = vec![0i64; num_rows];
+                for (value, &row) in values.into_iter().zip(positions) {
+                    out[row] = value;
+                }
+                Self::DateTime64 {
+                    precision,
+                    timezone,
+                    values: out,
+                }
+            }
+            Self::FixedString { width, bytes } => {
+                let mut out = vec![0u8; num_rows * width];
+                for (i, &row) in positions.iter().enumerate() {
+                    out[row * width..][..width].copy_from_slice(&bytes[i * width..][..width]);
+                }
+                Self::FixedString { width, bytes: out }
+            }
+            other => {
+                return Err(Error::BadResponse(format!(
+                    "native: {} cannot be sparse-serialised",
+                    other.type_label()
+                )));
+            }
+        })
+    }
+
+    /// Variant name for an error message.
+    fn type_label(&self) -> &'static str {
+        match self {
+            Self::Nullable { .. } => "a Nullable column",
+            Self::Array { .. } => "an Array column",
+            Self::LowCardinality { .. } => "a LowCardinality column",
+            Self::Tuple(_) => "a Tuple column",
+            Self::Map { .. } => "a Map column",
+            Self::Unsupported(_) => "an unsupported column",
+            _ => "this column",
+        }
+    }
 }
 
 /// A decoded Native data block: ordered list of columns plus the
@@ -607,17 +772,22 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
     for _ in 0..num_columns {
         let name = r.read_utf8_string().await?;
         let type_name = r.read_utf8_string().await?;
-        if has_custom_ser {
-            // Only normal serialisation (0) is decoded; a sparse or otherwise
-            // custom-serialised column would misalign the body bytes.
-            let flag = r.read_u8().await?;
-            if flag != 0 {
-                return Err(Error::BadResponse(format!(
-                    "native: column '{name}' uses custom serialization flag {flag} \
-                     -- only normal (0) is supported"
-                )));
+        // 0 is normal serialisation, 1 is sparse. Anything else is a wire this
+        // decoder does not know, and guessing would misalign the body bytes.
+        let sparse = if has_custom_ser {
+            match r.read_u8().await? {
+                0 => false,
+                1 => true,
+                flag => {
+                    return Err(Error::BadResponse(format!(
+                        "native: column '{name}' uses custom serialization flag {flag} \
+                         -- only normal (0) and sparse (1) are supported"
+                    )));
+                }
             }
-        }
+        } else {
+            false
+        };
 
         let col = match ColumnType::parse(&type_name) {
             Some(ct) => {
@@ -628,7 +798,21 @@ pub(crate) async fn decode_block<R: ClickHouseRead>(
                     decode_prefixes(r, &ct, 0, &mut prefixes).await?;
                 }
                 let mut headers = prefixes.into_iter();
-                decode_column(r, &ct, num_rows, server_revision, 0, &mut headers).await?
+                if sparse && num_rows > 0 {
+                    // Offsets first, then only the non-default values, so the
+                    // dense read is sized by the offset count rather than the
+                    // block's row count.
+                    let rows = usize::try_from(num_rows).unwrap_or(usize::MAX);
+                    let mut state = crate::native::sparse::SparseDeserializeState::default();
+                    let positions =
+                        crate::native::sparse::read_sparse_offsets(r, rows, &mut state).await?;
+                    let present = u64::try_from(positions.len()).unwrap_or(u64::MAX);
+                    let dense =
+                        decode_column(r, &ct, present, server_revision, 0, &mut headers).await?;
+                    dense.expand_sparse(&positions, rows)?
+                } else {
+                    decode_column(r, &ct, num_rows, server_revision, 0, &mut headers).await?
+                }
             }
             None => {
                 // The stream pointer cannot advance past a type of unknown
@@ -1512,6 +1696,55 @@ mod tests {
             Error::BadResponse(msg) => {
                 assert!(msg.contains("custom serialization flag"), "got: {msg}");
             }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// A sparse column carries only its non-default values, so the decoder has
+    /// to put them back where they came from and fill the rest with defaults.
+    #[tokio::test]
+    async fn sparse_column_expands_to_full_rows() {
+        use crate::native::sparse::END_OF_GRANULE_FLAG;
+
+        let mut bytes = Vec::new();
+        bytes.write_string(b"v").await.unwrap();
+        bytes.write_string(b"UInt8").await.unwrap();
+        bytes.push(1u8); // sparse
+        // Non-defaults at rows 1 and 3 of 5: one default before each, then one
+        // trailing default carrying the end-of-granule flag.
+        let mut offsets = Vec::new();
+        offsets.put_var_uint(1);
+        offsets.put_var_uint(1);
+        offsets.put_var_uint(1 | END_OF_GRANULE_FLAG);
+        bytes.extend_from_slice(&offsets);
+        bytes.extend_from_slice(&[7u8, 9u8]);
+
+        let mut cur = Cursor::new(bytes);
+        let block = decode_block(&mut cur, 1, 5, REV).await.unwrap();
+        match block.column("v").unwrap() {
+            DecodedColumn::UInt8(values) => assert_eq!(values, &[0, 7, 0, 9, 0]),
+            other => panic!("expected UInt8, got {other:?}"),
+        }
+    }
+
+    /// A composite has no sparse form, so the decoder names it rather than
+    /// scattering into a shape it invented.
+    #[tokio::test]
+    async fn a_sparse_composite_is_refused() {
+        use crate::native::sparse::END_OF_GRANULE_FLAG;
+
+        let mut bytes = Vec::new();
+        bytes.write_string(b"v").await.unwrap();
+        bytes.write_string(b"Array(UInt8)").await.unwrap();
+        bytes.push(1u8);
+        let mut offsets = Vec::new();
+        offsets.put_var_uint(END_OF_GRANULE_FLAG);
+        bytes.extend_from_slice(&offsets);
+
+        let mut cur = Cursor::new(bytes);
+        let err = decode_block(&mut cur, 1, 1, REV).await.unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("sparse"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
         }
     }
