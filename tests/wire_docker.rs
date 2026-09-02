@@ -641,6 +641,259 @@ async fn a_root_json_array_is_rejected_raw_and_round_trips_wrapped() {
     );
 }
 
+/// Document shapes a real ingest sends at a `JSON` column, as
+/// `(name, the document)`.
+///
+/// The type matrix covers `ClickHouse` types; these cover the payloads. Each
+/// one is written twice -- once by the server from the same SQL literal, once
+/// through this crate's encoder -- and the two must read back identically, so
+/// the oracle is the server rather than this crate's reading of itself.
+const JSON_DOCUMENTS: &[(&str, &str)] = &[
+    ("empty object", r"{}"),
+    (
+        "ecs-shaped event",
+        r#"{"@timestamp":"2026-09-02T08:00:00Z","host":{"name":"h1"},"tags":["beats","filebeat"]}"#,
+    ),
+    // A dotted KEY and real nesting reach the same path in ClickHouse's JSON
+    // type, so both must survive a round trip without collapsing into one.
+    ("dotted key", r#"{"a.b":1}"#),
+    ("nested object", r#"{"a":{"b":1}}"#),
+    ("null inside", r#"{"a":null,"b":1}"#),
+    ("empty string value", r#"{"a":""}"#),
+    ("unicode and emoji", r#"{"ünïcode":"héllo","emoji":"🎯"}"#),
+    (
+        "escapes",
+        r#"{"quote":"he said \"hi\"","back\\slash":"c:\\tmp","newline":"a\nb","tab":"a\tb"}"#,
+    ),
+    // The widest integers a JSON column holds; past this the server refuses
+    // the document outright, which the test below pins.
+    (
+        "integer bounds",
+        r#"{"i":-9223372036854775808,"u":18446744073709551615}"#,
+    ),
+    ("float forms", r#"{"e":1.5e300,"neg":-0.0,"small":1e-300}"#),
+    ("array of objects", r#"{"items":[{"id":1},{"id":2}]}"#),
+    ("nested arrays", r#"{"m":[[1,2],[3]]}"#),
+    ("deep nesting", r#"{"a":{"b":{"c":{"d":{"e":{"f":1}}}}}}"#),
+];
+
+/// Every shape a real ingest sends at a `JSON` column must survive this
+/// crate's encoder and come back as what the server itself stored.
+#[tokio::test]
+async fn json_documents_round_trip_as_the_server_stores_them() {
+    use std::sync::Arc;
+
+    use serde_json::{Map, Value};
+
+    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let client = server.tcp();
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let mut failures = Vec::new();
+    for (i, (name, document)) in JSON_DOCUMENTS.iter().enumerate() {
+        let table = format!("wire.doc{i}");
+        client
+            .execute(&format!(
+                "CREATE OR REPLACE TABLE {table} (d JSON) ENGINE = MergeTree ORDER BY tuple()"
+            ))
+            .await
+            .unwrap();
+
+        // The server's own copy, from the literal.
+        let quoted = document.replace('\\', r"\\").replace('\'', r"\'");
+        if let Err(e) = client
+            .execute(&format!(
+                "INSERT INTO {table} VALUES (CAST('{quoted}', 'JSON'))"
+            ))
+            .await
+        {
+            failures.push(format!("{name}: the server rejected its own literal: {e}"));
+            continue;
+        }
+
+        // This crate's copy, through the dynamic encoder.
+        let schema = Arc::new(DynamicSchema::from_columns(
+            &table,
+            vec![ColumnDef::new("d", "JSON")],
+        ));
+        let mut insert = DynamicInsert::tcp(
+            client.as_tcp().expect("the tcp arm").clone(),
+            "wire",
+            &format!("doc{i}"),
+            schema,
+        );
+        let parsed: Value = serde_json::from_str(document).expect("the case is valid JSON");
+        let mut row = Map::new();
+        row.insert("d".to_string(), parsed);
+        if let Err(e) = insert.write_map(&row).await {
+            failures.push(format!("{name}: encode failed: {e}"));
+            continue;
+        }
+        if let Err(e) = insert.end().await {
+            failures.push(format!("{name}: insert failed: {e}"));
+            continue;
+        }
+
+        match client
+            .fetch_columns(&format!("SELECT d FROM {table} ORDER BY toString(d)"))
+            .await
+        {
+            Ok(read) => {
+                let docs = read
+                    .get::<String>("d")
+                    .expect("a JSON column reads as text");
+                match docs.as_slice() {
+                    [by_encoder, by_server] if by_encoder == by_server => {}
+                    [a, b] => failures.push(format!("{name}: encoder {a} != server {b}")),
+                    other => failures.push(format!("{name}: expected 2 rows, got {}", other.len())),
+                }
+            }
+            Err(e) => failures.push(format!("{name}: read failed: {e}")),
+        }
+    }
+
+    server.stop().await;
+    assert!(
+        failures.is_empty(),
+        "{} document(s) failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// An integer too wide for any `ClickHouse` integer type is stored as a
+/// `Float64`, losing precision, and nothing reports it.
+///
+/// The two routes disagree, which is what makes this worth pinning.
+/// `CAST('<doc>', 'JSON')` refuses the document with code 117. The insert path
+/// accepts it -- a `JSON` column is declared `String` on the wire and the
+/// server converts on the way in -- and the conversion silently rounds to
+/// about 17 significant digits. A pipeline sending large integers gets neither
+/// the value nor an error.
+#[tokio::test]
+async fn an_oversized_json_number_is_stored_as_a_lossy_float() {
+    use std::sync::Arc;
+
+    use serde_json::{Map, Value};
+
+    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+
+    const HUGE: &str = r#"{"huge":123456789012345678901234567890}"#;
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let client = server.tcp();
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    client
+        .execute("CREATE OR REPLACE TABLE wire.huge (d JSON) ENGINE = MergeTree ORDER BY tuple()")
+        .await
+        .unwrap();
+
+    let by_server = client
+        .execute(&format!(
+            "INSERT INTO wire.huge VALUES (CAST('{HUGE}', 'JSON'))"
+        ))
+        .await;
+
+    let schema = Arc::new(DynamicSchema::from_columns(
+        "wire.huge",
+        vec![ColumnDef::new("d", "JSON")],
+    ));
+    let mut insert = DynamicInsert::tcp(
+        client.as_tcp().expect("the tcp arm").clone(),
+        "wire",
+        "huge",
+        schema,
+    );
+    let parsed: Value = serde_json::from_str(HUGE).expect("the literal is valid JSON");
+    let mut row = Map::new();
+    row.insert("d".to_string(), parsed);
+    // The encoder writes the text unchanged; the server decides.
+    insert.write_map(&row).await.expect("the row encodes");
+    insert.end().await.expect("the insert commits");
+
+    let read = client.fetch_columns("SELECT d FROM wire.huge").await;
+    server.stop().await;
+
+    let server_err = by_server.expect_err("a CAST refuses the oversized literal");
+    assert!(
+        format!("{server_err}").contains("117"),
+        "expected code 117, got: {server_err}"
+    );
+    // 1.2345678901234568e29 against the 1.2345678901234567890123456789e29 that
+    // went in: the tail is gone and no error was raised.
+    assert_eq!(
+        read.expect("the inserted document reads back")
+            .get::<String>("d")
+            .unwrap(),
+        [r#"{"huge":1.2345678901234568e29}"#]
+    );
+}
+
+/// A path whose type changes between rows is the shape a mixed ingest
+/// produces, and the one a static schema cannot hold.
+#[tokio::test]
+async fn a_json_path_that_changes_type_between_rows_reads_back() {
+    use std::sync::Arc;
+
+    use serde_json::{Map, json};
+
+    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let client = server.tcp();
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    client
+        .execute("CREATE OR REPLACE TABLE wire.mixed (d JSON) ENGINE = MergeTree ORDER BY tuple()")
+        .await
+        .unwrap();
+
+    let schema = Arc::new(DynamicSchema::from_columns(
+        "wire.mixed",
+        vec![ColumnDef::new("d", "JSON")],
+    ));
+    let mut insert = DynamicInsert::tcp(
+        client.as_tcp().expect("the tcp arm").clone(),
+        "wire",
+        "mixed",
+        schema,
+    );
+    for value in [json!({"a": 1}), json!({"a": "x"}), json!({"a": [1, 2]})] {
+        let mut row = Map::new();
+        row.insert("d".to_string(), value);
+        insert.write_map(&row).await.expect("the row encodes");
+    }
+    insert.end().await.expect("the insert commits");
+
+    let read = client
+        .fetch_columns("SELECT d FROM wire.mixed ORDER BY toString(d)")
+        .await;
+    server.stop().await;
+
+    let mut docs = read
+        .expect("the mixed-type column reads back")
+        .get::<String>("d")
+        .unwrap();
+    docs.sort();
+    assert_eq!(docs, [r#"{"a":"x"}"#, r#"{"a":1}"#, r#"{"a":[1,2]}"#]);
+}
+
 /// The JSON serialisation this crate does NOT decode, pinned as the clean
 /// error it is rather than left to surprise someone.
 ///
