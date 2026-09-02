@@ -261,6 +261,9 @@ impl TcpClient {
                     Err(_) => crate::tcp::pool::TcpTls::ConfiguredButFailed,
                 },
             };
+            // deadpool's only documented build failure is NoRuntimeSpecified,
+            // which `build_pool` rules out by always supplying Runtime::Tokio1.
+            #[allow(clippy::expect_used)]
             Arc::new(
                 build_pool(
                     self.config.endpoints.clone(),

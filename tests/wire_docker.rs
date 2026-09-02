@@ -8,8 +8,8 @@
 
 //! Type-matrix proof against a real server, not a mock.
 //!
-//! One container per test, pinned to the version the devex cluster runs and
-//! stopped before the test returns. The server builds every value, so a
+//! One container per test, pinned to a fixed server version and stopped
+//! before the test returns. The server builds every value, so a
 //! failure here is this crate's decoder rather than its encoder; the encoder
 //! is covered separately, and by one test that uses the server as its oracle.
 //!
@@ -38,7 +38,7 @@ use clickhouse::Client;
 use clickhouse_dfe::native::DecodedBlock;
 use clickhouse_dfe::{Columns, TcpClient, UnifiedClient};
 
-/// The version the devex cluster runs. Never `latest`: the wire format moves.
+/// Pinned, never `latest`: the wire format moves between server versions.
 const IMAGE_TAG: &str = "26.3.21.7";
 
 /// Enough for the matrix, far below what an unbounded server would take.

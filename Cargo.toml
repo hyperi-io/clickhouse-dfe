@@ -19,7 +19,11 @@ repository = "https://github.com/hyperi-io/clickhouse-dfe"
 publish = true
 keywords = ["clickhouse", "database", "tcp", "tokio"]
 categories = ["database", "asynchronous"]
-exclude = [".github/", ".githooks/", "docs/"]
+# `docs/` ships: it is 24K, the type-support and insert-format pages are
+# consumer-facing, and `src/native/mod.rs` and `src/tcp/pool.rs` point at
+# `docs/COVERAGE.md` -- excluding it left those references dangling in the
+# published tarball. `.github/` and `.githooks/` are repo machinery and stay out.
+exclude = [".github/", ".githooks/"]
 
 [package.metadata.docs.rs]
 all-features = true

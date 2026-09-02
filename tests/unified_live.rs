@@ -142,7 +142,8 @@ fn same_strings(pair: &(Columns, Columns), column: &str) -> Vec<String> {
     over_tcp
 }
 
-/// dfe-loader's five schema-shaped reads, both ways round, asserted equal.
+/// The five schema-shaped reads a loader makes against `system.columns`, run
+/// over both transports and asserted equal.
 #[tokio::test]
 #[ignore = "needs a ClickHouse cluster -- see the module docs"]
 async fn the_schema_queries_agree_across_transports() {

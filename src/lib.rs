@@ -21,10 +21,8 @@ mod worker;
 
 pub mod error;
 
-// `TcpClient::pool` still expects on a deadpool build that cannot fail.
 #[cfg(feature = "tcp")]
 #[cfg_attr(docsrs, doc(cfg(feature = "tcp")))]
-#[allow(clippy::expect_used)]
 pub mod tcp;
 
 #[cfg(feature = "tls")]
