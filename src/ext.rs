@@ -37,6 +37,20 @@ impl ServerException {
         let Error::BadResponse(body) = error else {
             return None;
         };
+
+        // Upstream falls back to the `X-ClickHouse-Exception-Code` header alone
+        // as the body (`response.rs:179`) when the real body is empty, not
+        // UTF-8, or fails mid-read.
+        let trimmed = body.trim();
+        if let Ok(code) = trimmed.parse::<i32>() {
+            return Some(Self {
+                code,
+                name: None,
+                message: String::new(),
+                stack_trace: None,
+            });
+        }
+
         let code: i32 = body
             .strip_prefix("Code: ")?
             .split_once('.')
@@ -211,7 +225,6 @@ mod tests {
         for body in [
             "404 Not Found",
             "",
-            // Upstream drops the header code, so the body is the only source.
             "DB::Exception: oops",
             // A code but no message left after stripping.
             "Code: 60. DB::Exception: (UNKNOWN_TABLE)",
@@ -223,6 +236,23 @@ mod tests {
             );
         }
         assert!(ServerException::parse(&Error::TimedOut).is_none());
+    }
+
+    /// Declining a bare code loses the only field a caller classifies on.
+    #[test]
+    fn parse_accepts_the_bare_code_upstream_falls_back_to() {
+        let exc = ServerException::parse(&Error::BadResponse("117".into()))
+            .expect("a bare exception code is a rejection, not junk");
+        assert_eq!(exc.code, 117);
+        assert_eq!(exc.name, None);
+        assert!(exc.message.is_empty(), "no message is on the wire to read");
+        assert!(exc.stack_trace.is_none());
+
+        // Whitespace is upstream's own `trim`, and a retriable code still reads.
+        let exc = ServerException::parse(&Error::BadResponse(" 202 ".into()))
+            .expect("a padded bare code still parses");
+        assert_eq!(exc.code, 202);
+        assert!(exc.is_retriable());
     }
 
     #[test]
