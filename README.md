@@ -16,10 +16,8 @@ Extensions for the official client, as a separate crate depending on the
 published `clickhouse` release. Adds a native TCP transport, runtime-schema
 inserts, and one client that dispatches over either.
 
-```toml
-[dependencies]
-clickhouse = "0.15"
-clickhouse-dfe = "0.1"
+```console
+cargo add clickhouse clickhouse-dfe
 ```
 
 ## Extension traits on the HTTP client
@@ -43,8 +41,8 @@ client.ping().await?;
 
 ## Native TCP
 
-```toml
-clickhouse-dfe = { version = "0.1", features = ["tcp"] }
+```console
+cargo add clickhouse-dfe --features tcp
 ```
 
 Reads are column-typed, and `JSON`, `Variant` and `Dynamic` decode to their
@@ -68,8 +66,8 @@ for block in &blocks {
 
 ## Runtime-schema inserts
 
-```toml
-clickhouse-dfe = { version = "0.1", features = ["dynamic"] }
+```console
+cargo add clickhouse-dfe --features dynamic
 ```
 
 Rows arrive as `serde_json::Map`, column types come from `system.columns`.
