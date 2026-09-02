@@ -722,6 +722,63 @@ mod tests {
         }
     }
 
+    /// `read_hello` is the most exposed reader in the crate: it runs before
+    /// anything has authenticated the peer, so its whole input is hostile by
+    /// default. Raising the advertised revision to 54473 widened it -- a
+    /// parallel-replicas varuint, two chunked-protocol strings, a
+    /// peer-counted password-complexity list and an 8-byte nonce -- and the
+    /// list's count is the one field that sizes a loop from a number the peer
+    /// chose. `MAX_PASSWORD_COMPLEXITY_RULES` bounds it; this proves the
+    /// bound holds for inputs nobody thought to write by hand.
+    #[tokio::test]
+    async fn read_hello_survives_garbage_and_truncation() {
+        let mut good = Vec::new();
+        good.write_string(b"ClickHouse server").await.unwrap();
+        good.write_var_uint(25).await.unwrap();
+        good.write_var_uint(4).await.unwrap();
+        good.write_var_uint(DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
+        good.write_var_uint(0).await.unwrap();
+        good.write_string(b"Etc/UTC").await.unwrap();
+        good.write_string(b"ch-01").await.unwrap();
+        good.write_var_uint(7).await.unwrap();
+        good.write_string(b"notchunked").await.unwrap();
+        good.write_string(b"notchunked").await.unwrap();
+        good.write_var_uint(0).await.unwrap();
+        good.write_all(&[0u8; 8]).await.unwrap();
+
+        let mut rng = Prng(0x2545_F491_4F6C_DD1D);
+        for case in 0..4096u32 {
+            let mut bytes = good.clone();
+            match case % 4 {
+                0 => {
+                    let cut = (rng.next_u64() as usize) % (bytes.len() + 1);
+                    bytes.truncate(cut);
+                }
+                1 => {
+                    let at = (rng.next_u64() as usize) % bytes.len();
+                    bytes[at] = rng.next_byte();
+                }
+                // Corrupt the complexity-rule count specifically, which is
+                // where a peer-supplied number reaches a loop bound.
+                2 => {
+                    let at = bytes.len() - 9;
+                    for b in bytes.iter_mut().skip(at).take(4) {
+                        *b = rng.next_byte() | 0x80;
+                    }
+                }
+                _ => {
+                    let len = (rng.next_u64() as usize) % 96;
+                    bytes = (0..len).map(|_| rng.next_byte()).collect();
+                }
+            }
+            let mut cur = Cursor::new(bytes);
+            // Either outcome is fine; a panic, a hang or an abort is not.
+            let _ = read_hello(&mut cur).await;
+        }
+    }
+
     /// `read_packet` faces bytes from an unauthenticated peer until the
     /// handshake completes and from a possibly-buggy one after, so it
     /// must return `Ok` or `Err` for any input -- never panic, and never

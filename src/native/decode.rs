@@ -2754,6 +2754,94 @@ mod tests {
         }
     }
 
+    /// A decode that stops short of the body it was handed leaves the leftover
+    /// bytes for the next packet's header, and the connection reads garbage
+    /// from there on. The error that results names the wrong thing: one byte
+    /// left behind by the sparse kind-stack bug reported as
+    /// `unknown server packet id 78`, columns later.
+    ///
+    /// So every successful decode must land exactly on the end of its input.
+    /// What this CANNOT catch is a fixture built to the same wrong spec as the
+    /// decoder -- agreeing with itself is not evidence. That is what the
+    /// Docker wire suite is for, where the server writes the bytes.
+    #[tokio::test]
+    async fn a_decoded_block_lands_exactly_on_the_end_of_its_body() {
+        let cases: &[(&str, u64, Vec<Vec<u8>>)] = &[
+            (
+                "UInt64",
+                3,
+                (0u64..3).map(|v| v.to_le_bytes().to_vec()).collect(),
+            ),
+            ("String", 2, vec![b"\x02hi".to_vec(), b"\x00".to_vec()]),
+            // A RowBinary NULL is the flag byte alone -- no value follows it.
+            ("Nullable(UInt8)", 2, vec![vec![0, 9], vec![1]]),
+            ("Array(UInt8)", 2, vec![vec![1, 7], vec![2, 8, 9]]),
+            (
+                "Map(String, UInt64)",
+                1,
+                vec![{
+                    let mut row = vec![1u8, 1, b'k'];
+                    row.extend_from_slice(&5u64.to_le_bytes());
+                    row
+                }],
+            ),
+            ("Tuple(UInt8, String)", 1, vec![vec![3, 1, b'x']]),
+            (
+                "LowCardinality(String)",
+                2,
+                vec![b"\x01a".to_vec(), b"\x01b".to_vec()],
+            ),
+        ];
+
+        for (type_name, rows, values) in cases {
+            let bytes = encode_one_column_block("c", type_name, values);
+            let len = bytes.len() as u64;
+            let mut cur = Cursor::new(bytes);
+            decode_block(&mut cur, 1, *rows, REV)
+                .await
+                .unwrap_or_else(|e| panic!("{type_name} decodes: {e}"));
+            assert_eq!(
+                cur.position(),
+                len,
+                "{type_name} left {} bytes on the wire",
+                len - cur.position()
+            );
+        }
+    }
+
+    /// The same guarantee for a sparse column, built to the spec rather than to
+    /// what the decoder happens to do: two header bytes (the
+    /// `has_custom_serialization` bool, then the kind-stack byte), the offsets,
+    /// then only the non-default values.
+    ///
+    /// Both assertions earn their place. Reverting the decoder to read one
+    /// header byte was checked against this test: it lands on the right END
+    /// byte anyway -- the drift cancels out over a fixture this small -- and it
+    /// is the scattered VALUES that come back wrong, `[0,42,0,0]` for
+    /// `[0,0,42,0]`. A residual-byte check alone would have passed.
+    #[tokio::test]
+    async fn a_sparse_column_lands_exactly_on_the_end_of_its_body() {
+        use crate::native::sparse::END_OF_GRANULE_FLAG;
+
+        let mut bytes = Vec::new();
+        bytes.put_string(b"c");
+        bytes.put_string(b"UInt8");
+        bytes.push(1); // has_custom_serialization
+        bytes.push(1); // KindStack {Default, Sparse}
+        bytes.put_var_uint(2); // two defaults, then a value at row 2
+        bytes.put_var_uint(1 | END_OF_GRANULE_FLAG); // one trailing default
+        bytes.push(42);
+
+        let len = bytes.len() as u64;
+        let mut cur = Cursor::new(bytes);
+        let block = decode_block(&mut cur, 1, 4, REV).await.unwrap();
+        assert_eq!(cur.position(), len, "left bytes on the wire");
+        match block.column("c").unwrap() {
+            DecodedColumn::UInt8(values) => assert_eq!(values, &[0, 0, 42, 0]),
+            other => panic!("expected UInt8, got {other:?}"),
+        }
+    }
+
     /// Upper bounds on what the property test may generate. A declared count is
     /// server-controlled, so the generator stays inside what a real block can
     /// carry: a test that allocates from an unbounded generated value is a
