@@ -1748,11 +1748,90 @@ mod tests {
         }
     }
 
+    /// A combination stack carries its own length, so the bytes are consumed
+    /// before the refusal -- a caller that retried on the same connection would
+    /// otherwise start reading mid-list.
+    #[tokio::test]
+    async fn a_combination_serialization_kind_is_consumed_then_refused() {
+        let mut bytes = Vec::new();
+        bytes.write_string(b"x").await.unwrap();
+        bytes.write_string(b"UInt8").await.unwrap();
+        bytes.push(1); // has_custom_serialization
+        bytes.push(5); // KindStackBinarySerializationType::COMBINATION
+        bytes.put_var_uint(3);
+        bytes.extend_from_slice(&[0, 1, 2]);
+        let trailing = bytes.len() as u64;
+        bytes.push(0xAB); // a sentinel the refusal must not have eaten
+
+        let mut cur = Cursor::new(bytes);
+        let err = decode_block(&mut cur, 1, 0, REV).await.unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("combination"), "got: {msg}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+        assert_eq!(cur.position(), trailing, "the kind list was not consumed");
+    }
+
+    /// The count is a varuint the peer chose, and it drives a read loop.
+    #[tokio::test]
+    async fn an_absurd_combination_kind_count_is_refused_without_reading_it() {
+        let mut bytes = Vec::new();
+        bytes.write_string(b"x").await.unwrap();
+        bytes.write_string(b"UInt8").await.unwrap();
+        bytes.push(1);
+        bytes.push(5);
+        bytes.put_var_uint(u64::MAX);
+
+        let mut cur = Cursor::new(bytes);
+        let err = decode_block(&mut cur, 1, 0, REV).await.unwrap_err();
+        match err {
+            Error::BadResponse(msg) => {
+                assert!(msg.contains("serialization kinds"), "got: {msg}");
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// A sparse body whose value count disagrees with its offset count would
+    /// scatter into the wrong rows, so it is refused rather than zipped short.
+    #[test]
+    fn sparse_expansion_refuses_a_value_count_that_does_not_match() {
+        let err = DecodedColumn::UInt8(vec![1, 2, 3])
+            .expand_sparse(&[0, 2], 4)
+            .unwrap_err();
+        match err {
+            Error::BadResponse(msg) => {
+                assert!(msg.contains("3 values for 2 positions"), "got: {msg}");
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// A position past the block's rows would index out of bounds, which is a
+    /// panic rather than an error unless it is caught here first.
+    #[test]
+    fn sparse_expansion_refuses_a_position_past_the_block() {
+        let err = DecodedColumn::UInt8(vec![7])
+            .expand_sparse(&[9], 4)
+            .unwrap_err();
+        match err {
+            Error::BadResponse(msg) => {
+                assert!(msg.contains("past the block's 4 rows"), "got: {msg}");
+            }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
     /// A kind stack we cannot decode is named, not guessed at -- reading the
     /// body under the wrong serialisation would desync the whole connection.
     #[tokio::test]
     async fn rejects_a_serialization_kind_it_cannot_decode() {
-        for (kind, want) in [(2u8, "Detached"), (4u8, "Replicated")] {
+        for (kind, want) in [
+            (2u8, "Detached"),
+            (3u8, "Detached over Sparse"),
+            (4u8, "Replicated"),
+            (6u8, "kind 6"),
+        ] {
             let mut bytes = Vec::new();
             bytes.write_string(b"x").await.unwrap();
             bytes.write_string(b"UInt8").await.unwrap();

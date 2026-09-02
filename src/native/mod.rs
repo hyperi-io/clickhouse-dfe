@@ -2,7 +2,10 @@
 //! encoding, independent of the transport that carries it.
 //!
 //! HOT PATH. Every row in and out of the server passes through here, so this
-//! module carries the 90% coverage floor rather than the repo's 80%.
+//! module is held to a 90% line-coverage target rather than the repo's 80%
+//! floor. It does not meet it yet -- see `docs/COVERAGE.md` for the current
+//! numbers and where the gap is. Adding a wire format here means adding the
+//! test with it.
 //!
 //! Upstream's `src/rowbinary/` is row-oriented; this module is the columnar
 //! primitive that lets the server write blocks into its merge tree without a
