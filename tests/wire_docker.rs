@@ -580,6 +580,67 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
     );
 }
 
+/// A root-level JSON array is unwritable as-is, which is why the dynamic
+/// encoder wraps one. Both halves are proved here rather than assumed: the
+/// server's refusal, and the wrapped document reading back.
+#[tokio::test]
+async fn a_root_json_array_is_rejected_raw_and_round_trips_wrapped() {
+    use std::sync::Arc;
+
+    use serde_json::{Map, json};
+
+    use clickhouse_dfe::dynamic::{
+        ColumnDef, DynamicInsert, DynamicSchema, JSON_ARRAY_WRAPPER_KEY,
+    };
+
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let client = server.tcp();
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+    client
+        .execute("CREATE OR REPLACE TABLE wire.tags (t JSON) ENGINE = MergeTree ORDER BY tuple()")
+        .await
+        .unwrap();
+
+    let unwrapped = client
+        .execute(r#"INSERT INTO wire.tags VALUES (CAST('["a","b"]', 'JSON'))"#)
+        .await;
+
+    let schema = Arc::new(DynamicSchema::from_columns(
+        "wire.tags",
+        vec![ColumnDef::new("t", "JSON")],
+    ));
+    let mut insert = DynamicInsert::tcp(
+        client.as_tcp().expect("the tcp arm").clone(),
+        "wire",
+        "tags",
+        schema,
+    );
+    let mut row = Map::new();
+    row.insert("t".to_string(), json!(["a", "b"]));
+    insert.write_map(&row).await.expect("the row encodes");
+    insert.end().await.expect("the insert commits");
+
+    let read = client.fetch_columns("SELECT t FROM wire.tags").await;
+    server.stop().await;
+
+    let err = unwrapped.expect_err("a root array is not a JSON document the column accepts");
+    assert!(
+        format!("{err}").contains("117"),
+        "the server must refuse it as code 117, got: {err}"
+    );
+    assert_eq!(
+        read.expect("the wrapped document reads back")
+            .get::<String>("t")
+            .unwrap(),
+        [format!(r#"{{"{JSON_ARRAY_WRAPPER_KEY}":["a","b"]}}"#)]
+    );
+}
+
 /// The JSON serialisation this crate does NOT decode, pinned as the clean
 /// error it is rather than left to surprise someone.
 ///

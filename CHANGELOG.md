@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `ClientExt` on `clickhouse::Client`: ping, kill query, query id, session id, role, plus `ServerException` parsed from a server error body with a retriable-code test
 - Server-side query parameters over TCP: `TcpQuery::param` emits the Query packet's parameters section, so `{name:Type}` binds instead of being interpolated
 - `column_as` reaches every scalar the decoder produces, and `Option<T>` works wherever `T` does
+- A root-level JSON array written to a `JSON` column is wrapped as `{"_values": [...]}` (`dynamic::JSON_ARRAY_WRAPPER_KEY`), because ClickHouse's JSON parser accepts only an object at the root and rejects an array with code 117. An array nested inside an object is untouched
 
 ### Fixed
 

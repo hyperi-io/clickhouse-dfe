@@ -26,7 +26,7 @@ pub mod insert;
 pub mod parsed_type;
 pub mod schema;
 
-pub use encode::{ColumnDef, DynamicRow};
+pub use encode::{ColumnDef, DynamicRow, JSON_ARRAY_WRAPPER_KEY};
 pub use error::DynamicError;
 pub use insert::DynamicInsert;
 pub use parsed_type::{ParsedType, TypeTag};
