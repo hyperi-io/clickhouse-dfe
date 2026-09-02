@@ -30,7 +30,11 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [features]
-default = ["tcp", "lz4"]
+# The HTTP client is the default story: upstream's `clickhouse::Client` plus
+# our extension traits. `ext` pulls no dependencies of its own, and the native
+# transport is a deliberate opt-in rather than something every consumer pays
+# for. Adding to this set later is non-breaking; removing from it is not.
+default = ["lz4", "ext"]
 tcp = ["dep:deadpool", "dep:socket2", "dep:backon"]
 tls = [
     "tcp",

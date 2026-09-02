@@ -1,49 +1,20 @@
 # clickhouse-dfe
 
-HyperI extensions for the official ClickHouse Rust client. It depends on
-`clickhouse` from crates.io and adds the pieces that client does not ship: a
-native TCP transport, runtime-schema inserts, and one client that dispatches
-over either transport.
+<!-- BADGES:START -->
+[![Build Status](https://github.com/hyperi-io/clickhouse-dfe/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/clickhouse-dfe/actions)
+[![Crates.io](https://img.shields.io/crates/v/clickhouse-dfe?logo=rust)](https://crates.io/crates/clickhouse-dfe)
+[![docs.rs](https://img.shields.io/docsrs/clickhouse-dfe?logo=rust)](https://docs.rs/clickhouse-dfe)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/hyperi-io/clickhouse-dfe/blob/main/LICENSE)
+<!-- BADGES:END -->
 
-Pre-release. The API is unstable and will change without a deprecation cycle
-until 1.0.
+> The official ClickHouse Rust client speaks HTTP and nothing else. Plenty of
+> deployments expose port 9000 and no HTTP at all. `JSON`, `Variant` and
+> `Dynamic` columns do not read. Inserting needs a struct known at compile
+> time, which a loader taking arbitrary shapes off a topic does not have.
 
-## Status
-
-The TCP transport is in -- connection actor, deadpool pool, retry, TLS trust and
-the Native-format wire codec.
-
-Reads over TCP are column-typed: `client.query(sql).fetch_blocks()`, then values
-by column name off each block. Row-typed `fetch::<T>()` and `insert::<T>()` are
-not in -- they need two small upstream re-exports of the RowBinary row serialiser
-and deserialiser.
-
-`JSON` columns travel over TCP as `String` in both directions: an insert declares
-them as `String` and the server casts, and every query asks for
-`output_format_native_write_json_as_string=1` so they come back as JSON text.
-`TcpClient::with_json_as_string(false)` turns the read side off, at which point a
-JSON column arrives in the V2 path-based serialisation and decodes from that
-instead. The setting stays on by default because the text form costs the server
-nothing to produce.
-
-## Layers
-
-Every layer is a feature. Take what you need and pay for nothing else.
-
-| Feature | What it adds |
-|---|---|
-| `tcp` | Native TCP transport -- connection actor, deadpool pool, retry, Native-format wire codec |
-| `tls` | rustls trust for the TCP transport (implies `tcp`) |
-| `lz4` | LZ4 compression for the HTTP transport, forwarded to upstream. The TCP handshake negotiates no compression |
-| `zstd` | Zstd compression for the HTTP transport, forwarded to upstream. The TCP handshake negotiates no compression |
-| `dynamic` | Runtime-schema insert from `serde_json::Map` rows -- `FORMAT RowBinary` over HTTP, `FORMAT Native` over TCP (implies `ext`) |
-| `unified` | One client over HTTP `clickhouse::Client` and our `TcpClient` (implies `tcp`) |
-| `ext` | Extension traits on `clickhouse::Client` -- ping, kill query, query id, session id, role, typed server exceptions |
-| `full` | All of the above |
-
-Default is `tcp` plus `lz4`. `lz4` affects the HTTP path only -- the TCP
-handshake sends no compression, so a default build that uses only the native
-transport pays nothing for it.
+Extensions for the official client, as a separate crate depending on the
+published `clickhouse` release. Adds a native TCP transport, runtime-schema
+inserts, and one client that dispatches over either.
 
 ```toml
 [dependencies]
@@ -51,53 +22,95 @@ clickhouse = "0.15"
 clickhouse-dfe = "0.1"
 ```
 
-## Tests
+## Extension traits on the HTTP client
 
-```bash
-cargo test --all-features
+`ping`, `kill_query`, `with_query_id`, `with_session_id`, `with_role`, and
+`ServerException::parse` for a typed error carrying the server's own code.
+
+```rust,no_run
+use clickhouse::Client;
+use clickhouse_dfe::ClientExt;
+
+# async fn example() -> clickhouse_dfe::Result<()> {
+let client = Client::default()
+    .with_url("http://localhost:8123")
+    .with_query_id("nightly-rollup");
+
+client.ping().await?;
+# Ok(())
+# }
 ```
 
-That runs the unit tests and the wire suite, which starts a pinned ClickHouse
-in Docker and round-trips every supported column type over both transports.
-Without a container runtime the wire tests skip with a message, except under
-`$CI`, where they fail rather than disappear. `cargo nextest run` serialises
-them to one server at a time; plain `cargo test` does the same through a
-semaphore.
+## Native TCP
 
-The suites ending in `_live` are `#[ignore]`d because they need a real cluster.
-Point them at one and opt in:
-
-```bash
-env CLICKHOUSE_DFE_ENV_FILE=/path/to/.env \
-  cargo test --all-features -- --ignored
+```toml
+clickhouse-dfe = { version = "0.1", features = ["tcp"] }
 ```
 
-The env file supplies `CLICKHOUSE_HOST`, `CLICKHOUSE_NATIVE_PORT`,
-`CLICKHOUSE_HTTP_PORT`, `CLICKHOUSE_TLS`, `CLICKHOUSE_USER`,
-`CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE` and `CLICKHOUSE_CLUSTER`.
+Reads are column-typed, and `JSON`, `Variant` and `Dynamic` decode to their
+per-row document text.
 
-## Relationship to upstream
+```rust,ignore
+use clickhouse_dfe::TcpClient;
 
-This is not a fork. It is a separate crate that depends on the published
-`clickhouse` release, and that dependency is the only link -- no `git`, no
-`path`, no `[patch]`.
+let client = TcpClient::new("localhost:9000").with_database("default");
+let blocks = client
+    .query("SELECT number FROM system.numbers LIMIT 10")
+    .fetch_blocks()
+    .await?;
 
-Files here stay close to upstream conventions (same edition, same MSRV, same
-rustfmt settings, same lint set) so that
+for block in &blocks {
+    for n in block.column_as::<u64>("number")? {
+        println!("{n}");
+    }
+}
+```
+
+## Runtime-schema inserts
+
+```toml
+clickhouse-dfe = { version = "0.1", features = ["dynamic"] }
+```
+
+Rows arrive as `serde_json::Map`, column types come from `system.columns`.
+Binary on the wire either way -- `FORMAT RowBinary` over HTTP, `FORMAT Native`
+over TCP -- so the server does no JSON parsing.
+
+## Features
+
+| Feature | What it adds |
+|---|---|
+| `ext` | Extension traits on `clickhouse::Client` (default) |
+| `lz4` | LZ4 for the HTTP transport, forwarded to upstream (default) |
+| `zstd` | Zstd for the HTTP transport, forwarded to upstream |
+| `tcp` | Native TCP transport: connection actor, pool, retry, wire codec |
+| `tls` | rustls trust for the TCP transport (implies `tcp`) |
+| `dynamic` | Runtime-schema inserts (implies `ext`) |
+| `unified` | One client over both transports (implies `tcp`) |
+| `full` | All of the above |
+
+Default is `ext` plus `lz4`, neither of which adds a dependency beyond
+upstream's. `tcp` brings deadpool, socket2 and backon.
+
+## Documentation
+
+| Read | When |
+|---|---|
+| [type-support](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/TYPE-SUPPORT.md) | Checking whether a column type reads and writes |
+| [insert-formats](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/INSERT-FORMATS.md) | Asking why there is no JSONEachRow option |
+| [unified-client](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/UNIFIED-CLIENT.md) | Choosing a transport at runtime |
+| [coverage](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/COVERAGE.md) | Adding to a hot-path module |
+
+## Upstream
+
+Not a fork. The dependency on the published `clickhouse` release is the only
+link -- no `git`, no `path`, no `[patch]`. Same edition, MSRV, rustfmt settings
+and lint set, so
 [ClickHouse/clickhouse-rs](https://github.com/ClickHouse/clickhouse-rs) can
-cherry-pick from this crate without a reformat or a relicensing step.
-
-## Updating from upstream
-
-Bump the `clickhouse` version in `Cargo.toml`, run `cargo update -p clickhouse`,
-run the tests, and release. That is the whole procedure -- there is no fork to
-rebase and no patch to reapply, because the dependency is a published crates.io
-version. Renovate raises the bump PR on its own once a new release is a week
-old; a bump that turns red is telling you which layer has drifted from
-upstream's public API, and that layer is where the fix goes.
+cherry-pick from here without a reformat or a relicence.
 
 ## Licence
 
-Apache-2.0, which is one of the two options upstream offers, so code moves in
-either direction unchanged. Files derived from upstream keep upstream's own
-`MIT OR Apache-2.0` notice. See `NOTICE` for the attribution.
+Apache-2.0. See
+[LICENSE](https://github.com/hyperi-io/clickhouse-dfe/blob/main/LICENSE) and
+[NOTICE](https://github.com/hyperi-io/clickhouse-dfe/blob/main/NOTICE).
