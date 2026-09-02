@@ -13,10 +13,10 @@
 //! failure here is this crate's decoder rather than its encoder; the encoder
 //! is covered separately, and by one test that uses the server as its oracle.
 //!
-//! These are NOT `#[ignore]`. `hyperi-ci` runs `cargo nextest` with no way to
-//! pass `--run-ignored`, so an ignored test here is one CI silently never
-//! runs. Without a container runtime they fail under `$CI` and skip with a
-//! message anywhere else.
+//! None of these is `#[ignore]`d. `hyperi-ci` runs `cargo nextest` with no way
+//! to pass `--run-ignored`, so an ignored test here is one CI never runs.
+//! Without a container runtime they fail under `$CI` and skip with a message
+//! anywhere else.
 //!
 //! ```text
 //! cargo test --all-features --test wire_docker
@@ -65,8 +65,9 @@ fn docker_endpoint_exists() -> bool {
     })
 }
 
-/// Gate every test on a container runtime. CI must never quietly lose this
-/// suite, so a missing endpoint fails there and skips honestly elsewhere.
+/// Gate every test on a container runtime: a missing endpoint fails under
+/// `$CI`, so the suite cannot go missing there, and skips with a message
+/// anywhere else.
 macro_rules! require_docker {
     () => {
         if !docker_endpoint_exists() {
@@ -416,15 +417,14 @@ const VALUE_COLUMNS: &[(&str, &str, &str, &str)] = &[
     ("e8", "Enum8('a' = 1, 'b' = -2)", "'a'", "'b'"),
 ];
 
-/// The matrix proves the two transports agree. Agreement is not correctness:
-/// since `client_protocol_version` put HTTP on this crate's own codec, both
-/// sides of that comparison are the same decoder, and one that is wrong the
-/// same way on both passes it.
+/// The matrix asserts the two transports agree, and since
+/// `client_protocol_version` put HTTP on this crate's own codec, both sides of
+/// that comparison run the same decoder -- so it cannot catch a value misread
+/// the same way twice.
 ///
-/// So pin the values themselves. The expectations come from the literal the
-/// SQL asked for and `ClickHouse`'s own representation of it -- days since the
-/// epoch, unscaled decimal integers, network-order address bytes -- none of
-/// which this crate had any part in choosing.
+/// These expectations come from the SQL literal and `ClickHouse`'s own
+/// representation of it instead: days since the epoch, unscaled decimal
+/// integers, network-order address bytes.
 #[tokio::test]
 async fn decoded_values_match_what_the_literals_asked_for() {
     require_docker!();
@@ -682,11 +682,11 @@ async fn json_without_the_string_flag_is_a_clean_error_not_a_misread() {
 /// A `MergeTree` column that is almost all defaults, merged into one part, is
 /// stored with sparse serialisation. Real tables look like this.
 ///
-/// This passes, but it does NOT yet prove the sparse form reached the wire:
-/// the server may have materialised the column before sending, and this
-/// decoder rejects a non-zero custom-serialization flag outright, so it would
-/// have failed loudly if it had. Proving the wire form needs the flag
-/// observed, not just the values -- see S5.T4 step 3.
+/// Passing does not prove the sparse form reached the wire: the server may
+/// have materialised the column before sending. This decoder rejects a
+/// non-zero custom-serialization flag outright, so it would have failed loudly
+/// if it had not. Proving the wire form needs that flag observed rather than
+/// the values alone.
 #[tokio::test]
 async fn a_sparse_column_reads_back_on_both_transports() {
     const TOTAL: &str = "SELECT sum(c) AS total FROM wire.sparse";

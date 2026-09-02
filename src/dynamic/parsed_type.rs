@@ -239,7 +239,6 @@ impl ParsedType {
             break;
         }
 
-        // Check for Array
         if let Some(inner) = Self::extract_wrapper(&type_str, "Array") {
             result.base = "Array".to_string();
             result.tag = TypeTag::Array;
@@ -247,7 +246,6 @@ impl ParsedType {
             return result;
         }
 
-        // Check for Map
         if let Some(inner) = Self::extract_wrapper(&type_str, "Map")
             && let Some((key, value)) = Self::split_type_args(&inner)
         {
