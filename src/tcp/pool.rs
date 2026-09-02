@@ -1,8 +1,8 @@
 //! deadpool-managed connection pool for the TCP transport.
 //!
 //! HOT PATH. Every operation acquires from here, so this module is held to a
-//! 90% line-coverage target rather than the repo's 80% floor. It sits just
-//! under -- see `docs/COVERAGE.md`.
+//! 90% line-coverage target rather than the repo's 80% floor, and meets it.
+//! See `docs/COVERAGE.md`.
 //!
 //! Wraps [`crate::tcp::connection_actor::ConnectionHandle`] in a
 //! [`deadpool::managed::Pool`] so callers can acquire ready-to-use
@@ -77,10 +77,11 @@ pub(crate) const DEFAULT_RECYCLE_TIMEOUT: Duration = Duration::from_secs(5);
 #[non_exhaustive]
 pub struct TcpConnectionManager {
     /// Candidate server addresses as the caller supplied them.
-    /// INVARIANT: non-empty, which `Manager::create`'s round-robin
-    /// modulo arithmetic relies on. Each is resolved per connection via
-    /// the async resolver rather than pinned to a `SocketAddr`, so new A
-    /// records are picked up on reconnect.
+    /// [`build_pool`] asserts this is non-empty; `Manager::create` checks
+    /// it again rather than trusting it, since this field is public. Each
+    /// is resolved per connection via the async resolver rather than
+    /// pinned to a `SocketAddr`, so new A records are picked up on
+    /// reconnect.
     pub endpoints: Vec<String>,
     /// Round-robin cursor shared across the pool, so concurrent `create`
     /// calls spread their starting endpoint instead of all hammering
@@ -111,9 +112,16 @@ impl managed::Manager for TcpConnectionManager {
     async fn create(&self) -> Result<ConnectionHandle> {
         // Round-robin connect-failover: pick a starting endpoint via the
         // shared atomic cursor, walk the list from there in one pass,
-        // return the first that connects. `n >= 1` by the non-empty
-        // invariant on `endpoints`, so the modulo is safe.
+        // return the first that connects.
+        //
+        // `build_pool` asserts a non-empty list; a directly-constructed
+        // manager has no such guarantee, and the modulo below divides by zero.
         let n = self.endpoints.len();
+        if n == 0 {
+            return Err(Error::Connect(
+                "tcp: no endpoints configured for this pool".to_string(),
+            ));
+        }
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
         let mut last_err: Option<Error> = None;
         for i in 0..n {
@@ -151,10 +159,9 @@ impl managed::Manager for TcpConnectionManager {
                 Err(e) => last_err = Some(e),
             }
         }
-        // Every endpoint failed this pass. Surface the last error
-        // unchanged so it stays typed for retry classification; the
-        // fallback covers the unreachable empty-list case without a
-        // panic in a pool-acquire path.
+        // Every endpoint failed this pass. Surface the last error unchanged so
+        // it stays typed for retry classification. `last_err` is always set:
+        // the loop ran at least once, guarded by the emptiness check above.
         Err(last_err.unwrap_or_else(|| {
             Error::Connect("tcp: no endpoints configured for this pool".to_string())
         }))
@@ -852,6 +859,57 @@ mod tests {
             vec![1],
             "create should have connected only to the accepting endpoint after skipping the refusing one"
         );
+    }
+
+    /// A name that will not resolve fails BEFORE the connect, on a
+    /// different branch from a refused port, and the comment there claims
+    /// one bad host must not sink the pass. That claim was never tested.
+    #[tokio::test]
+    async fn create_fails_over_past_an_unresolvable_endpoint() {
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let accepting = spawn_mock_endpoint(1, 1, Arc::clone(&order)).await;
+
+        // `.invalid` is reserved by RFC 2606 and never resolves.
+        let mgr = manager_over(vec!["no-such-host.invalid:9000".to_string(), accepting]);
+        mgr.create()
+            .await
+            .expect("an unresolvable endpoint must be skipped, not fatal");
+
+        assert_eq!(
+            order.lock().unwrap().clone(),
+            vec![1],
+            "create should have reached the accepting endpoint"
+        );
+    }
+
+    /// Every endpoint unresolvable surfaces the resolver's error rather
+    /// than the empty-list fallback, so the message names the host.
+    #[tokio::test]
+    async fn create_surfaces_the_resolver_error_when_no_endpoint_resolves() {
+        let mgr = manager_over(vec![
+            "no-such-host-a.invalid:9000".to_string(),
+            "no-such-host-b.invalid:9000".to_string(),
+        ]);
+        let Err(err) = mgr.create().await else {
+            panic!("no endpoint resolves; create must not connect")
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no-such-host-b.invalid"),
+            "expected the last endpoint's resolver error, got: {msg}"
+        );
+    }
+
+    /// The empty-endpoint arm is unreachable through `build_pool`, which
+    /// asserts a non-empty list, but `create` still has to answer rather
+    /// than panic on an `unwrap` of `last_err`.
+    #[tokio::test]
+    async fn create_over_no_endpoints_errors_rather_than_panicking() {
+        let mgr = manager_over(Vec::new());
+        let Err(err) = mgr.create().await else {
+            panic!("an empty endpoint list cannot produce a connection")
+        };
+        assert!(err.to_string().contains("no endpoints configured"), "{err}");
     }
 
     /// When every endpoint refuses, a single `create` pass tries them

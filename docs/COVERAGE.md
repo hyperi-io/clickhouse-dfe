@@ -4,10 +4,9 @@ The repo floor is 80% lines. Two modules are marked `HOT PATH` in their own
 docs and held to 90% instead: `src/native/` (every row in or out of the server
 goes through it) and `src/tcp/pool.rs` (every operation acquires from it).
 
-Every module in `src/native/` meets it. `src/tcp/pool.rs` sits just under, and
-that is tracked debt rather than an oversight -- this file is where it is
-tracked, and the marker comments point here rather than asserting a number that
-would go stale the next time someone adds a type.
+Both meet it as of 2026-09-02, so there is no tracked debt right now. This file
+is where it goes if that changes -- the marker comments point here rather than
+each asserting a number that would go stale the next time someone adds a type.
 
 ## Measuring
 
@@ -30,12 +29,12 @@ Line coverage, whole suite, at protocol revision 54473.
 | Module | Lines | Against its target |
 |---|---|---|
 | `native/io.rs` | 92.6% | met |
-| `native/decode.rs` | 92.3% | met |
-| `native/encode.rs` | 91.7% | met |
+| `native/decode.rs` | 92.4% | met |
 | `native/columns.rs` | 91.7% | met |
+| `native/encode.rs` | 91.5% | met |
 | `native/sparse.rs` | 91.5% | met |
-| `tcp/pool.rs` | 88.8% | -1.2 |
-| Crate total | 91.8% | above the 90% goal |
+| `tcp/pool.rs` | 90.3% | met |
+| Crate total | 91.9% | above the 90% goal |
 
 All of `src/native/` came up in one pass, and the shape that did it is worth
 copying. Each of the three laggards had its gap concentrated in one family of
@@ -54,8 +53,13 @@ currently returns. The `LowCardinality(Nullable)` test asserts the exact
 dictionary and index bytes derived from the spec, which is the difference
 between a test that pins behaviour and one that pins a bug.
 
-`tcp/pool.rs` is the last one short. Its gap is the recycle and health-check
-paths, which want a connection that fails on demand rather than another table.
+`tcp/pool.rs` came up the same way, and the tests found something the table
+tests could not: `create` divided by the endpoint count before checking it,
+so an empty endpoint list panicked inside a pool acquire. Two comments in that
+function disagreed about it -- one claimed the non-empty invariant made the
+modulo safe, the other claimed a fallback covered the empty case without a
+panic. The fallback was unreachable. Writing the test that reached it is what
+exposed the disagreement.
 
 ## What the numbers do not tell you
 
