@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-02
+
+First release. Everything below shipped in it.
+
 ### Added
 
 - TCP transport (connection actor, deadpool pool, retry, TLS trust) and the Native-format wire codec
