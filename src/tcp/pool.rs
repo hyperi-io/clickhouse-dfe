@@ -261,10 +261,9 @@ impl Default for PoolConfig {
     }
 }
 
-/// Aggregated TCP-client knobs the `Client` builder threads through
-/// to [`build_pool`]. Held inside `Client` so `with_tcp_pool_*` /
-/// `with_tcp_addrs` builders can rebuild the pool with new dials;
-/// matches the HTTP `pool_config` shape on the same struct.
+/// Aggregated knobs [`crate::TcpClient`]'s builders thread through to
+/// [`build_pool`], held on the client so a builder that changes a dial can
+/// discard the pool and rebuild from them.
 ///
 /// Endpoints are stored as the original strings the caller supplied
 /// (e.g. `["127.0.0.1:9000"]`) so we can re-resolve at rebuild time
@@ -272,16 +271,13 @@ impl Default for PoolConfig {
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct TcpClientConfig {
-    /// Candidate server addresses as the caller supplied them.
-    /// Resolved at pool-build time, not at `Client::tcp` time, so a
-    /// hostname that gains new A records after construction picks them
-    /// up on rebuild. `Client::tcp` / `tcp_tls` set a single-element
-    /// list; `with_tcp_addrs` replaces it with the full list. A
-    /// default-constructed config (HTTP clients) leaves it empty; the
-    /// TCP pool is only built once a constructor has populated it.
+    /// Candidate server addresses as the caller supplied them, resolved at
+    /// pool-build time so a hostname that gains new A records picks them up
+    /// on rebuild. `TcpClient::new` / `new_tls` set a single-element list and
+    /// `with_addrs` replaces it.
     pub endpoints: Vec<String>,
     /// Plain vs TLS transport selection. Defaults to `Plain`; set by
-    /// `Client::tcp_tls` under the `tls` feature.
+    /// `TcpClient::new_tls` under the `tls` feature.
     pub kind: ConnectKindConfig,
     /// Handshake parameters (database, credentials, quota_key).
     pub handshake: HandshakeConfig,

@@ -50,6 +50,31 @@ clickhouse = "0.15"
 clickhouse-dfe = "0.1"
 ```
 
+## Tests
+
+```bash
+cargo test --all-features
+```
+
+That runs the unit tests and the wire suite, which starts a pinned ClickHouse
+in Docker and round-trips every supported column type over both transports.
+Without a container runtime the wire tests skip with a message, except under
+`$CI`, where they fail rather than disappear. `cargo nextest run` serialises
+them to one server at a time; plain `cargo test` does the same through a
+semaphore.
+
+The suites ending in `_live` are `#[ignore]`d because they need a real cluster.
+Point them at one and opt in:
+
+```bash
+env CLICKHOUSE_DFE_ENV_FILE=/path/to/.env \
+  cargo test --all-features -- --ignored
+```
+
+The env file supplies `CLICKHOUSE_HOST`, `CLICKHOUSE_NATIVE_PORT`,
+`CLICKHOUSE_HTTP_PORT`, `CLICKHOUSE_TLS`, `CLICKHOUSE_USER`,
+`CLICKHOUSE_PASSWORD`, `CLICKHOUSE_DATABASE` and `CLICKHOUSE_CLUSTER`.
+
 ## Relationship to upstream
 
 This is not a fork. It is a separate crate that depends on the published

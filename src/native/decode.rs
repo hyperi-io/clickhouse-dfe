@@ -104,17 +104,18 @@ async fn read_u256_column<R: ClickHouseRead>(r: &mut R, n: usize) -> Result<Vec<
 #[non_exhaustive]
 pub enum DecodedColumn {
     // Numeric scalars.
-    /// `UInt8` values in wire order -- `Bool` and `Enum8` decode here too.
+    /// `UInt8` values in wire order -- `Bool` decodes here too.
     UInt8(Vec<u8>),
-    /// `UInt16` values in wire order -- `Enum16` decodes here too.
+    /// `UInt16` values in wire order.
     UInt16(Vec<u16>),
     /// `UInt32` values in wire order.
     UInt32(Vec<u32>),
     /// `UInt64` values in wire order.
     UInt64(Vec<u64>),
-    /// `Int8` values in wire order.
+    /// `Int8` values in wire order -- `Enum8` decodes here too, because its
+    /// ordinals are signed.
     Int8(Vec<i8>),
-    /// `Int16` values in wire order.
+    /// `Int16` values in wire order -- `Enum16` decodes here too.
     Int16(Vec<i16>),
     /// `Int32` values in wire order.
     Int32(Vec<i32>),
@@ -737,10 +738,10 @@ fn decode_prefixes<'a, R: ClickHouseRead + 'a>(
 /// The zero-row shape of `col_type`, for a block that carries no column bytes.
 fn empty_column(col_type: &ColumnType) -> DecodedColumn {
     match col_type {
-        ColumnType::UInt8 | ColumnType::Enum8 => DecodedColumn::UInt8(Vec::new()),
-        ColumnType::Int8 => DecodedColumn::Int8(Vec::new()),
-        ColumnType::UInt16 | ColumnType::Enum16 => DecodedColumn::UInt16(Vec::new()),
-        ColumnType::Int16 => DecodedColumn::Int16(Vec::new()),
+        ColumnType::UInt8 => DecodedColumn::UInt8(Vec::new()),
+        ColumnType::Int8 | ColumnType::Enum8 => DecodedColumn::Int8(Vec::new()),
+        ColumnType::UInt16 => DecodedColumn::UInt16(Vec::new()),
+        ColumnType::Int16 | ColumnType::Enum16 => DecodedColumn::Int16(Vec::new()),
         ColumnType::UInt32 => DecodedColumn::UInt32(Vec::new()),
         ColumnType::Int32 => DecodedColumn::Int32(Vec::new()),
         ColumnType::UInt64 => DecodedColumn::UInt64(Vec::new()),
@@ -881,11 +882,13 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
         })?;
 
         match col_type {
-            ColumnType::UInt8 | ColumnType::Enum8 => {
+            ColumnType::UInt8 => {
                 let buf = read_exact_grown(r, n).await?;
                 Ok(DecodedColumn::UInt8(buf))
             }
-            ColumnType::Int8 => {
+            // An `Enum8` ordinal is signed, so it decodes as `Int8` rather
+            // than as its unsigned wire byte.
+            ColumnType::Int8 | ColumnType::Enum8 => {
                 let raw = read_exact_grown(r, n).await?;
                 // Reinterpret as i8 without an extra copy: i8 and u8
                 // have identical layout, the cast is lossless and the
@@ -896,10 +899,10 @@ fn decode_column<'a, R: ClickHouseRead + 'a>(
                 let buf: Vec<i8> = raw.into_iter().map(|b| b as i8).collect();
                 Ok(DecodedColumn::Int8(buf))
             }
-            ColumnType::UInt16 | ColumnType::Enum16 => {
-                Ok(DecodedColumn::UInt16(read_le_column::<_, u16>(r, n).await?))
+            ColumnType::UInt16 => Ok(DecodedColumn::UInt16(read_le_column::<_, u16>(r, n).await?)),
+            ColumnType::Int16 | ColumnType::Enum16 => {
+                Ok(DecodedColumn::Int16(read_le_column::<_, i16>(r, n).await?))
             }
-            ColumnType::Int16 => Ok(DecodedColumn::Int16(read_le_column::<_, i16>(r, n).await?)),
             ColumnType::UInt32 => Ok(DecodedColumn::UInt32(read_le_column::<_, u32>(r, n).await?)),
             ColumnType::Int32 => Ok(DecodedColumn::Int32(read_le_column::<_, i32>(r, n).await?)),
             ColumnType::UInt64 => Ok(DecodedColumn::UInt64(read_le_column::<_, u64>(r, n).await?)),

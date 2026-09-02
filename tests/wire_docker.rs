@@ -13,21 +13,26 @@
 //! failure here is this crate's decoder rather than its encoder; the encoder
 //! is covered separately, and by one test that uses the server as its oracle.
 //!
-//! Run with `--test-threads=1`: one ClickHouse at a time on the host.
+//! These are NOT `#[ignore]`. `hyperi-ci` runs `cargo nextest` with no way to
+//! pass `--run-ignored`, so an ignored test here is one CI silently never
+//! runs. Without a container runtime they fail under `$CI` and skip with a
+//! message anywhere else.
 //!
 //! ```text
-//! cargo test --all-features --test wire_docker -- --include-ignored --test-threads=1
+//! cargo test --all-features --test wire_docker
 //! ```
 
 #![cfg(all(feature = "tcp", feature = "unified", feature = "dynamic"))]
 // Helpers sit outside #[test], so clippy's in-test exemption misses them.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::path::Path;
 use std::time::Duration;
 
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
+use tokio::sync::Semaphore;
 
 use clickhouse::Client;
 use clickhouse_dfe::native::DecodedBlock;
@@ -38,6 +43,42 @@ const IMAGE_TAG: &str = "26.3.21.7";
 
 /// Enough for the matrix, far below what an unbounded server would take.
 const CONTAINER_MEMORY_BYTES: i64 = 2 * 1024 * 1024 * 1024;
+
+/// One server at a time. `cargo test` runs a binary's tests as threads in one
+/// process, so this bounds them; `nextest` forks a process per test, where
+/// `.config/nextest.toml`'s test-group does the same job instead.
+static ONE_SERVER: Semaphore = Semaphore::const_new(1);
+
+/// Sockets `testcontainers` will find without `DOCKER_HOST` being set.
+const DOCKER_SOCKETS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock"];
+
+fn docker_endpoint_exists() -> bool {
+    if std::env::var_os("DOCKER_HOST").is_some() {
+        return true;
+    }
+    if DOCKER_SOCKETS.iter().any(|s| Path::new(s).exists()) {
+        return true;
+    }
+    std::env::var_os("XDG_RUNTIME_DIR").is_some_and(|dir| {
+        let dir = Path::new(&dir);
+        dir.join("docker.sock").exists() || dir.join("podman/podman.sock").exists()
+    })
+}
+
+/// Gate every test on a container runtime. CI must never quietly lose this
+/// suite, so a missing endpoint fails there and skips honestly elsewhere.
+macro_rules! require_docker {
+    () => {
+        if !docker_endpoint_exists() {
+            assert!(
+                std::env::var_os("CI").is_none(),
+                "CI runs the wire suite: no Docker endpoint (DOCKER_HOST unset, no socket)"
+            );
+            eprintln!("skipped: no Docker endpoint -- start dockerd or set DOCKER_HOST");
+            return;
+        }
+    };
+}
 
 struct Server {
     container: ContainerAsync<GenericImage>,
@@ -250,8 +291,9 @@ fn rendered(columns: &Columns, name: &str) -> Result<String, String> {
 /// HTTP. Both go through this crate's Native codec, so a divergence is a
 /// transport-specific bug in the framing around it.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn every_type_decodes_identically_on_both_transports() {
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let (tcp, http) = (server.tcp(), server.http());
     tcp.execute("CREATE DATABASE IF NOT EXISTS wire")
@@ -322,12 +364,156 @@ async fn run_case(
     }
 }
 
+/// Columns whose wire representation this test pins, as
+/// `(name, ClickHouse type, row 0, row 1)`.
+///
+/// Left out deliberately: `UUID`, whose 16 bytes have a byte order worth
+/// pinning against the server source rather than against a value guessed here,
+/// and the composites, which have no flat Rust shape to compare.
+const VALUE_COLUMNS: &[(&str, &str, &str, &str)] = &[
+    ("u8", "UInt8", "0", "255"),
+    ("u64", "UInt64", "0", "18446744073709551615"),
+    (
+        "u128",
+        "UInt128",
+        "0",
+        "340282366920938463463374607431768211455",
+    ),
+    ("i8", "Int8", "-128", "127"),
+    (
+        "i64",
+        "Int64",
+        "-9223372036854775808",
+        "9223372036854775807",
+    ),
+    (
+        "i128",
+        "Int128",
+        "-170141183460469231731687303715884105728",
+        "0",
+    ),
+    ("f64", "Float64", "-1.5", "3.25"),
+    ("b", "Bool", "true", "false"),
+    ("s", "String", "''", "concat('a', char(0), 'b')"),
+    ("d", "Date", "'1970-01-01'", "'2149-06-06'"),
+    (
+        "dt",
+        "DateTime('UTC')",
+        "'1970-01-01 00:00:00'",
+        "'2106-02-07 06:28:15'",
+    ),
+    (
+        "dt64",
+        "DateTime64(3, 'UTC')",
+        "'1970-01-01 00:00:00.000'",
+        "'1970-01-01 00:00:01.500'",
+    ),
+    ("dec32", "Decimal(9, 2)", "'-1234567.89'", "'0.01'"),
+    ("dec64", "Decimal(18, 4)", "'-1.0001'", "'12345678901.2345'"),
+    ("u256", "UInt256", "0", "1"),
+    ("ip4", "IPv4", "'0.0.0.0'", "'127.0.0.1'"),
+    ("ip6", "IPv6", "'::'", "'::1'"),
+    ("e8", "Enum8('a' = 1, 'b' = -2)", "'a'", "'b'"),
+];
+
+/// The matrix proves the two transports agree. Agreement is not correctness:
+/// since `client_protocol_version` put HTTP on this crate's own codec, both
+/// sides of that comparison are the same decoder, and one that is wrong the
+/// same way on both passes it.
+///
+/// So pin the values themselves. The expectations come from the literal the
+/// SQL asked for and `ClickHouse`'s own representation of it -- days since the
+/// epoch, unscaled decimal integers, network-order address bytes -- none of
+/// which this crate had any part in choosing.
+#[tokio::test]
+async fn decoded_values_match_what_the_literals_asked_for() {
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
+    let server = server().await;
+    let client = server.tcp();
+    client
+        .execute("CREATE DATABASE IF NOT EXISTS wire")
+        .await
+        .unwrap();
+
+    let columns: Vec<String> = VALUE_COLUMNS
+        .iter()
+        .map(|(name, ty, ..)| format!("{name} {ty}"))
+        .collect();
+    let first: Vec<&str> = VALUE_COLUMNS.iter().map(|(.., a, _)| *a).collect();
+    let second: Vec<&str> = VALUE_COLUMNS.iter().map(|(.., b)| *b).collect();
+    client
+        .execute(&format!(
+            "CREATE OR REPLACE TABLE wire.values_ (ord UInt8, {}) \
+             ENGINE = MergeTree ORDER BY ord",
+            columns.join(", ")
+        ))
+        .await
+        .unwrap();
+    client
+        .execute(&format!(
+            "INSERT INTO wire.values_ VALUES (0, {}), (1, {})",
+            first.join(", "),
+            second.join(", ")
+        ))
+        .await
+        .unwrap();
+
+    let got = client
+        .fetch_columns("SELECT * FROM wire.values_ ORDER BY ord")
+        .await;
+    server.stop().await;
+    let got = got.expect("the pinned-value row pair reads back");
+
+    assert_eq!(got.get::<u8>("u8").unwrap(), [0, 255]);
+    assert_eq!(got.get::<u64>("u64").unwrap(), [0, u64::MAX]);
+    assert_eq!(got.get::<u128>("u128").unwrap(), [0, u128::MAX]);
+    assert_eq!(got.get::<i8>("i8").unwrap(), [i8::MIN, i8::MAX]);
+    assert_eq!(got.get::<i64>("i64").unwrap(), [i64::MIN, i64::MAX]);
+    assert_eq!(got.get::<i128>("i128").unwrap(), [i128::MIN, 0]);
+    assert_eq!(got.get::<f64>("f64").unwrap(), [-1.5, 3.25]);
+    assert_eq!(got.get::<bool>("b").unwrap(), [true, false]);
+    // A ClickHouse String is bytes, so the NUL survives and UTF-8 is not
+    // assumed.
+    assert_eq!(
+        got.get::<Vec<u8>>("s").unwrap(),
+        [b"".to_vec(), b"a\0b".to_vec()]
+    );
+    // Date is days since the epoch on a UInt16 backing; 2149-06-06 is the last
+    // representable day.
+    assert_eq!(got.get::<u16>("d").unwrap(), [0, u16::MAX]);
+    assert_eq!(got.get::<u32>("dt").unwrap(), [0, u32::MAX]);
+    // DateTime64(3) counts milliseconds.
+    assert_eq!(got.get::<i64>("dt64").unwrap(), [0, 1_500]);
+    // A Decimal reads as its unscaled backing integer: -1234567.89 at scale 2.
+    assert_eq!(got.get::<i32>("dec32").unwrap(), [-123_456_789, 1]);
+    assert_eq!(
+        got.get::<i64>("dec64").unwrap(),
+        [-10_001, 123_456_789_012_345]
+    );
+    // 256-bit values come back as raw little-endian bytes, so 1 is a low byte.
+    let u256 = got.get::<[u8; 32]>("u256").unwrap();
+    assert_eq!(u256[0], [0u8; 32]);
+    let mut one = [0u8; 32];
+    one[0] = 1;
+    assert_eq!(u256[1], one);
+    // IPv4 is a UInt32: 127.0.0.1 is 0x7F000001.
+    assert_eq!(got.get::<u32>("ip4").unwrap(), [0, 0x7F00_0001]);
+    // IPv6 is 16 bytes in network order, so ::1 sets only the last.
+    let ip6 = got.get::<[u8; 16]>("ip6").unwrap();
+    assert_eq!(ip6[0], [0u8; 16]);
+    let mut loopback = [0u8; 16];
+    loopback[15] = 1;
+    assert_eq!(ip6[1], loopback);
+    // An Enum8 reads as its signed ordinal, not its name.
+    assert_eq!(got.get::<i8>("e8").unwrap(), [1, -2]);
+}
+
 /// The encoder faces the same prefix ordering as the decoder did. Rather than
 /// assert which way round it is, write the same row twice -- once by the
 /// server from SQL, once through this crate's encoder -- and require the two
 /// tables to read back identically.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
     use std::sync::Arc;
 
@@ -336,6 +522,8 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
     use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
 
     const TYPE: &str = "Array(LowCardinality(String))";
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let client = server.tcp();
     client
@@ -402,10 +590,11 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
 /// JSON column arrives as version 1 (plain strings) and reads fine. Turn it
 /// off and version 0 arrives, which `read_json_body` has no reader for.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn json_without_the_string_flag_is_a_clean_error_not_a_misread() {
     const SQL: &str = r#"SELECT CAST('{"a":1}', 'JSON') AS doc"#;
 
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let with_flag = server.tcp().fetch_columns(SQL).await;
     let without = TcpClient::new(format!("127.0.0.1:{}", server.native_port))
@@ -438,13 +627,14 @@ async fn json_without_the_string_flag_is_a_clean_error_not_a_misread() {
 /// have failed loudly if it had. Proving the wire form needs the flag
 /// observed, not just the values -- see S5.T4 step 3.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn a_sparse_column_reads_back_on_both_transports() {
     const TOTAL: &str = "SELECT sum(c) AS total FROM wire.sparse";
     // The column itself, where the sparse serialisation reaches the wire
     // rather than being collapsed by an aggregate.
     const RAW: &str = "SELECT c FROM wire.sparse ORDER BY n LIMIT 6000";
 
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let client = server.tcp();
     client
@@ -496,10 +686,11 @@ async fn a_sparse_column_reads_back_on_both_transports() {
 /// A result set the server splits into several blocks must read back whole
 /// and in order, on both transports.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn a_multi_block_result_reads_back_whole_and_in_order() {
     const SQL: &str = "SELECT number AS n FROM system.numbers LIMIT 200000";
 
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let over_tcp = server.tcp().fetch_columns(SQL).await.unwrap();
     let over_http = server.http().fetch_columns(SQL).await.unwrap();
@@ -516,10 +707,11 @@ async fn a_multi_block_result_reads_back_whole_and_in_order() {
 /// An exception raised part-way through a result set must surface as an
 /// error, not as a short read that looks like success.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn a_mid_stream_exception_surfaces_rather_than_truncating() {
     const SQL: &str = "SELECT throwIf(number = 50000) FROM system.numbers LIMIT 100000";
 
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let err = server
         .tcp()
@@ -536,8 +728,9 @@ async fn a_mid_stream_exception_surfaces_rather_than_truncating() {
 /// The connection is reusable after a failed query: the actor drains and
 /// returns to idle rather than staying poisoned.
 #[tokio::test]
-#[ignore = "needs Docker -- see the module docs"]
 async fn a_failed_query_leaves_the_connection_usable() {
+    require_docker!();
+    let _one = ONE_SERVER.acquire().await.unwrap();
     let server = server().await;
     let client = server.tcp();
     let _ = client.fetch_columns("SELECT * FROM no_such_table").await;

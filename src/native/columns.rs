@@ -246,7 +246,7 @@ impl ColumnType {
             return None;
         }
 
-        // Enum8(...) / Enum16(...) -- wire format = UInt8/UInt16
+        // Enum8(...) / Enum16(...) -- one and two wire bytes, signed ordinals.
         if type_str.starts_with("Enum8(") {
             return Some(Self::Enum8);
         }

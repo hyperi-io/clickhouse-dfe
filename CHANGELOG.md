@@ -30,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Retry backoff is jittered, so connections that fail together no longer retry in lockstep
 - The pool's recycle decision is one function, so the tests exercise the production rule rather than a copy of it
 - A nested `LowCardinality` now reads and writes its serialisation prefix where the server puts it -- ahead of the enclosing column's data, not inline. `Array(LowCardinality(String))` and `Map(String, LowCardinality(Nullable(String)))` could not be read, and inserting either returned server code 117
+- `Enum8` and `Enum16` decode as `DecodedColumn::Int8` / `Int16`, matching the signed ordinals ClickHouse defines. A top-level enum column previously decoded unsigned, so `Enum8('b' = -2)` read back as `254`, while the same value inside a `Variant`, `Dynamic` or `JSON` cell rendered correctly as `-2`. Read such a column with `column_as::<i8>` / `::<i16>`
 
 ### Removed
 

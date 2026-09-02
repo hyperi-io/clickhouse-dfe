@@ -416,3 +416,95 @@ impl TcpClient {
         self.pool = OnceLock::new();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ADDR: &str = "127.0.0.1:9000";
+
+    /// Each of these writes exactly one config field and nothing reads it
+    /// back, so a builder assigning the wrong one would go unnoticed.
+    #[test]
+    fn every_builder_writes_the_field_it_names() {
+        let client = TcpClient::new(ADDR)
+            .with_user("reader")
+            .with_password("pw")
+            .with_quota_key("q1")
+            .with_pool_create_timeout(Some(Duration::from_secs(7)))
+            .with_pool_max_lifetime(Some(Duration::from_secs(11)))
+            .with_pool_acquire_timeout(Some(Duration::from_secs(13)));
+
+        assert_eq!(client.config.handshake.user, "reader");
+        assert_eq!(client.config.handshake.password, "pw");
+        assert_eq!(client.config.handshake.quota_key, "q1");
+        assert_eq!(
+            client.config.pool.create_timeout,
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            client.config.pool.max_lifetime,
+            Some(Duration::from_secs(11))
+        );
+        assert_eq!(
+            client.config.pool.acquire_timeout,
+            Some(Duration::from_secs(13))
+        );
+        // Untouched by the chain above.
+        assert_eq!(client.config.handshake.database, "default");
+    }
+
+    #[test]
+    #[should_panic(expected = "with_addrs requires at least one endpoint")]
+    fn with_addrs_rejects_an_empty_endpoint_list() {
+        let _ = TcpClient::new(ADDR).with_addrs(Vec::<String>::new());
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_builders_record_the_source_they_were_given() {
+        use crate::tls::{TlsConfigSource, TlsTrust};
+
+        assert!(TcpClient::new(ADDR).tls.is_none(), "unset until asked for");
+
+        let trust = TcpClient::new(ADDR).with_tls_trust(TlsTrust {
+            exclusive: true,
+            ..TlsTrust::default()
+        });
+        match &trust.tls {
+            Some(TlsConfigSource::Trust(t)) => assert!(t.exclusive),
+            other => panic!("with_tls_trust must store a Trust source, got {other:?}"),
+        }
+    }
+
+    /// The pool is built on first use and shared by clones from then on;
+    /// `with_*` builders that change a handshake or pool input discard it,
+    /// and the per-query ones must not.
+    #[test]
+    fn the_pool_is_built_once_and_only_discarded_by_its_own_inputs() {
+        let client = TcpClient::new(ADDR);
+        let first = Arc::clone(client.pool());
+        assert!(
+            Arc::ptr_eq(&first, client.pool()),
+            "a second call must not rebuild"
+        );
+
+        let shared = client.clone();
+        assert!(
+            Arc::ptr_eq(&first, shared.pool()),
+            "a clone taken after the build shares the pool"
+        );
+
+        let per_query = shared.with_setting("max_execution_time", "30");
+        assert!(
+            Arc::ptr_eq(&first, per_query.pool()),
+            "a session setting rides on the Query packet and needs no rebuild"
+        );
+
+        let rebuilt = per_query.with_database("other");
+        assert!(
+            !Arc::ptr_eq(&first, rebuilt.pool()),
+            "the database is a handshake input, so the pool must be rebuilt"
+        );
+    }
+}

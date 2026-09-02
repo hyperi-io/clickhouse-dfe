@@ -61,9 +61,9 @@ impl Default for TlsTrust {
     }
 }
 
-/// What the Client carries: either a caller-built config (Go's
+/// What [`crate::TcpClient`] carries: either a caller-built config (Go's
 /// `Options.TLS` analog) or a declarative trust we resolve ourselves.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum TlsConfigSource {
     /// A config the caller built; used as-is, nothing here inspects it.

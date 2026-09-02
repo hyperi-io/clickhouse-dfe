@@ -1,0 +1,18 @@
+# Project:   clickhouse-dfe
+# File:      .config/nextest.toml
+# Purpose:   Serialise the tests that each start a ClickHouse container
+#
+# License:   Apache-2.0
+# Copyright: (c) 2026 HYPERI PTY LIMITED
+
+# nextest runs each test in its own process, so a semaphore inside the binary
+# cannot serialise them -- this group is the only thing that does. One server
+# at a time: seven at 2 GiB each does not fit a build host.
+[test-groups]
+docker-server = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(wire_docker)'
+test-group = 'docker-server'
+# Pulling and starting the image on a cold host outruns the 60 s default.
+slow-timeout = { period = "120s" }

@@ -276,6 +276,16 @@ async fn insert_and_read_back(db: &str, table: &str) -> Result<(Vec<u64>, Vec<St
             .map_err(|e| clickhouse_dfe::Error::Custom(e.to_string()))?;
     }
 
+    // `select_sequential_consistency` does not hold one shard for another, so
+    // a Distributed read straight after two per-replica inserts races
+    // replication unless the replicas are levelled first.
+    tcp()
+        .execute(&format!(
+            "SYSTEM SYNC REPLICA ON CLUSTER {} {db}.{local}",
+            cluster().name
+        ))
+        .await?;
+
     let read = on_both(&format!("SELECT id, tag, n FROM {db}.{table} ORDER BY id")).await?;
     let ids = read.0.get::<u64>("id")?;
     assert_eq!(ids, read.1.get::<u64>("id")?, "transports disagree on 'id'");

@@ -15,6 +15,9 @@ quality:
   enabled: true
 test:
   enabled: true
+  # test.min_coverage is honoured for Python only, so on Rust this reports
+  # without gating and swaps nextest for cargo's harness. The floor is held by
+  # cargo llvm-cov at the review gate instead.
   coverage: false
   rust:
     nextest: true
