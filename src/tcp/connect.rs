@@ -201,6 +201,9 @@ mod tests {
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
 
         let stream = connect_plain(addr).await.expect("loopback connect");
+        // `MaybeTlsStream` has a second variant only under `tls`, so without it
+        // this pattern is the whole enum.
+        #[cfg_attr(not(feature = "tls"), allow(irrefutable_let_patterns))]
         let MaybeTlsStream::Plain(sock) = &stream else {
             panic!("connect_plain must yield the plain variant");
         };

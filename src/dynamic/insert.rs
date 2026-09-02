@@ -224,6 +224,9 @@ impl DynamicInsert {
     ///
     /// `raw_names` are column names supplied via raw passthrough (e.g. `_json`)
     /// that must be in the INSERT even if absent from the row map.
+    // The only await is opening the TCP session; the HTTP sink opens
+    // synchronously. Callers await this either way, so the signature is fixed.
+    #[cfg_attr(not(feature = "tcp"), allow(clippy::unused_async))]
     async fn ensure_active(
         &mut self,
         row: &Map<String, Value>,

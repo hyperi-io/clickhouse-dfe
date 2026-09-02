@@ -354,9 +354,9 @@ pub enum TcpTls {
 ///
 /// # Panics
 ///
-/// If `endpoints` is empty -- `Manager::create`'s round-robin divides by
-/// `endpoints.len()`, and the `TcpClient` builders assert non-emptiness
-/// before reaching here.
+/// If `endpoints` is empty. A pool that can never connect is a caller bug,
+/// caught here rather than deferred to the first acquire; the `TcpClient`
+/// builders assert non-emptiness before reaching this.
 ///
 /// # Errors
 ///
@@ -364,6 +364,9 @@ pub enum TcpTls {
 /// fails. Its only documented failure is `NoRuntimeSpecified`, which
 /// supplying a runtime rules out; the mapping is explicit so a future
 /// deadpool build failure surfaces typed rather than as a panic.
+// The `Tls` arm moves `server_name` out of `kind`; without that feature the
+// only arm is a unit variant, so nothing consumes it.
+#[cfg_attr(not(feature = "tls"), allow(clippy::needless_pass_by_value))]
 pub fn build_pool(
     endpoints: Vec<String>,
     kind: ConnectKindConfig,

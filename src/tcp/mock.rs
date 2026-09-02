@@ -98,6 +98,8 @@ pub(crate) async fn write_uint64_payload_block(server: &mut TcpStream, values: &
 }
 
 /// One `String` column per pair; every column supplies the same row count.
+// Only `unified`'s tests drive this, and `tcp` alone is a shipped feature set.
+#[cfg(feature = "unified")]
 pub(crate) async fn write_string_payload_block(
     server: &mut TcpStream,
     columns: &[(&str, &[&str])],

@@ -182,6 +182,9 @@ pub(crate) trait ClickHouseRead: AsyncRead + Unpin + Send {
 /// A `FORMAT Native` body is a bare run of blocks with no terminator, so the
 /// only way to know it is finished is that the next block's first byte never
 /// arrives. Ending part-way through a value is still an error.
+// Only the `unified` HTTP-Native reader needs the EOF-tolerant form; the TCP
+// path always knows how many blocks a packet carries.
+#[cfg(feature = "unified")]
 pub(crate) async fn read_var_uint_or_eof<R: ClickHouseRead>(r: &mut R) -> Result<Option<u64>> {
     let mut first = [0u8; 1];
     if r.read(&mut first).await? == 0 {
