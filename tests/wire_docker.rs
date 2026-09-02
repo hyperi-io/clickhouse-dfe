@@ -392,6 +392,43 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
     );
 }
 
+/// The JSON serialisation this crate does NOT decode, pinned as the clean
+/// error it is rather than left to surprise someone.
+///
+/// We advertise revision 54459, below the 54473 V2 gate
+/// (`ProtocolDefines.h:109`), so a server sends Object `V1` -- wire value 0,
+/// per `SerializationObject.h:37`. With
+/// `output_format_native_write_json_as_string` on, which is the default, a
+/// JSON column arrives as version 1 (plain strings) and reads fine. Turn it
+/// off and version 0 arrives, which `read_json_body` has no reader for.
+#[tokio::test]
+#[ignore = "needs Docker -- see the module docs"]
+async fn json_without_the_string_flag_is_a_clean_error_not_a_misread() {
+    const SQL: &str = r#"SELECT CAST('{"a":1}', 'JSON') AS doc"#;
+
+    let server = server().await;
+    let with_flag = server.tcp().fetch_columns(SQL).await;
+    let without = TcpClient::new(format!("127.0.0.1:{}", server.native_port))
+        .with_json_as_string(false)
+        .query(SQL)
+        .fetch_blocks()
+        .await;
+    server.stop().await;
+
+    assert_eq!(
+        with_flag
+            .expect("the default reads JSON")
+            .get::<String>("doc")
+            .unwrap(),
+        [r#"{"a":1}"#]
+    );
+    let err = without.expect_err("version 0 has no reader");
+    assert!(
+        format!("{err}").contains("unsupported JSON serialization version: 0"),
+        "the version must be named, not misread: {err}"
+    );
+}
+
 /// A `MergeTree` column that is almost all defaults, merged into one part, is
 /// stored with sparse serialisation. Real tables look like this.
 ///

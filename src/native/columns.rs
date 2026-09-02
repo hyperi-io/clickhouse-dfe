@@ -1037,10 +1037,19 @@ async fn read_json_column<R: ClickHouseRead>(
     read_json_body_at(reader, n, version, depth).await
 }
 
-/// JSON column payload, after the u64 serialization version:
-/// - `1`: each row is a plain JSON string (String column format)
-/// - `2`: path-based object format with Dynamic v1/v2 sub-columns + shared data
-/// - `3`: path-based object format with Dynamic v3 sub-columns (no shared data)
+/// JSON column payload, after the u64 serialization version.
+///
+/// The values are the wire numbers from `SerializationObject.h:37-56`, which
+/// are NOT the ordinals their names suggest -- Object `V1 = 0`, `V2 = 2`,
+/// `FLATTENED = 3`, `V3 = 4`:
+/// - `1`: each row is a plain JSON string, which is what
+///   `output_format_native_write_json_as_string` asks for and the only form
+///   this crate produces by default
+/// - `2`: path-based object format with Dynamic sub-columns + shared data
+/// - `3`: FLATTENED, path-based with no shared data
+///
+/// Not handled: Object `V1 = 0`, which a server sends when that setting is
+/// off, and `V3 = 4`. Both surface as a clean error naming the version.
 ///
 /// # Errors
 ///
@@ -1062,7 +1071,7 @@ async fn read_json_body_at<R: ClickHouseRead>(
     match version {
         JSON_SERIALIZATION_STRING => read_string_column(reader, n).await,
         2 => read_json_object_v2_column(reader, n, depth).await,
-        3 => read_json_object_v3_column(reader, n, depth).await,
+        3 => read_json_object_flattened_column(reader, n, depth).await,
         _ => Err(Error::BadResponse(format!(
             "native protocol: unsupported JSON serialization version: {version}"
         ))),
@@ -1243,7 +1252,8 @@ fn wire_type(name: &str) -> Result<ColumnType> {
     })
 }
 
-/// JSON v3 object column reader, after the u64 version has been consumed.
+/// JSON FLATTENED object column reader, after the u64 version has been
+/// consumed. `FLATTENED` is wire value 3; Object `V3` is 4 and unhandled.
 ///
 /// ```text
 /// varuint   numDynamicPaths
@@ -1252,8 +1262,8 @@ fn wire_type(name: &str) -> Result<ColumnType> {
 /// per path: discriminators (width by numTypes + 1), then the sub-columns in
 ///           declaration order
 /// ```
-/// There is no shared-data section in v3.
-async fn read_json_object_v3_column<R: ClickHouseRead>(
+/// There is no shared-data section in the flattened form.
+async fn read_json_object_flattened_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     depth: usize,
@@ -1406,7 +1416,7 @@ async fn read_dynamic_column<R: ClickHouseRead>(
     match version {
         1 => read_dynamic_v1v2_column(reader, n, true, depth).await,
         2 => read_dynamic_v1v2_column(reader, n, false, depth).await,
-        3 => read_dynamic_v3_column(reader, n, depth).await,
+        3 => read_dynamic_flattened_column(reader, n, depth).await,
         _ => Err(Error::BadResponse(format!(
             "native protocol: unsupported Dynamic serialization version: {version}"
         ))),
@@ -1519,11 +1529,12 @@ pub(crate) async fn read_dynamic_v1v2_body<R: ClickHouseRead>(
     Ok(result)
 }
 
-/// Dynamic v3 column reader (new flat format, `ClickHouse` 25.6+).
+/// Dynamic FLATTENED column reader (`ClickHouse` 25.6+). `FLATTENED` is wire
+/// value 3 (`SerializationDynamic.h:49`); Dynamic has no version 3 of its own.
 ///
 /// No `SharedVariant`; NULL discriminator = totalTypes, and the discriminator
 /// width scales with it.
-async fn read_dynamic_v3_column<R: ClickHouseRead>(
+async fn read_dynamic_flattened_column<R: ClickHouseRead>(
     reader: &mut R,
     n: usize,
     depth: usize,
