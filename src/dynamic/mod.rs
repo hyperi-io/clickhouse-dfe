@@ -17,8 +17,8 @@
 //! (`FORMAT Native` through `TcpClient`). Both sinks are fed the same
 //! [`DynamicRow::encode_into`] bytes.
 //!
-//! The five modules below were ported from the DFE Loader and keep the
-//! BUSL-1.1 headers they were written under.
+//! The five modules below were ported from the DFE Loader and relicensed
+//! Apache-2.0 to match the crate.
 
 pub mod encode;
 pub mod error;

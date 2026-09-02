@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
 // Project:   clickhouse-dfe
@@ -6,7 +6,7 @@
 // Purpose:   Dynamic Map<String, Value> to RowBinary encoder
 // Language:  Rust
 //
-// License:   BUSL-1.1
+// License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Dynamic RowBinary encoder.

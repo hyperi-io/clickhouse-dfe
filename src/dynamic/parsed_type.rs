@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: BUSL-1.1
+// SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
 // Project:   clickhouse-dfe
@@ -6,7 +6,7 @@
 // Purpose:   Runtime ClickHouse type-string parser (ParsedType)
 // Language:  Rust
 //
-// License:   BUSL-1.1
+// License:   Apache-2.0
 // Copyright: (c) 2026 HYPERI PTY LIMITED
 
 //! Rich ClickHouse type parser for runtime schema-driven inserts.

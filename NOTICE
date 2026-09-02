@@ -1,0 +1,7 @@
+clickhouse-dfe
+Copyright 2026 HYPERI PTY LIMITED
+
+This product includes software developed by HYPERI PTY LIMITED.
+
+Portions were ported from the HyperI fork of clickhouse-arrow and from
+DFE Loader, both copyright HYPERI PTY LIMITED.
