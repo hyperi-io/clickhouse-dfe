@@ -29,11 +29,14 @@ use crate::error::{Error, Result};
 use crate::native::decode::{DecodedBlock, decode_block};
 use crate::native::io::ClickHouseRead;
 use crate::tcp::protocol::{
-    DBMS_MIN_REVISION_WITH_BLOCK_INFO, DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES, DBMS_MIN_REVISION_WITH_BLOCK_INFO,
+    DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO, DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2,
     DBMS_MIN_REVISION_WITH_SERVER_DISPLAY_NAME, DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE,
     DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES, DBMS_MIN_REVISION_WITH_VERSION_PATCH,
-    DBMS_TCP_PROTOCOL_VERSION, Exception, ProfileInfo, Progress, ServerHello, ServerPacketId,
-    TCP_EXCEPTION_STACK_TRACE_CAP, TableColumns, truncate_on_char_boundary,
+    DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL, DBMS_TCP_PROTOCOL_VERSION,
+    Exception, ProfileInfo, Progress, ServerHello, ServerPacketId, TCP_EXCEPTION_STACK_TRACE_CAP,
+    TableColumns, truncate_on_char_boundary,
 };
 
 /// Upper bound on the column count a single block header may declare.
@@ -45,6 +48,13 @@ use crate::tcp::protocol::{
 /// Duplicates `native::io`'s constant of the same name and value; the two
 /// collapse to one once the codec's copy is reachable from here.
 const MAX_BLOCK_COLUMNS: u64 = 16_384;
+
+/// Cap on the password-complexity rules a server may declare in Hello.
+///
+/// The count is an unbounded varuint that drives a read loop, so a hostile
+/// or corrupt value would otherwise stall the handshake. A real server ships
+/// a handful.
+const MAX_PASSWORD_COMPLEXITY_RULES: u64 = 256;
 
 /// Revision at which the server started emitting `total_rows_to_read`
 /// inside the Progress packet, matching clickhouse-cpp-client
@@ -133,6 +143,11 @@ pub(crate) async fn read_hello<R: ClickHouseRead>(r: &mut R) -> Result<ServerHel
             // advertised pin, so the two agree; this is the correct,
             // future-bump-safe value.)
             let effective = revision.min(DBMS_TCP_PROTOCOL_VERSION);
+            // Fields follow the server's write order in
+            // `TCPHandler::sendHello`, not the numeric order of their gates.
+            if effective >= DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL {
+                let _parallel_replicas_version = r.read_var_uint().await?;
+            }
             let timezone = if effective >= DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE {
                 Some(r.read_utf8_string().await?)
             } else {
@@ -148,6 +163,32 @@ pub(crate) async fn read_hello<R: ClickHouseRead>(r: &mut R) -> Result<ServerHel
             } else {
                 0
             };
+            if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS {
+                // The server's send and recv capabilities. We answer
+                // `notchunked` in the addendum, which it defaults to, so the
+                // framing stays as it is.
+                let _proto_send = r.read_utf8_string().await?;
+                let _proto_recv = r.read_utf8_string().await?;
+            }
+            if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES {
+                let rules = r.read_var_uint().await?;
+                // A hostile count would otherwise buy an unbounded read loop.
+                if rules > MAX_PASSWORD_COMPLEXITY_RULES {
+                    return Err(Error::BadResponse(format!(
+                        "tcp: server declared {rules} password-complexity rules, over the \
+                         {MAX_PASSWORD_COMPLEXITY_RULES} cap"
+                    )));
+                }
+                for _ in 0..rules {
+                    let _pattern = r.read_utf8_string().await?;
+                    let _message = r.read_utf8_string().await?;
+                }
+            }
+            if effective >= DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2 {
+                // Sent to every client, not only an interserver peer.
+                let mut nonce = [0u8; 8];
+                r.read_exact(&mut nonce).await?;
+            }
             Ok(ServerHello {
                 server_name,
                 version: (major, minor, patch),

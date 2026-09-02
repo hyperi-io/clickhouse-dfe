@@ -24,10 +24,12 @@ use crate::native::io::ClickHouseWrite;
 use crate::tcp::client_info::ClientInfo;
 use crate::tcp::protocol::{
     ClientPacketId, DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM,
-    DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS, DBMS_MIN_REVISION_WITH_BLOCK_INFO,
-    DBMS_MIN_REVISION_WITH_CLIENT_INFO, DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS, DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS,
+    DBMS_MIN_REVISION_WITH_BLOCK_INFO, DBMS_MIN_REVISION_WITH_CLIENT_INFO,
+    DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET,
     DBMS_MIN_REVISION_WITH_SETTINGS_SERIALIZED_AS_STRINGS, DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES,
-    DBMS_TCP_PROTOCOL_VERSION, QueryProcessingStage,
+    DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL, DBMS_TCP_PROTOCOL_VERSION,
+    QueryProcessingStage,
 };
 
 /// Client name advertised in Hello and ClientInfo. cpp-client sends
@@ -77,18 +79,35 @@ pub(crate) async fn send_hello<W: ClickHouseWrite>(
     Ok(())
 }
 
-/// Send the post-Hello addendum. Currently only carries the quota_key
-/// string, and only when the server advertises at least
-/// `DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM` (54458). Older servers do
-/// not expect any addendum bytes -- silently no-op so the caller can
-/// invoke this unconditionally.
+/// Send the post-Hello addendum, in the field order
+/// `TCPHandler::receiveAddendum` reads: quota key, chunked capabilities, then
+/// the parallel-replicas protocol version. Older servers expect no addendum
+/// bytes at all, so this is a silent no-op there and the caller can invoke it
+/// unconditionally.
+///
+/// The server gates each field on the revision WE advertised, so the effective
+/// revision -- the lower of the two -- is what decides: below it the server has
+/// no code for the field, above it the server is reading on our value.
 pub(crate) async fn send_addendum<W: ClickHouseWrite>(
     w: &mut W,
     server_revision: u64,
     quota_key: &str,
 ) -> Result<()> {
-    if server_revision >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
+    let effective = server_revision.min(DBMS_TCP_PROTOCOL_VERSION);
+    if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
         w.write_string(quota_key.as_bytes()).await?;
+    }
+    if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS {
+        // Decline chunked framing in both directions, which is the server's
+        // own default, so the packet framing stays as it is.
+        w.write_string(b"notchunked").await?;
+        w.write_string(b"notchunked").await?;
+    }
+    if effective >= DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL {
+        // We drive no parallel-replicas reads; 0 is the "unversioned" value.
+        w.write_var_uint(0).await?;
+    }
+    if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM {
         w.flush().await?;
     }
     Ok(())
