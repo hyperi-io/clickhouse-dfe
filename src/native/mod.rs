@@ -1,19 +1,22 @@
 //! `ClickHouse` Native columnar block format -- the `format=Native` payload
 //! encoding, independent of the transport that carries it.
 //!
+//! HOT PATH. Every row in and out of the server passes through here, so this
+//! module carries the 90% coverage floor rather than the repo's 80%.
+//!
 //! Upstream's `src/rowbinary/` is row-oriented; this module is the columnar
 //! primitive that lets the server write blocks into its merge tree without a
 //! rows-to-columns transpose.
 //!
 //! # Module map
 //!
-//! - [`columns`]: type-name parser and the column reader that re-serialises
+//! - `columns`: type-name parser and the column reader that re-serialises
 //!   native cells as `RowBinary`.
-//! - [`encode`]: INSERT-block encoder, shared by the HTTP and TCP transports.
+//! - `encode`: INSERT-block encoder, shared by the HTTP and TCP transports.
 //! - `decode`: SELECT-block decoder producing the typed column buffers
 //!   [`DecodedBlock`] carries.
 //! - `sparse`: sparse-column wire format (offset list + non-default values).
-//! - [`io`]: varint and length-prefixed-string helpers over
+//! - `io`: varint and length-prefixed-string helpers over
 //!   [`tokio::io::AsyncRead`]/[`tokio::io::AsyncWrite`] and [`bytes::BufMut`].
 //!
 //! The TCP transport in `src/tcp/` is a separate wire protocol that happens to
@@ -28,10 +31,13 @@
 // relaxation for README prose is reversed here.
 #![warn(clippy::doc_markdown)]
 
-pub mod columns;
+// Private, like upstream's own `src/native/` keeps `BlockReader` and
+// `BlockWriter`. The types a caller needs are re-exported below, so the
+// module layout stays free to move without a breaking change.
+pub(crate) mod columns;
 pub(crate) mod decode;
-pub mod encode;
-pub mod io;
+pub(crate) mod encode;
+pub(crate) mod io;
 pub(crate) mod sparse;
 
 pub use columns::ColumnType;

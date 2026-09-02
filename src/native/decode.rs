@@ -75,6 +75,8 @@ async fn read_le_column<R: ClickHouseRead, T: LeScalar>(r: &mut R, n: usize) -> 
     })?;
     let raw = read_exact_grown(r, total).await?;
     let mut out = with_cap(n)?;
+    // `as_chunks` wants a literal width and `T::WIDTH` is an associated const,
+    // so the const-generic form does not compile here.
     out.extend(raw.chunks_exact(T::WIDTH).map(T::from_le_slice));
     Ok(out)
 }
@@ -88,11 +90,7 @@ async fn read_u256_column<R: ClickHouseRead>(r: &mut R, n: usize) -> Result<Vec<
     })?;
     let raw = read_exact_grown(r, total).await?;
     let mut out = with_cap(n)?;
-    out.extend(raw.chunks_exact(32).map(|c| {
-        let mut a = [0u8; 32];
-        a.copy_from_slice(c);
-        a
-    }));
+    out.extend(raw.as_chunks::<32>().0.iter().copied());
     Ok(out)
 }
 
@@ -293,13 +291,7 @@ impl DecodedColumn {
             Self::Decimal128 { values, .. } => values.len(),
             Self::Decimal256 { values, .. } => values.len(),
             Self::String(v) | Self::Json(v) => v.len(),
-            Self::FixedString { width, bytes } => {
-                if *width == 0 {
-                    0
-                } else {
-                    bytes.len() / *width
-                }
-            }
+            Self::FixedString { width, bytes } => bytes.len().checked_div(*width).unwrap_or(0),
             Self::Date(v) => v.len(),
             Self::Date32(v) => v.len(),
             Self::DateTime(v) => v.len(),

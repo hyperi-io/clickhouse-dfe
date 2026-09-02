@@ -412,7 +412,7 @@ mod tests {
         for cap in 0..12 {
             let mut s = "\u{20ac}\u{20ac}\u{20ac}".to_string();
             truncate_on_char_boundary(&mut s, cap);
-            assert!(s.len() <= cap.max(0));
+            assert!(s.len() <= cap);
             assert_eq!(s.len() % 3, 0, "cut mid-character at cap {cap}");
         }
     }

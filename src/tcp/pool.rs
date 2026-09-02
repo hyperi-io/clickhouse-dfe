@@ -1,5 +1,8 @@
 //! deadpool-managed connection pool for the TCP transport.
 //!
+//! HOT PATH. Every operation acquires from here, so this module carries the
+//! 90% coverage floor rather than the repo's 80%.
+//!
 //! Wraps [`crate::tcp::connection_actor::ConnectionHandle`] in a
 //! [`deadpool::managed::Pool`] so callers can acquire ready-to-use
 //! connections without having to drive the connect + handshake +

@@ -346,7 +346,11 @@ mod tests {
         cache.insert("db.t", shared("db.t", vec![col("id", "UInt64", "")]));
 
         // Every wait is driven explicitly; nothing here sleeps for real.
-        tokio::time::advance(ttl - Duration::from_secs(1)).await;
+        tokio::time::advance(
+            ttl.checked_sub(Duration::from_secs(1))
+                .expect("ttl exceeds 1s"),
+        )
+        .await;
         assert!(cache.get("db.t").is_some(), "still inside the TTL");
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(cache.get("db.t").is_none(), "past the TTL");

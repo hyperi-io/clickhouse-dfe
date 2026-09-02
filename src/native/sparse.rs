@@ -269,7 +269,7 @@ mod tests {
         // 100 rows, only position 0 is non-default.
         let mut data = Vec::new();
         data.extend(encode_var_uint(0)); // 0 defaults before position 0
-        data.extend(encode_var_uint(99 | END_OF_GRANULE_FLAG)); // 99 trailing defaults
+        data.extend(encode_var_uint(0x63 | END_OF_GRANULE_FLAG)); // 99 trailing defaults
 
         let mut bytes = Bytes::from(data);
         let mut state = SparseDeserializeState::default();

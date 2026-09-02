@@ -37,7 +37,6 @@ Every layer is a feature. Take what you need and pay for nothing else.
 | `dynamic` | Runtime-schema insert from `serde_json::Map` rows -- `FORMAT RowBinary` over HTTP, `FORMAT Native` over TCP (implies `ext`) |
 | `unified` | One client over HTTP `clickhouse::Client` and our `TcpClient` (implies `tcp`) |
 | `ext` | Extension traits on `clickhouse::Client` -- ping, kill query, query id, session id, role, typed server exceptions |
-| `inserter` | Forwards `clickhouse/inserter`, which a consumer of this crate cannot enable on the upstream dependency any other way |
 | `full` | All of the above |
 
 Default is `tcp` plus `lz4`. `lz4` affects the HTTP path only -- the TCP

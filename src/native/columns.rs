@@ -722,7 +722,7 @@ async fn read_nullable_column<R: ClickHouseRead>(
     let inner_data = read_column_at(reader, inner, n as u64, depth + 1).await?;
 
     let mut result = with_cap(n)?;
-    for (flag, value) in null_flags.into_iter().zip(inner_data.into_iter()) {
+    for (flag, value) in null_flags.into_iter().zip(inner_data) {
         if flag != 0 {
             // NULL -- RowBinary: 1 byte = 1
             result.push(vec![1u8]);
@@ -901,7 +901,7 @@ async fn read_tuple_column<R: ClickHouseRead>(
     rows.resize_with(n, Vec::new);
     for field_type in fields {
         let field_data = read_column_at(reader, field_type, n as u64, depth + 1).await?;
-        for (row, cell) in rows.iter_mut().zip(field_data.into_iter()) {
+        for (row, cell) in rows.iter_mut().zip(field_data) {
             row.extend_from_slice(&cell);
         }
     }
@@ -1197,6 +1197,9 @@ async fn read_json_object_v2_column<R: ClickHouseRead>(
         .collect();
 
     let mut result = with_cap(n)?;
+    // The row index reads across every path's discriminator list, not along one
+    // collection, so there is nothing to iterate over.
+    #[allow(clippy::needless_range_loop)]
     for row_i in 0..n {
         let mut json = b"{".to_vec();
         let mut first = true;
@@ -1311,6 +1314,9 @@ async fn read_json_object_flattened_column<R: ClickHouseRead>(
         .collect();
 
     let mut result = with_cap(n)?;
+    // The row index reads across every path's discriminator list, not along one
+    // collection, so there is nothing to iterate over.
+    #[allow(clippy::needless_range_loop)]
     for row_i in 0..n {
         let mut json = b"{".to_vec();
         let mut first = true;
@@ -1575,7 +1581,9 @@ fn rowbinary_to_json(bytes: &[u8], col_type: &ColumnType) -> Vec<u8> {
 }
 
 /// Inner parser: returns `(json_bytes, bytes_consumed)` or `Err(())` on underflow.
-#[allow(clippy::too_many_lines)]
+// The date/time arms repeat a width already listed above, and stay separate so
+// the comment explaining why they render as bare wire integers sits with them.
+#[allow(clippy::too_many_lines, clippy::match_same_arms)]
 fn rowbinary_to_json_inner(bytes: &[u8], col_type: &ColumnType) -> Result<(Vec<u8>, usize), ()> {
     macro_rules! fixed {
         ($n:expr, $t:ty) => {{

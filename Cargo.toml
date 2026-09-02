@@ -44,9 +44,6 @@ zstd = ["clickhouse/zstd"]
 dynamic = ["dep:serde_json", "ext"]
 unified = ["tcp"]
 ext = []
-# No module of its own -- it forwards `clickhouse/inserter`, which a consumer
-# of this crate cannot enable on the upstream dependency any other way.
-inserter = ["clickhouse/inserter"]
 full = [
     "tcp",
     "tls",
@@ -55,7 +52,6 @@ full = [
     "dynamic",
     "unified",
     "ext",
-    "inserter",
 ]
 
 [dependencies]
