@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-03
+
 ### Fixed
 
 - `ServerException::parse` reads a body that is only an error code. Upstream falls back to the `X-ClickHouse-Exception-Code` header as the whole body when the real one is empty, not UTF-8, or fails mid-read, so a rejection can arrive as `117`. Declining it left callers unable to tell a payload rejection from a transient fault, and a consumer routing on that verdict would retry a poison batch instead of sending it to a dead-letter queue

@@ -8,7 +8,7 @@
 
 [package]
 name = "clickhouse-dfe"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 # Upstream's MSRV. Keep in step with rust-toolchain.toml.
 rust-version = "1.89.0"
