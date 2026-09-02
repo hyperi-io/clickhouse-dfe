@@ -8,4 +8,10 @@ cherry-picked into another repository carries its reasoning with it. That is
 deliberate -- this index stays thin rather than duplicating what the source
 already says and would drift from.
 
-Per-layer notes land here as each grows past what a comment can carry.
+Per-layer notes land here as each grows past what a comment can carry:
+
+- [INSERT-FORMATS.md](INSERT-FORMATS.md) -- why every insert path sends binary,
+  and why there is no JSONEachRow option.
+- [TYPE-SUPPORT.md](TYPE-SUPPORT.md) -- which ClickHouse types the codec reads
+  and writes.
+- [UNIFIED-CLIENT.md](UNIFIED-CLIENT.md) -- one entry point over two transports.
