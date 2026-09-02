@@ -3,9 +3,9 @@
 //!
 //! HOT PATH. Every row in and out of the server passes through here, so this
 //! module is held to a 90% line-coverage target rather than the repo's 80%
-//! floor. It does not meet it yet -- see `docs/COVERAGE.md` for the current
-//! numbers and where the gap is. Adding a wire format here means adding the
-//! test with it.
+//! floor. `columns`, `io` and `sparse` meet it; `encode` and `decode` do not
+//! yet. `docs/COVERAGE.md` carries the numbers and how to measure them.
+//! Adding a wire format here means adding the test with it.
 //!
 //! Upstream's `src/rowbinary/` is row-oriented; this module is the columnar
 //! primitive that lets the server write blocks into its merge tree without a

@@ -4,9 +4,10 @@ The repo floor is 80% lines. Two modules are marked `HOT PATH` in their own
 docs and held to 90% instead: `src/native/` (every row in or out of the server
 goes through it) and `src/tcp/pool.rs` (every operation acquires from it).
 
-Neither meets 90% today. That is tracked debt, not an oversight, and this file
-is where it is tracked -- the marker comments point here rather than asserting
-a number that would go stale the next time someone adds a type.
+`src/native/` mostly meets it; `src/tcp/pool.rs` sits just under. The remainder
+is tracked debt, not an oversight, and this file is where it is tracked -- the
+marker comments point here rather than asserting a number that would go stale
+the next time someone adds a type.
 
 ## Measuring
 
@@ -28,16 +29,22 @@ Line coverage, whole suite, at protocol revision 54473.
 
 | Module | Lines | Against its target |
 |---|---|---|
-| `native/columns.rs` | 81.4% | -8.6 |
-| `native/encode.rs` | 85.7% | -4.3 |
-| `native/decode.rs` | 86.8% | -3.2 |
-| `tcp/pool.rs` | 88.8% | -1.2 |
 | `native/io.rs` | 92.6% | met |
 | `native/sparse.rs` | 91.5% | met |
-| Crate total | 89.4% | above the 80% floor |
+| `native/columns.rs` | 90.9% | met |
+| `tcp/pool.rs` | 88.8% | -1.2 |
+| `native/decode.rs` | 86.8% | -3.2 |
+| `native/encode.rs` | 85.7% | -4.3 |
+| Crate total | 90.5% | above the 90% goal |
 
-`native/columns.rs` is the one worth attention: 1,414 lines, the least covered
-file in the crate, and the type-name parser every column read starts from.
+`native/columns.rs` was the laggard at 81.4% and is now the one to copy: the
+lift came almost entirely from one table-driven test over
+`rowbinary_to_json`, the function that renders every `Variant`, `Dynamic` and
+`JSON` cell as text. Roughly 260 uncovered lines, one coherent unit, and a
+wrong arm in it is silently wrong data rather than a failed query.
+
+`native/encode.rs` and `native/decode.rs` are the remaining gap. Both are
+mostly per-type arms, so the same shape of test should work on them.
 
 ## What the numbers do not tell you
 

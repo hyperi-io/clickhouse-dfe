@@ -2175,6 +2175,195 @@ mod tests {
         assert_eq!(json, br#""abc""#.to_vec());
     }
 
+    /// Build a RowBinary string cell: varuint length, then the bytes.
+    fn rb_string(s: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.put_var_uint(s.len() as u64);
+        out.extend_from_slice(s);
+        out
+    }
+
+    /// Every rendering arm, driven through the type parser the decoder uses.
+    ///
+    /// This is what turns a `Variant`, `Dynamic` or `JSON` cell into the text a
+    /// caller reads, so a wrong arm here is silently wrong data rather than a
+    /// failed query. The expectations are written from the wire format, not
+    /// from what the function currently returns.
+    #[test]
+    fn every_scalar_arm_renders_the_json_the_wire_asked_for() {
+        let cases: &[(&str, Vec<u8>, &str)] = &[
+            ("UInt8", vec![200], "200"),
+            ("UInt16", 4_000u16.to_le_bytes().to_vec(), "4000"),
+            ("UInt32", 70_000u32.to_le_bytes().to_vec(), "70000"),
+            (
+                "UInt64",
+                5_000_000_000u64.to_le_bytes().to_vec(),
+                "5000000000",
+            ),
+            // The signed arms reinterpret the unsigned wire byte.
+            ("Int8", vec![0xff], "-1"),
+            ("Int16", (-2i16).to_le_bytes().to_vec(), "-2"),
+            ("Int32", (-3i32).to_le_bytes().to_vec(), "-3"),
+            ("Int64", (-4i64).to_le_bytes().to_vec(), "-4"),
+            ("Int128", (-5i128).to_le_bytes().to_vec(), "-5"),
+            ("UInt128", 6u128.to_le_bytes().to_vec(), "6"),
+            ("Enum8('a' = -1)", vec![0xff], "-1"),
+            ("Float32", 1.5f32.to_le_bytes().to_vec(), "1.5"),
+            ("Float64", (-2.25f64).to_le_bytes().to_vec(), "-2.25"),
+            // BFloat16 is the top half of an f32's bits, so 0x3f80 is 1.0.
+            ("BFloat16", 0x3f80u16.to_le_bytes().to_vec(), "1"),
+            ("Decimal32(2)", 150i32.to_le_bytes().to_vec(), "150"),
+            ("Decimal64(2)", 151i64.to_le_bytes().to_vec(), "151"),
+            ("Date", 19_000u16.to_le_bytes().to_vec(), "19000"),
+            ("Date32", 19_001i32.to_le_bytes().to_vec(), "19001"),
+            (
+                "DateTime",
+                1_700_000_000u32.to_le_bytes().to_vec(),
+                "1700000000",
+            ),
+            (
+                "DateTime64(3)",
+                1_700_000_000_123i64.to_le_bytes().to_vec(),
+                "1700000000123",
+            ),
+            ("String", rb_string(b"hi"), r#""hi""#),
+            ("FixedString(2)", b"ab".to_vec(), r#""ab""#),
+            (
+                "IPv4",
+                0x0100_007fu32.to_le_bytes().to_vec(),
+                r#""1.0.0.127""#,
+            ),
+            ("Nullable(UInt8)", vec![1], "null"),
+            ("Nullable(UInt8)", vec![0, 9], "9"),
+            ("LowCardinality(String)", rb_string(b"x"), r#""x""#),
+            ("SimpleAggregateFunction(any, UInt8)", vec![3], "3"),
+            ("Array(UInt8)", vec![2, 7, 8], "[7,8]"),
+            ("Array(UInt8)", vec![0], "[]"),
+            ("Tuple(UInt8, UInt8)", vec![1, 2], "[1,2]"),
+            (
+                "Point",
+                {
+                    let mut v = 1.5f64.to_le_bytes().to_vec();
+                    v.extend_from_slice(&2.5f64.to_le_bytes());
+                    v
+                },
+                "[1.5,2.5]",
+            ),
+            (
+                "Map(String, UInt8)",
+                {
+                    let mut v = vec![1u8];
+                    v.extend_from_slice(&rb_string(b"k"));
+                    v.push(9);
+                    v
+                },
+                r#"{"k":9}"#,
+            ),
+        ];
+
+        for (type_str, bytes, want) in cases {
+            let ct = ColumnType::parse(type_str).unwrap_or_else(|| panic!("{type_str} parses"));
+            let got = rowbinary_to_json(bytes, &ct);
+            assert_eq!(
+                String::from_utf8_lossy(&got),
+                *want,
+                "{type_str} rendered the wrong JSON"
+            );
+        }
+    }
+
+    /// A 32-byte integer has no JSON number form, so it renders as a hex string
+    /// with the wire's little-endian bytes reversed to reading order.
+    #[test]
+    fn a_256_bit_integer_renders_as_big_endian_hex() {
+        let mut raw = [0u8; 32];
+        raw[0] = 0xef;
+        raw[1] = 0xbe;
+        let json = rowbinary_to_json(&raw, &ColumnType::Int256);
+        let text = String::from_utf8(json).unwrap();
+        assert!(text.ends_with(r#"beef""#), "got {text}");
+        assert_eq!(text.len(), 66, "quotes plus 64 hex digits");
+    }
+
+    /// The 16 bytes are TWO little-endian u64s, high half first -- not one
+    /// big-endian run -- so the rendered digits are not the byte order.
+    #[test]
+    fn a_uuid_renders_hyphenated_from_two_le_halves() {
+        let mut raw = 0x0123_4567_89ab_cdefu64.to_le_bytes().to_vec();
+        raw.extend_from_slice(&0xfedc_ba98_7654_3210u64.to_le_bytes());
+        let json = rowbinary_to_json(&raw, &ColumnType::Uuid);
+        assert_eq!(json, br#""01234567-89ab-cdef-fedc-ba9876543210""#);
+    }
+
+    /// NaN and infinity have no JSON form, so they render as `null` rather than
+    /// as text no JSON parser would accept.
+    #[test]
+    fn floats_without_a_json_form_render_as_null() {
+        assert_eq!(
+            rowbinary_to_json(&f64::NAN.to_le_bytes(), &ColumnType::Float64),
+            b"null"
+        );
+        assert_eq!(
+            rowbinary_to_json(&f64::INFINITY.to_le_bytes(), &ColumnType::Float64),
+            b"null"
+        );
+        assert_eq!(
+            rowbinary_to_json(&f32::NEG_INFINITY.to_le_bytes(), &ColumnType::Float32),
+            b"null"
+        );
+    }
+
+    /// A string cell is arbitrary bytes, so anything that would break out of a
+    /// JSON string has to be escaped -- including the control characters that
+    /// have no short form.
+    #[test]
+    fn string_rendering_escapes_what_would_break_the_json() {
+        let raw = b"a\"b\\c\nd\re\tf\x01g";
+        let json = rowbinary_to_json(&rb_string(raw), &ColumnType::String);
+        // Concatenated rather than one literal: the expected text is itself
+        // full of backslash escapes, and writing them inside a literal makes
+        // the test read as though the escapes were the literal's own.
+        let want = [
+            "\"a", "\\\"", "b", "\\\\", "c", "\\n", "d", "\\r", "e", "\\t", "f", "\\u0001", "g\"",
+        ]
+        .concat();
+        assert_eq!(String::from_utf8(json).unwrap(), want);
+    }
+
+    /// Every arm is best-effort: a truncated cell renders as `null` rather than
+    /// panicking or propagating, because one bad cell must not fail the block.
+    #[test]
+    fn a_truncated_cell_renders_as_null_in_every_arm() {
+        let types = [
+            "UInt64",
+            "Int128",
+            "Int256",
+            "Float64",
+            "BFloat16",
+            "UUID",
+            "IPv6",
+            "Point",
+            "String",
+            "FixedString(4)",
+            "Nullable(UInt8)",
+            "Array(UInt8)",
+            "Tuple(UInt8, UInt8)",
+            "Map(String, UInt8)",
+            "DateTime64(3)",
+        ];
+        for type_str in types {
+            let ct = ColumnType::parse(type_str).unwrap_or_else(|| panic!("{type_str} parses"));
+            // One byte short of anything useful, and empty.
+            for cell in [b"\x01".as_slice(), b"".as_slice()] {
+                assert_eq!(
+                    rowbinary_to_json(cell, &ct),
+                    b"null",
+                    "{type_str} did not fall back to null on a truncated cell"
+                );
+            }
+        }
+    }
+
     #[test]
     fn index_width_matches_the_server_ladder() {
         // `getSmallestIndexesType(slots + 1)` keeps u8 up to 255 types.
