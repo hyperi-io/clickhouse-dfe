@@ -46,15 +46,23 @@ pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_SERVER_QUERY_TIME_IN_PROGRESS: u
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES: u64 = 54461;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_TOTAL_BYTES_IN_PROGRESS: u64 = 54463;
 pub(crate) const DBMS_MIN_REVISION_WITH_ROWS_BEFORE_AGGREGATION: u64 = 54469;
+/// At or above this the server serialises the modern `JSON` and `Dynamic`
+/// types in their V2 wire format rather than V1.
+pub(crate) const DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION: u64 = 54473;
 pub(crate) const DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2: u64 = 54462;
 pub(crate) const DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS: u64 = 54470;
 pub(crate) const DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL: u64 = 54471;
 
-/// Active protocol revision this client advertises in Hello. Matches
-/// clickhouse-cpp-client mainline (commit e903492). Bump only when
-/// adding wire-format support for a higher revision, never to "stay
+/// Active protocol revision this client advertises in Hello. Bump only when
+/// the wire-format support for the higher revision is in, never to "stay
 /// current".
-pub(crate) const DBMS_TCP_PROTOCOL_VERSION: u64 = DBMS_MIN_PROTOCOL_VERSION_WITH_PARAMETERS;
+///
+/// Pinned to the V2 JSON/Dynamic gate, which is the highest revision whose
+/// packets this client reads in full. Everything between it and the server's
+/// own 54484 costs fields we do not parse -- `SERVER_SETTINGS` (54474) puts a
+/// whole settings block in Hello, and 54477 adds a query-plan version.
+pub(crate) const DBMS_TCP_PROTOCOL_VERSION: u64 =
+    DBMS_MIN_REVISION_WITH_V2_DYNAMIC_AND_JSON_SERIALIZATION;
 
 /// Cap on the `stack_trace` field of an [`Error::ServerException`]. The
 /// wire string is only bounded by `native::io`'s 1 GiB `MAX_STRING_SIZE`,

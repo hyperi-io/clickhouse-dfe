@@ -122,8 +122,11 @@ mod tests {
             .write_var_uint(DBMS_TCP_PROTOCOL_VERSION)
             .await
             .unwrap();
-        // Revision is well above timezone / display_name /
-        // version_patch gates, so write all three.
+        // Every gated field the advertised revision clears, in the server's
+        // own write order: parallel-replicas version, timezone, display name,
+        // version patch, the two chunked capabilities, an empty
+        // password-complexity list, and the interserver nonce.
+        server_side.write_var_uint(0).await.unwrap();
         server_side
             .write_string("Etc/UTC".as_bytes())
             .await
@@ -133,6 +136,16 @@ mod tests {
             .await
             .unwrap();
         server_side.write_var_uint(7).await.unwrap();
+        server_side
+            .write_string("notchunked".as_bytes())
+            .await
+            .unwrap();
+        server_side
+            .write_string("notchunked".as_bytes())
+            .await
+            .unwrap();
+        server_side.write_var_uint(0).await.unwrap();
+        server_side.write_all(&[0u8; 8]).await.unwrap();
         server_side.flush().await.unwrap();
 
         let cfg = HandshakeConfig {

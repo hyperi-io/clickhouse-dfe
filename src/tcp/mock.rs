@@ -49,12 +49,26 @@ pub(crate) async fn serve_one_handshake(sock: &mut TcpStream) {
     let _ = sock.write_var_uint(25).await;
     let _ = sock.write_var_uint(4).await;
     let _ = sock.write_var_uint(DBMS_TCP_PROTOCOL_VERSION).await;
+    // Field order is the server's in `TCPHandler::sendHello`, which is not the
+    // order of the gates: the parallel-replicas version precedes the timezone.
+    let _ = sock.write_var_uint(0).await;
     let _ = sock.write_string("Etc/UTC".as_bytes()).await;
     let _ = sock.write_string("mock".as_bytes()).await;
     let _ = sock.write_var_uint(7).await;
+    // Chunked capabilities, then an empty password-complexity list, then the
+    // interserver nonce every client now receives.
+    let _ = sock.write_string(b"notchunked").await;
+    let _ = sock.write_string(b"notchunked").await;
+    let _ = sock.write_var_uint(0).await;
+    let _ = AsyncWriteExt::write_all(sock, &[0u8; 8]).await;
     let _ = sock.flush().await;
 
+    // Addendum: quota key, the client's chunked answer, its parallel-replicas
+    // version.
     let _ = sock.read_utf8_string().await;
+    let _ = sock.read_utf8_string().await;
+    let _ = sock.read_utf8_string().await;
+    let _ = sock.read_var_uint().await;
 }
 
 /// Write a Data packet with `num_rows = 0` and the supplied

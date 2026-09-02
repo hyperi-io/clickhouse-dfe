@@ -555,11 +555,16 @@ mod tests {
         buf.write_var_uint(25).await.unwrap();
         buf.write_var_uint(4).await.unwrap();
         buf.write_var_uint(DBMS_TCP_PROTOCOL_VERSION).await.unwrap();
-        // Revision is well above the timezone / display_name /
-        // version_patch gates, so write all three.
+        // Every gated field the advertised revision clears, in the server's
+        // write order rather than the order of the gates.
+        buf.write_var_uint(0).await.unwrap();
         buf.write_string("Etc/UTC".as_bytes()).await.unwrap();
         buf.write_string("ch-01".as_bytes()).await.unwrap();
         buf.write_var_uint(7).await.unwrap();
+        buf.write_string("notchunked".as_bytes()).await.unwrap();
+        buf.write_string("notchunked".as_bytes()).await.unwrap();
+        buf.write_var_uint(0).await.unwrap();
+        buf.write_all(&[0u8; 8]).await.unwrap();
         let mut cur = Cursor::new(buf);
         let hello = read_hello(&mut cur).await.unwrap();
         assert_eq!(hello.server_name, "ClickHouse server");
@@ -796,11 +801,13 @@ mod tests {
     #[tokio::test]
     async fn progress_revision_gating_modern() {
         let mut buf = Vec::new();
-        buf.write_var_uint(100).await.unwrap();
-        buf.write_var_uint(2048).await.unwrap();
-        buf.write_var_uint(10_000).await.unwrap();
-        buf.write_var_uint(50).await.unwrap();
-        buf.write_var_uint(1024).await.unwrap();
+        buf.write_var_uint(100).await.unwrap(); // rows_read
+        buf.write_var_uint(2048).await.unwrap(); // bytes_read
+        buf.write_var_uint(10_000).await.unwrap(); // total_rows_to_read
+        buf.write_var_uint(65_536).await.unwrap(); // total_bytes_to_read
+        buf.write_var_uint(50).await.unwrap(); // written_rows
+        buf.write_var_uint(1024).await.unwrap(); // written_bytes
+        buf.write_var_uint(12_345).await.unwrap(); // elapsed_ns
         let mut cur = Cursor::new(buf);
         let p = read_progress(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
             .await
@@ -821,6 +828,8 @@ mod tests {
         buf.write_u8(1).await.unwrap(); // applied_limit = true
         buf.write_var_uint(500).await.unwrap(); // rows_before_limit
         buf.write_u8(0).await.unwrap(); // calculated_rows_before_limit (discarded)
+        buf.write_u8(1).await.unwrap(); // applied_aggregation (discarded)
+        buf.write_var_uint(250).await.unwrap(); // rows_before_aggregation (discarded)
         let mut cur = Cursor::new(buf);
         let pi = read_profile_info(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
             .await
