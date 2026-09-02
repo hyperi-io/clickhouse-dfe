@@ -30,10 +30,13 @@ use crate::native::decode::{DecodedBlock, decode_block};
 use crate::native::io::ClickHouseRead;
 use crate::tcp::protocol::{
     DBMS_MIN_PROTOCOL_VERSION_WITH_CHUNKED_PACKETS,
-    DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES, DBMS_MIN_REVISION_WITH_BLOCK_INFO,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_PASSWORD_COMPLEXITY_RULES,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_SERVER_QUERY_TIME_IN_PROGRESS,
+    DBMS_MIN_PROTOCOL_VERSION_WITH_TOTAL_BYTES_IN_PROGRESS, DBMS_MIN_REVISION_WITH_BLOCK_INFO,
     DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO, DBMS_MIN_REVISION_WITH_INTERSERVER_SECRET_V2,
-    DBMS_MIN_REVISION_WITH_SERVER_DISPLAY_NAME, DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE,
-    DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES, DBMS_MIN_REVISION_WITH_VERSION_PATCH,
+    DBMS_MIN_REVISION_WITH_ROWS_BEFORE_AGGREGATION, DBMS_MIN_REVISION_WITH_SERVER_DISPLAY_NAME,
+    DBMS_MIN_REVISION_WITH_SERVER_TIMEZONE, DBMS_MIN_REVISION_WITH_TEMPORARY_TABLES,
+    DBMS_MIN_REVISION_WITH_VERSION_PATCH,
     DBMS_MIN_REVISION_WITH_VERSIONED_PARALLEL_REPLICAS_PROTOCOL, DBMS_TCP_PROTOCOL_VERSION,
     Exception, ProfileInfo, Progress, ServerHello, ServerPacketId, TCP_EXCEPTION_STACK_TRACE_CAP,
     TableColumns, truncate_on_char_boundary,
@@ -264,21 +267,32 @@ pub(crate) async fn read_progress<R: ClickHouseRead>(
     r: &mut R,
     server_revision: u64,
 ) -> Result<Progress> {
+    // The server gates each field on the revision WE advertised
+    // (`ProgressValues::write`), so read on the effective one.
+    let effective = server_revision.min(DBMS_TCP_PROTOCOL_VERSION);
     let rows_read = r.read_var_uint().await?;
     let bytes_read = r.read_var_uint().await?;
-    let total_rows_to_read = if server_revision >= DBMS_MIN_REVISION_WITH_TOTAL_ROWS_IN_PROGRESS {
+    let total_rows_to_read = if effective >= DBMS_MIN_REVISION_WITH_TOTAL_ROWS_IN_PROGRESS {
         r.read_var_uint().await?
     } else {
         0
     };
-    let (written_rows, written_bytes) =
-        if server_revision >= DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO {
-            let wr = r.read_var_uint().await?;
-            let wb = r.read_var_uint().await?;
-            (wr, wb)
-        } else {
-            (0, 0)
-        };
+    // Field order is the server's, which is not the order of the gates:
+    // total_bytes precedes the write info despite a higher gate, and elapsed
+    // time trails it despite a lower one.
+    if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_TOTAL_BYTES_IN_PROGRESS {
+        let _total_bytes_to_read = r.read_var_uint().await?;
+    }
+    let (written_rows, written_bytes) = if effective >= DBMS_MIN_REVISION_WITH_CLIENT_WRITE_INFO {
+        let wr = r.read_var_uint().await?;
+        let wb = r.read_var_uint().await?;
+        (wr, wb)
+    } else {
+        (0, 0)
+    };
+    if effective >= DBMS_MIN_PROTOCOL_VERSION_WITH_SERVER_QUERY_TIME_IN_PROGRESS {
+        let _elapsed_ns = r.read_var_uint().await?;
+    }
     Ok(Progress {
         rows_read,
         bytes_read,
@@ -296,7 +310,10 @@ pub(crate) async fn read_progress<R: ClickHouseRead>(
 /// it is not surfaced through this client's [`ProfileInfo`] struct
 /// and is discarded after read so the stream pointer advances
 /// correctly to the next packet.
-pub(crate) async fn read_profile_info<R: ClickHouseRead>(r: &mut R) -> Result<ProfileInfo> {
+pub(crate) async fn read_profile_info<R: ClickHouseRead>(
+    r: &mut R,
+    server_revision: u64,
+) -> Result<ProfileInfo> {
     let rows = r.read_var_uint().await?;
     let blocks = r.read_var_uint().await?;
     let bytes = r.read_var_uint().await?;
@@ -304,6 +321,12 @@ pub(crate) async fn read_profile_info<R: ClickHouseRead>(r: &mut R) -> Result<Pr
     let rows_before_limit = r.read_var_uint().await?;
     // calculated_rows_before_limit -- discarded, see rustdoc above.
     let _ = r.read_u8().await?;
+    if server_revision.min(DBMS_TCP_PROTOCOL_VERSION)
+        >= DBMS_MIN_REVISION_WITH_ROWS_BEFORE_AGGREGATION
+    {
+        let _applied_aggregation = r.read_u8().await?;
+        let _rows_before_aggregation = r.read_var_uint().await?;
+    }
     Ok(ProfileInfo {
         rows,
         blocks,
@@ -476,7 +499,9 @@ pub(crate) async fn read_packet<R: ClickHouseRead>(
         ServerPacketId::Progress => Ok(ServerPacket::Progress(
             read_progress(r, server_revision).await?,
         )),
-        ServerPacketId::ProfileInfo => Ok(ServerPacket::ProfileInfo(read_profile_info(r).await?)),
+        ServerPacketId::ProfileInfo => Ok(ServerPacket::ProfileInfo(
+            read_profile_info(r, server_revision).await?,
+        )),
         ServerPacketId::Pong => Ok(ServerPacket::Pong),
         ServerPacketId::EndOfStream => Ok(ServerPacket::EndOfStream),
         ServerPacketId::Log => {
@@ -797,7 +822,9 @@ mod tests {
         buf.write_var_uint(500).await.unwrap(); // rows_before_limit
         buf.write_u8(0).await.unwrap(); // calculated_rows_before_limit (discarded)
         let mut cur = Cursor::new(buf);
-        let pi = read_profile_info(&mut cur).await.unwrap();
+        let pi = read_profile_info(&mut cur, DBMS_TCP_PROTOCOL_VERSION)
+            .await
+            .unwrap();
         assert_eq!(pi.rows, 1000);
         assert_eq!(pi.blocks, 5);
         assert_eq!(pi.bytes, 32768);
