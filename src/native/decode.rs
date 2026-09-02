@@ -1748,6 +1748,135 @@ mod tests {
         }
     }
 
+    /// Every scalar type ClickHouse will sparse-serialise, scattered through
+    /// the real decode path rather than by calling `expand_sparse` directly.
+    ///
+    /// One value at row 1 of 3. The scatter arms are per-variant, so an arm
+    /// that filled the wrong default or dropped the length would put the value
+    /// in the wrong row -- readable, plausible, and wrong.
+    #[tokio::test]
+    async fn every_sparse_scalar_arm_scatters_to_full_length() {
+        use crate::native::sparse::END_OF_GRANULE_FLAG;
+
+        let cases: &[(&str, Vec<u8>)] = &[
+            ("UInt8", vec![7]),
+            ("UInt16", 7u16.to_le_bytes().to_vec()),
+            ("UInt32", 7u32.to_le_bytes().to_vec()),
+            ("UInt64", 7u64.to_le_bytes().to_vec()),
+            ("Int8", vec![0xf9]),
+            ("Int16", (-7i16).to_le_bytes().to_vec()),
+            ("Int32", (-7i32).to_le_bytes().to_vec()),
+            ("Int64", (-7i64).to_le_bytes().to_vec()),
+            ("Int128", (-7i128).to_le_bytes().to_vec()),
+            ("UInt128", 7u128.to_le_bytes().to_vec()),
+            ("Int256", vec![7u8; 32]),
+            ("UInt256", vec![7u8; 32]),
+            ("Float32", 1.5f32.to_le_bytes().to_vec()),
+            ("Float64", 1.5f64.to_le_bytes().to_vec()),
+            ("Date", 7u16.to_le_bytes().to_vec()),
+            ("Date32", 7i32.to_le_bytes().to_vec()),
+            ("DateTime", 7u32.to_le_bytes().to_vec()),
+            ("DateTime64(3)", 7i64.to_le_bytes().to_vec()),
+            ("Decimal32(9, 2)", 7i32.to_le_bytes().to_vec()),
+            ("Decimal64(18, 2)", 7i64.to_le_bytes().to_vec()),
+            ("Decimal128(38, 2)", 7i128.to_le_bytes().to_vec()),
+            ("IPv4", 7u32.to_le_bytes().to_vec()),
+            ("IPv6", vec![7u8; 16]),
+            ("UUID", vec![7u8; 16]),
+            ("String", vec![1, b'x']),
+            ("Enum8('a' = 7)", vec![7]),
+            ("Enum16('a' = 7)", 7i16.to_le_bytes().to_vec()),
+        ];
+
+        for (type_name, value) in cases {
+            let mut bytes = Vec::new();
+            bytes.write_string(b"c").await.unwrap();
+            bytes.write_string(type_name.as_bytes()).await.unwrap();
+            bytes.push(1); // has_custom_serialization
+            bytes.push(1); // KindStack {Default, Sparse}
+            bytes.put_var_uint(1); // one default, then the value at row 1
+            bytes.put_var_uint(1 | END_OF_GRANULE_FLAG); // one trailing default
+            bytes.extend_from_slice(value);
+            let len = bytes.len() as u64;
+
+            let mut cur = Cursor::new(bytes);
+            let block = decode_block(&mut cur, 1, 3, REV)
+                .await
+                .unwrap_or_else(|e| panic!("{type_name} decodes sparse: {e}"));
+            assert_eq!(cur.position(), len, "{type_name} left bytes on the wire");
+            assert_eq!(
+                block.column("c").unwrap().row_count(),
+                3,
+                "{type_name} did not scatter to the block's full length"
+            );
+        }
+    }
+
+    /// A zero-row block still declares its columns, and each must come back as
+    /// the empty shape of its own type -- a caller reading the schema off a
+    /// header block otherwise sees the wrong variant for every column.
+    #[tokio::test]
+    async fn a_header_block_yields_the_empty_shape_of_every_type() {
+        let types = [
+            "UInt8",
+            "Int8",
+            "UInt16",
+            "Int16",
+            "UInt32",
+            "Int32",
+            "UInt64",
+            "Int64",
+            "Int128",
+            "UInt128",
+            "Int256",
+            "UInt256",
+            "Float32",
+            "Float64",
+            "Decimal32(9, 2)",
+            "Decimal64(18, 2)",
+            "Decimal128(38, 2)",
+            "Decimal256(76, 2)",
+            "String",
+            "FixedString(4)",
+            "Date",
+            "Date32",
+            "DateTime",
+            "DateTime64(3)",
+            "UUID",
+            "IPv4",
+            "IPv6",
+            "Bool",
+            "Enum8('a' = 1)",
+            "Enum16('a' = 1)",
+            "JSON",
+            "Dynamic",
+            "Nullable(UInt8)",
+            "Array(UInt8)",
+            "Tuple(UInt8, String)",
+            "Map(String, UInt8)",
+            "LowCardinality(String)",
+        ];
+
+        for type_name in types {
+            let mut bytes = Vec::new();
+            bytes.write_string(b"c").await.unwrap();
+            bytes.write_string(type_name.as_bytes()).await.unwrap();
+            bytes.push(0); // no custom serialisation
+            let len = bytes.len() as u64;
+
+            let mut cur = Cursor::new(bytes);
+            let block = decode_block(&mut cur, 1, 0, REV)
+                .await
+                .unwrap_or_else(|e| panic!("{type_name} decodes as a header: {e}"));
+            assert_eq!(cur.position(), len, "{type_name} read column bytes");
+            assert_eq!(
+                block.column("c").unwrap().row_count(),
+                0,
+                "{type_name} reported rows in a header block"
+            );
+        }
+    }
+
     /// A combination stack carries its own length, so the bytes are consumed
     /// before the refusal -- a caller that retried on the same connection would
     /// otherwise start reading mid-list.

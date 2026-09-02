@@ -4,10 +4,10 @@ The repo floor is 80% lines. Two modules are marked `HOT PATH` in their own
 docs and held to 90% instead: `src/native/` (every row in or out of the server
 goes through it) and `src/tcp/pool.rs` (every operation acquires from it).
 
-`src/native/` mostly meets it; `src/tcp/pool.rs` sits just under. The remainder
-is tracked debt, not an oversight, and this file is where it is tracked -- the
-marker comments point here rather than asserting a number that would go stale
-the next time someone adds a type.
+Every module in `src/native/` meets it. `src/tcp/pool.rs` sits just under, and
+that is tracked debt rather than an oversight -- this file is where it is
+tracked, and the marker comments point here rather than asserting a number that
+would go stale the next time someone adds a type.
 
 ## Measuring
 
@@ -30,21 +30,32 @@ Line coverage, whole suite, at protocol revision 54473.
 | Module | Lines | Against its target |
 |---|---|---|
 | `native/io.rs` | 92.6% | met |
+| `native/decode.rs` | 92.3% | met |
+| `native/encode.rs` | 91.7% | met |
+| `native/columns.rs` | 91.7% | met |
 | `native/sparse.rs` | 91.5% | met |
-| `native/columns.rs` | 90.9% | met |
 | `tcp/pool.rs` | 88.8% | -1.2 |
-| `native/decode.rs` | 86.8% | -3.2 |
-| `native/encode.rs` | 85.7% | -4.3 |
-| Crate total | 90.5% | above the 90% goal |
+| Crate total | 91.8% | above the 90% goal |
 
-`native/columns.rs` was the laggard at 81.4% and is now the one to copy: the
-lift came almost entirely from one table-driven test over
-`rowbinary_to_json`, the function that renders every `Variant`, `Dynamic` and
-`JSON` cell as text. Roughly 260 uncovered lines, one coherent unit, and a
-wrong arm in it is silently wrong data rather than a failed query.
+All of `src/native/` came up in one pass, and the shape that did it is worth
+copying. Each of the three laggards had its gap concentrated in one family of
+per-type arms, so one table-driven test per family moved each of them 5 to 9
+points:
 
-`native/encode.rs` and `native/decode.rs` are the remaining gap. Both are
-mostly per-type arms, so the same shape of test should work on them.
+- `columns.rs` 81.4 -> 91.7, covering `rowbinary_to_json`, which renders every
+  `Variant`, `Dynamic` and `JSON` cell as text.
+- `encode.rs` 85.7 -> 91.7, covering the `LowCardinality(Nullable(T))` INSERT
+  path and the truncation checks in `rb_advance`.
+- `decode.rs` 86.8 -> 92.3, covering the `expand_sparse` scatter arms and
+  `empty_column`'s per-type shapes.
+
+Write the expectations from the wire format, not from what the function
+currently returns. The `LowCardinality(Nullable)` test asserts the exact
+dictionary and index bytes derived from the spec, which is the difference
+between a test that pins behaviour and one that pins a bug.
+
+`tcp/pool.rs` is the last one short. Its gap is the recycle and health-check
+paths, which want a connection that fails on demand rather than another table.
 
 ## What the numbers do not tell you
 

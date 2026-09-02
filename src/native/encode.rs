@@ -682,4 +682,94 @@ mod tests {
         assert_eq!(&data[8..16], &0x200u64.to_le_bytes(), "additional keys, u8");
         assert_eq!(&data[16..24], &2u64.to_le_bytes(), "dictionary size");
     }
+
+    /// `LowCardinality(Nullable(T))` reserves dictionary slot 0 for the default
+    /// value and points every NULL row at it. Getting this wrong writes a real
+    /// value where the caller sent NULL, which the server accepts happily.
+    #[test]
+    fn lowcardinality_nullable_points_every_null_at_dictionary_slot_zero() {
+        // RowBinary Nullable: [0x01] is NULL, [0x00, ...] is Some.
+        let rows = vec![
+            vec![0x00u8, 1, b'a'], // Some("a")
+            vec![0x01u8],          // NULL
+            vec![0x00u8, 1, b'b'], // Some("b")
+            vec![0x01u8],          // NULL
+            vec![0x00u8, 1, b'a'], // Some("a") again -- must reuse its slot
+        ];
+        let t = "LowCardinality(Nullable(String))";
+        let out = encode_columns(&rows, &schema(t), 0).expect("encodes");
+        let data = body(&out, t);
+
+        assert_eq!(&data[..8], &1u64.to_le_bytes(), "version");
+        assert_eq!(&data[8..16], &0x200u64.to_le_bytes(), "additional keys, u8");
+        // Slot 0 is the default, then "a" and "b": three entries, not four.
+        assert_eq!(&data[16..24], &3u64.to_le_bytes(), "dictionary size");
+
+        // Dictionary: empty string (the default), "a", "b".
+        assert_eq!(&data[24..25], &[0], "slot 0 is the default empty string");
+        assert_eq!(&data[25..27], b"\x01a");
+        assert_eq!(&data[27..29], b"\x01b");
+
+        assert_eq!(&data[29..37], &5u64.to_le_bytes(), "index count");
+        assert_eq!(&data[37..42], &[1, 0, 2, 0, 1], "NULLs index slot 0");
+    }
+
+    /// The index width widens with the dictionary, and the server reads it from
+    /// the flags word -- a mismatch shifts every index by a byte.
+    #[test]
+    fn a_dictionary_past_256_entries_widens_the_index_to_two_bytes() {
+        // 300 distinct two-byte keys, so the dictionary passes the u8 ceiling.
+        let rows: Vec<Vec<u8>> = (0..300u16)
+            .map(|i| {
+                let mut row = vec![2u8];
+                row.extend_from_slice(&i.to_le_bytes());
+                row
+            })
+            .collect();
+        let t = "LowCardinality(String)";
+        let out = encode_columns(&rows, &schema(t), 0).expect("encodes");
+        let data = body(&out, t);
+
+        assert_eq!(&data[8..16], &0x201u64.to_le_bytes(), "index code 1, u16");
+        assert_eq!(&data[16..24], &300u64.to_le_bytes(), "dictionary size");
+    }
+
+    /// A type with no INSERT encoding is named rather than written as
+    /// something the server would misread.
+    #[test]
+    fn a_type_that_cannot_be_inserted_is_named() {
+        let rows = vec![vec![0u8; 8]];
+        let err = encode_columns(&rows, &schema("Dynamic"), 0)
+            .expect_err("Dynamic has no INSERT encoding");
+        assert!(
+            err.to_string().contains("not supported for INSERT"),
+            "{err}"
+        );
+    }
+
+    /// Every variable-length arm has its own truncation check, and a row that
+    /// trips one must reject rather than read past the buffer.
+    #[test]
+    fn a_truncated_row_rejects_in_every_variable_length_arm() {
+        let cases: &[(&str, Vec<u8>)] = &[
+            // A string claiming four bytes and carrying one.
+            ("String", vec![4, b'x']),
+            // FixedString(4) with two bytes.
+            ("FixedString(4)", vec![b'x', b'y']),
+            // A non-null Nullable whose value is missing.
+            ("Nullable(UInt64)", vec![0x00]),
+            // A map claiming two pairs and carrying one key.
+            ("Map(String, UInt8)", vec![2, 1, b'k']),
+            // A tuple missing its second field.
+            ("Tuple(UInt8, UInt64)", vec![1]),
+        ];
+        for (type_name, row) in cases {
+            let err = encode_columns(std::slice::from_ref(row), &schema(type_name), 0)
+                .expect_err(&format!("{type_name} must reject a truncated row"));
+            assert!(
+                err.to_string().contains("truncated"),
+                "{type_name}: expected a truncation error, got {err}"
+            );
+        }
+    }
 }
