@@ -38,7 +38,8 @@ fn encode_var_uint(mut value: u64, buf: &mut VarUintBuf) -> usize {
 /// Incremental `VarUInt` decoder, fed one byte at a time.
 ///
 /// The state is shared rather than the loop because the readers below take
-/// their bytes from an `AsyncRead`, a `bytes::Buf` and a plain slice.
+/// their bytes from an `AsyncRead` and from a plain slice, so the 10-byte
+/// ceiling is enforced in one place for both.
 #[derive(Default)]
 struct VarUintDecoder {
     out: u64,
@@ -247,45 +248,6 @@ impl<T: AsyncWrite + Unpin + Send + Sync> ClickHouseWrite for T {
     }
 }
 
-/// Sync extension trait on `bytes::Buf` for `ClickHouse` wire protocol.
-///
-/// Bound of the sync sparse reader, which only tests drive today.
-#[allow(dead_code)]
-pub(crate) trait ClickHouseBytesRead: bytes::Buf {
-    fn try_get_var_uint(&mut self) -> Result<u64>;
-    fn try_get_string(&mut self) -> Result<bytes::Bytes>;
-}
-
-impl<T: bytes::Buf> ClickHouseBytesRead for T {
-    #[inline]
-    fn try_get_var_uint(&mut self) -> Result<u64> {
-        let mut decoder = VarUintDecoder::default();
-        loop {
-            if !self.has_remaining() {
-                return Err(Error::NotEnoughData);
-            }
-            if let Some(value) = decoder.push(self.get_u8())? {
-                return Ok(value);
-            }
-        }
-    }
-
-    #[inline]
-    fn try_get_string(&mut self) -> Result<bytes::Bytes> {
-        let len = string_len_usize(self.try_get_var_uint()?)?;
-
-        if len == 0 {
-            return Ok(bytes::Bytes::new());
-        }
-
-        if self.remaining() < len {
-            return Err(Error::NotEnoughData);
-        }
-
-        Ok(self.copy_to_bytes(len))
-    }
-}
-
 /// Sync extension trait on `bytes::BufMut` for `ClickHouse` wire protocol.
 pub(crate) trait ClickHouseBytesWrite: bytes::BufMut {
     /// Append `value` as a `VarUInt`.
@@ -311,45 +273,6 @@ impl<T: bytes::BufMut> ClickHouseBytesWrite for T {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::{Bytes, BytesMut};
-
-    #[test]
-    fn test_var_uint_roundtrip_sync() {
-        // ClickHouse varint packs 7 value bits per byte, up to 10 bytes
-        // for the full u64 range. u64::MAX exercises the 10-byte path.
-        let test_values: &[u64] = &[
-            0,
-            1,
-            127,
-            128,
-            255,
-            256,
-            16383,
-            16384,
-            (1 << 63) - 1,
-            1 << 63,
-            u64::MAX,
-        ];
-        for &val in test_values {
-            let mut buf = BytesMut::new();
-            buf.put_var_uint(val);
-            let mut reader = buf.freeze();
-            let decoded = reader.try_get_var_uint().unwrap();
-            assert_eq!(val, decoded, "roundtrip failed for {val}");
-        }
-    }
-
-    #[test]
-    fn test_string_roundtrip_sync() {
-        let test_strings: &[&[u8]] = &[b"", b"hello", b"hello world", &[0u8; 1000]];
-        for &val in test_strings {
-            let mut buf = BytesMut::new();
-            buf.put_string(val);
-            let mut reader = buf.freeze();
-            let decoded = reader.try_get_string().unwrap();
-            assert_eq!(val, &decoded[..], "roundtrip failed");
-        }
-    }
 
     #[tokio::test]
     async fn test_var_uint_roundtrip_async() {
@@ -387,11 +310,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_eof_returns_error() {
-        let mut buf = Bytes::new();
-        let result = buf.try_get_var_uint();
-        assert!(result.is_err());
+    /// An empty stream is not a zero-length varuint; the reader must say so
+    /// rather than return a value it never read.
+    #[tokio::test]
+    async fn test_eof_returns_error() {
+        let mut reader = std::io::Cursor::new(Vec::new());
+        assert!(reader.read_var_uint().await.is_err());
     }
 
     #[tokio::test]
@@ -436,20 +360,5 @@ mod tests {
             get_var_uint(&[0x81, 0x81]),
             Err(Error::NotEnoughData)
         ));
-    }
-
-    #[test]
-    fn test_var_uint_malformed_too_long_sync() {
-        // Same fail-closed guarantee on the sync `bytes::Buf` reader.
-        let malformed = vec![0x81u8; 12];
-        let mut reader = Bytes::from(malformed);
-        let err = reader
-            .try_get_var_uint()
-            .expect_err("over-long varint must be rejected");
-        assert!(
-            matches!(err, Error::BadResponse(_)),
-            "expected BadResponse, got {err:?}"
-        );
-        assert!(err.to_string().contains("past 10 bytes"), "got: {err}");
     }
 }

@@ -22,7 +22,9 @@ and deserialiser.
 them as `String` and the server casts, and every query asks for
 `output_format_native_write_json_as_string=1` so they come back as JSON text.
 `TcpClient::with_json_as_string(false)` turns the read side off, at which point a
-JSON column arrives in the path-based serialisation and does not decode.
+JSON column arrives in the V2 path-based serialisation and decodes from that
+instead. The setting stays on by default because the text form costs the server
+nothing to produce.
 
 ## Layers
 

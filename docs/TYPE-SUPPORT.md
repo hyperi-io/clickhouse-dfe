@@ -36,9 +36,14 @@ text. `Object('json')` is the deprecated type and reads as a plain String.
 
 A `JSON` column travels as `String` in both directions: an insert declares it
 `String` and the server converts, and every query asks for
-`output_format_native_write_json_as_string=1` so it comes back as text. Turn
-that off and the path-based serialisation arrives, which this decoder rejects
-with a message naming the version rather than misreading it.
+`output_format_native_write_json_as_string=1` so it comes back as text.
+
+Turning that setting off also works, and has since the advertised revision
+reached 54473: the server then sends the V2 path-based serialisation, which the
+decoder reads. The setting stays the default because the text form costs the
+server nothing to produce, not because it is the only readable one. Both
+directions are covered in `tests/wire_docker.rs` by
+`json_reads_with_or_without_the_string_flag`.
 
 Two limits worth knowing before sending data:
 
@@ -49,11 +54,24 @@ Two limits worth knowing before sending data:
   and silently rounded -- about 17 significant digits survive, with no error.
   Send such fields as strings.
 
+## Sparse columns
+
+Wired and proved live. A column whose defaults pass
+`ratio_of_defaults_for_sparse_serialization` arrives as an offset list plus
+only the non-default values, and the decoder scatters it back to the block's
+full length. Scalars only, which is all the server sparse-serialises; a
+composite arriving that way is refused by name.
+
+The header that selects it is TWO bytes, not one, and the second is easy to
+miss: `NativeWriter` writes the `has_custom_serialization` bool, then, only
+when it is set, a byte naming the kind stack (0 Default, 1 Sparse, 2 Detached,
+3 Detached-over-Sparse, 4 Replicated, 5 a combination with its own varuint
+count). Reading the flag alone and treating 1 as "sparse" leaves the kind byte
+on the wire; one byte of drift then corrupts every following column and
+surfaces as an unknown packet id nowhere near the cause. Only Default and
+Sparse are decoded; the rest are refused by name.
+
 ## Not implemented
 
 `AggregateFunction`, `Nested` (decomposes as `Array(Tuple)`), `Ring`,
 `Polygon`, `MultiPolygon`.
-
-Sparse serialisation has a reader in `native/sparse.rs` that is not yet wired:
-the advertised protocol revision sits below the sparse gate, so the server
-never sends it. It is wired as part of raising that revision.
