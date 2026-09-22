@@ -83,7 +83,7 @@ socket2 = { version = ">=0.6, <0.7", features = ["all"], optional = true }
 backon = { version = ">=1.6.0, <2", default-features = false, features = ["std", "tokio-sleep"], optional = true }
 
 # tls
-rustls = { version = ">=0.23, <0.24", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"], optional = true }
+rustls = { version = ">=0.23.45, <0.24", default-features = false, features = ["std", "tls12", "logging", "aws_lc_rs"], optional = true }
 tokio-rustls = { version = ">=0.26, <0.27", default-features = false, features = ["aws_lc_rs", "tls12", "logging"], optional = true }
 rustls-pki-types = { version = ">=1.15.1, <2", features = ["std"], optional = true }
 # 1.x, not the 0.26 shim over it: the shim carried a second webpki-roots copy.
