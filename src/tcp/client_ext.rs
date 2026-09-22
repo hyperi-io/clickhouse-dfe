@@ -147,13 +147,17 @@ fn poison_unless_server_rejected(conn: &ConnectionHandle, e: &Error) {
 ///
 /// Holds the pooled [`deadpool::managed::Object`] for the whole session
 /// so the actor keeps the socket exclusive across
-/// `BeginInsert` -> N x `SendInsertBlock` -> `FinishInsert`. Dropping the
-/// session without [`Self::finish`] or [`Self::abort`] returns the
-/// connection to the pool still in `InsertActive`, and the next acquirer
-/// gets an out-of-state error.
+/// `BeginInsert` -> N x `SendInsertBlock` -> `FinishInsert`. A session
+/// dropped without [`Self::finish`] or [`Self::abort`] leaves the actor in
+/// `InsertActive`, so [`Drop`] poisons the connection: the pool's recycle
+/// path then refuses it and opens a fresh one, and the leak costs one
+/// connection instead of wedging the slot for every later borrower.
 #[non_exhaustive]
 pub struct TcpInsertSession {
     handle: deadpool::managed::Object<crate::tcp::pool::TcpConnectionManager>,
+    /// Set by [`Self::finish`] and [`Self::abort`]; while it is false the
+    /// actor is still mid-INSERT and [`Drop`] must poison the connection.
+    settled: bool,
     /// Column metadata the server echoed in its schema block.
     /// Forwarded so callers can reconcile against their declared schema
     /// if needed.
@@ -198,19 +202,39 @@ impl TcpInsertSession {
     ///
     /// [`Error::ServerException`] if the server rejected the INSERT on
     /// commit, or an I/O or drain-timeout error.
-    pub async fn finish(self) -> Result<()> {
+    pub async fn finish(mut self) -> Result<()> {
         let result = self.handle.finish_insert().await;
         if let Err(ref e) = result {
             poison_unless_server_rejected(&self.handle, e);
         }
+        // The actor is back in `Idle` whatever the outcome, so `Drop` must
+        // not poison a connection this call already settled.
+        self.settled = true;
         result
     }
 
     /// Poison the connection and drop the session. The pool's recycle
     /// path will refuse the handle and `Manager::create` opens a new
     /// one for the next caller.
-    pub fn abort(self) {
+    pub fn abort(mut self) {
         self.handle.poison();
+        self.settled = true;
+    }
+}
+
+impl Drop for TcpInsertSession {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        // Nothing else moves the actor out of `InsertActive`, so an
+        // unpoisoned handle here would make every later borrower of this
+        // connection fail out-of-state for the life of the pool.
+        self.handle.poison();
+        tracing::warn!(
+            target: "clickhouse::tcp",
+            "insert session dropped without finish() or abort(); the connection was poisoned"
+        );
     }
 }
 
@@ -254,6 +278,7 @@ pub async fn insert_native_via_pool(
     let server_revision = conn.server_hello().revision;
     Ok(TcpInsertSession {
         handle: conn,
+        settled: false,
         server_columns,
         server_revision,
     })
@@ -267,11 +292,11 @@ mod tests {
     use tokio::io::AsyncWriteExt;
     use tokio::net::{TcpListener, TcpStream};
 
-    use crate::native::io::ClickHouseWrite;
+    use crate::native::io::{ClickHouseRead, ClickHouseWrite};
     use crate::tcp::handshake::HandshakeConfig;
     use crate::tcp::mock::{serve_one_handshake, write_schema_block, write_uint64_payload_block};
     use crate::tcp::pool::{ConnectKindConfig, PoolConfig, build_pool};
-    use crate::tcp::protocol::ServerPacketId;
+    use crate::tcp::protocol::{ClientPacketId, ServerPacketId};
     use crate::tcp::retry::is_retriable_transport;
 
     /// Build a one-connection pool against `addr`.
@@ -365,6 +390,53 @@ mod tests {
             is_retriable_transport(&err),
             "a refused connect must classify as retriable, got {err:?}"
         );
+    }
+
+    /// A session dropped without `finish()` or `abort()` leaves the actor in
+    /// `InsertActive`. Returned to the pool unpoisoned, that connection
+    /// answers every later Ping, query, insert and stream with an
+    /// out-of-state error for the life of the pool, and `max_size` leaks
+    /// brick it outright.
+    #[tokio::test]
+    async fn a_dropped_insert_session_does_not_wedge_the_pooled_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            // First connection: open an INSERT and leave it open.
+            let (mut opened, _) = listener.accept().await.unwrap();
+            serve_one_handshake(&mut opened).await;
+            write_schema_block(&mut opened, &[("n", "UInt64")]).await;
+
+            // Second: the pool must refuse the poisoned handle and connect
+            // again, and the fresh connection must answer a Ping.
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            serve_one_handshake(&mut fresh).await;
+            assert_eq!(
+                fresh.read_var_uint().await.unwrap(),
+                ClientPacketId::Ping as u64,
+                "the reconnected client must send a Ping"
+            );
+            fresh
+                .write_var_uint(ServerPacketId::Pong as u64)
+                .await
+                .unwrap();
+            fresh.flush().await.unwrap();
+            (opened, fresh)
+        });
+
+        let pool = pool_of(addr, 1);
+        let session = insert_native_via_pool(&pool, "q", "INSERT INTO t FORMAT Native", &[])
+            .await
+            .expect("the insert session opens");
+        drop(session);
+
+        let conn = pool.get().await.expect("acquire after a dropped session");
+        conn.ping()
+            .await
+            .expect("the pool must hand out a usable connection");
+
+        drop(conn);
+        let _socks = server.await.unwrap();
     }
 
     /// Releasing the slot at dispatch time would let the next `get()`
