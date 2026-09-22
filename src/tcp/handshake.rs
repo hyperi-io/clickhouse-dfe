@@ -30,7 +30,7 @@ use crate::tcp::{reader, writer};
 ///
 /// The defaults match ClickHouse's own: `"default"` database and user,
 /// empty password and quota key.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct HandshakeConfig {
     /// Default database for the session.
@@ -51,6 +51,19 @@ impl Default for HandshakeConfig {
             password: String::new(),
             quota_key: String::new(),
         }
+    }
+}
+
+// Hand-written so the password cannot reach a log line or an assertion diff.
+// Derived on a struct a consumer formats with `?` and the credential is printed.
+impl std::fmt::Debug for HandshakeConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeConfig")
+            .field("database", &self.database)
+            .field("user", &self.user)
+            .field("password", &"<redacted>")
+            .field("quota_key", &self.quota_key)
+            .finish()
     }
 }
 
@@ -83,6 +96,27 @@ mod tests {
         DBMS_MIN_PROTOCOL_VERSION_WITH_ADDENDUM, DBMS_TCP_PROTOCOL_VERSION, ServerPacketId,
     };
     use tokio::io::{AsyncWriteExt, duplex};
+
+    #[test]
+    fn debug_redacts_the_password_and_keeps_the_rest() {
+        let cfg = HandshakeConfig {
+            database: "analytics".to_string(),
+            user: "loader".to_string(),
+            password: "hunter2-not-a-real-password".to_string(),
+            quota_key: "q1".to_string(),
+        };
+
+        let rendered = format!("{cfg:?}");
+
+        assert!(
+            !rendered.contains("hunter2-not-a-real-password"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("<redacted>"), "{rendered}");
+        assert!(rendered.contains("analytics"), "{rendered}");
+        assert!(rendered.contains("loader"), "{rendered}");
+        assert!(rendered.contains("q1"), "{rendered}");
+    }
 
     #[test]
     fn default_handshake_config_uses_server_defaults() {
