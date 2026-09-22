@@ -587,7 +587,14 @@ fn as_f64(value: &Value, col: &str) -> Result<f64, DynamicError> {
 fn as_bool(value: &Value, col: &str) -> Result<bool, DynamicError> {
     match value {
         Value::Bool(b) => Ok(*b),
-        Value::Number(n) => Ok(n.as_i64().unwrap_or(0) != 0),
+        // Mirrors as_i64: a number the column cannot hold fails the row rather
+        // than being written as false.
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|v| i64::try_from(v).ok()))
+            .or_else(|| n.as_f64().and_then(whole_f64_as_i64))
+            .map(|v| v != 0)
+            .ok_or_else(|| enc_err(col, "number not parseable as bool")),
         Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
             "true" | "yes" | "1" => Ok(true),
             "false" | "no" | "0" | "" => Ok(false),
@@ -1246,6 +1253,21 @@ mod tests {
             (json!("0"), 0),
         ] {
             assert_eq!(enc(json!({"b": v}), &[("b", "Bool")]), vec![want]);
+        }
+    }
+
+    #[test]
+    fn bool_takes_a_whole_float_and_refuses_the_rest() {
+        // 1.0 parses as f64, so the old `as_i64().unwrap_or(0)` stored false.
+        assert_eq!(enc(json!({"b": 1.0}), &[("b", "Bool")]), vec![1]);
+        assert_eq!(enc(json!({"b": 0.0}), &[("b", "Bool")]), vec![0]);
+
+        for v in [json!(2.5), json!(1e30), json!(-0.5)] {
+            let err = enc_err_of(json!({ "b": v }), &[("b", "Bool")]).to_string();
+            assert!(
+                err.contains("not parseable as bool"),
+                "a number the column cannot hold must fail the row, got: {err}"
+            );
         }
     }
 
