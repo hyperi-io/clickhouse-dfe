@@ -339,13 +339,9 @@ impl DecodedColumn {
         }
 
         macro_rules! scatter {
-            ($variant:ident, $values:expr, $default:expr) => {{
-                let mut out = vec![$default; num_rows];
-                for (value, &row) in $values.into_iter().zip(positions) {
-                    out[row] = value;
-                }
-                Self::$variant(out)
-            }};
+            ($variant:ident, $values:expr, $default:expr) => {
+                Self::$variant(scatter_values($values, positions, num_rows, $default)?)
+            };
         }
 
         Ok(match self {
@@ -375,79 +371,57 @@ impl DecodedColumn {
                 precision,
                 scale,
                 values,
-            } => {
-                let mut out = vec![0i32; num_rows];
-                for (value, &row) in values.into_iter().zip(positions) {
-                    out[row] = value;
-                }
-                Self::Decimal32 {
-                    precision,
-                    scale,
-                    values: out,
-                }
-            }
+            } => Self::Decimal32 {
+                precision,
+                scale,
+                values: scatter_values(values, positions, num_rows, 0i32)?,
+            },
             Self::Decimal64 {
                 precision,
                 scale,
                 values,
-            } => {
-                let mut out = vec![0i64; num_rows];
-                for (value, &row) in values.into_iter().zip(positions) {
-                    out[row] = value;
-                }
-                Self::Decimal64 {
-                    precision,
-                    scale,
-                    values: out,
-                }
-            }
+            } => Self::Decimal64 {
+                precision,
+                scale,
+                values: scatter_values(values, positions, num_rows, 0i64)?,
+            },
             Self::Decimal128 {
                 precision,
                 scale,
                 values,
-            } => {
-                let mut out = vec![0i128; num_rows];
-                for (value, &row) in values.into_iter().zip(positions) {
-                    out[row] = value;
-                }
-                Self::Decimal128 {
-                    precision,
-                    scale,
-                    values: out,
-                }
-            }
+            } => Self::Decimal128 {
+                precision,
+                scale,
+                values: scatter_values(values, positions, num_rows, 0i128)?,
+            },
             Self::Decimal256 {
                 precision,
                 scale,
                 values,
-            } => {
-                let mut out = vec![[0u8; 32]; num_rows];
-                for (value, &row) in values.into_iter().zip(positions) {
-                    out[row] = value;
-                }
-                Self::Decimal256 {
-                    precision,
-                    scale,
-                    values: out,
-                }
-            }
+            } => Self::Decimal256 {
+                precision,
+                scale,
+                values: scatter_values(values, positions, num_rows, [0u8; 32])?,
+            },
             Self::DateTime64 {
                 precision,
                 timezone,
                 values,
-            } => {
-                let mut out = vec![0i64; num_rows];
-                for (value, &row) in values.into_iter().zip(positions) {
-                    out[row] = value;
-                }
-                Self::DateTime64 {
-                    precision,
-                    timezone,
-                    values: out,
-                }
-            }
+            } => Self::DateTime64 {
+                precision,
+                timezone,
+                values: scatter_values(values, positions, num_rows, 0i64)?,
+            },
             Self::FixedString { width, bytes } => {
-                let mut out = vec![0u8; num_rows * width];
+                // Both factors are wire-derived, so the product is checked --
+                // a release build wraps it and then indexes past the buffer.
+                let total = num_rows.checked_mul(width).ok_or_else(|| {
+                    Error::BadResponse(
+                        "native: sparse FixedString byte length overflows usize".into(),
+                    )
+                })?;
+                let mut out = with_cap(total)?;
+                out.resize(total, 0u8);
                 for (i, &row) in positions.iter().enumerate() {
                     out[row * width..][..width].copy_from_slice(&bytes[i * width..][..width]);
                 }
@@ -474,6 +448,28 @@ impl DecodedColumn {
             _ => "this column",
         }
     }
+}
+
+/// Scatter `values` into a full-length column, `values[i]` landing at
+/// `positions[i]` and every other row taking `default`.
+///
+/// `num_rows` is a count the server declared, so the buffer is sized through
+/// the fallible [`with_cap`] rather than `vec![_; n]`, which commits the whole
+/// claim and aborts the process when the allocator cannot back it. Callers
+/// check every position against `num_rows` first, so the indexing cannot panic.
+fn scatter_values<T: Clone>(
+    values: Vec<T>,
+    positions: &[usize],
+    num_rows: usize,
+    default: T,
+) -> Result<Vec<T>> {
+    // The reservation covers the full length, so `resize` cannot reallocate.
+    let mut out = with_cap(num_rows)?;
+    out.resize(num_rows, default);
+    for (value, &row) in values.into_iter().zip(positions) {
+        out[row] = value;
+    }
+    Ok(out)
 }
 
 /// A decoded Native data block: ordered list of columns plus the
@@ -1947,6 +1943,37 @@ mod tests {
             Error::BadResponse(msg) => {
                 assert!(msg.contains("past the block's 4 rows"), "got: {msg}");
             }
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// The scatter buffer is sized from a row count the server declared, and a
+    /// `Vec` allocation failure aborts the process rather than erroring, which
+    /// a library cannot catch.
+    #[test]
+    fn sparse_expansion_refuses_a_row_count_the_allocator_cannot_back() {
+        let err = DecodedColumn::UInt64(vec![7])
+            .expand_sparse(&[0], usize::MAX / 4)
+            .unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("column buffer"), "got: {msg}"),
+            other => panic!("expected BadResponse, got {other:?}"),
+        }
+    }
+
+    /// `num_rows` and `FixedString`'s width are both wire-derived, and the
+    /// width parses unbounded, so their product is checked: unchecked, a
+    /// release build wraps it and then indexes past the buffer.
+    #[test]
+    fn sparse_expansion_refuses_a_fixedstring_byte_length_that_overflows() {
+        let err = DecodedColumn::FixedString {
+            width: usize::MAX / 2 + 1,
+            bytes: Vec::new(),
+        }
+        .expand_sparse(&[], 2)
+        .unwrap_err();
+        match err {
+            Error::BadResponse(msg) => assert!(msg.contains("overflows usize"), "got: {msg}"),
             other => panic!("expected BadResponse, got {other:?}"),
         }
     }
