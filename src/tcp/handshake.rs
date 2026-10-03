@@ -123,8 +123,8 @@ mod tests {
         let cfg = HandshakeConfig::default();
         assert_eq!(cfg.database, "default");
         assert_eq!(cfg.user, "default");
-        assert!(cfg.password.is_empty());
-        assert!(cfg.quota_key.is_empty());
+        assert_eq!(cfg.password, "");
+        assert_eq!(cfg.quota_key, "");
     }
 
     /// End-to-end check on an in-memory duplex pair: handshake drives

@@ -500,17 +500,20 @@ mod tests {
             Ok(fabricate_handle().await)
         }
 
-        async fn recycle(
+        fn recycle(
             &self,
             obj: &mut ConnectionHandle,
             metrics: &Metrics,
-        ) -> RecycleResult<Error> {
+        ) -> impl std::future::Future<Output = RecycleResult<Error>> {
             // The production decision itself, not a copy of it. Only the
             // actor shutdown is skipped: a fabricated handle has no actor.
-            match recycle_refusal(self.max_lifetime, metrics.created.elapsed(), obj.is_alive()) {
-                Some(reason) => Err(RecycleError::message(reason)),
-                None => Ok(()),
-            }
+            std::future::ready(
+                match recycle_refusal(self.max_lifetime, metrics.created.elapsed(), obj.is_alive())
+                {
+                    Some(reason) => Err(RecycleError::message(reason)),
+                    None => Ok(()),
+                },
+            )
         }
     }
 
@@ -694,8 +697,12 @@ mod tests {
                 unreachable!("the create timeout fires first")
             }
 
-            async fn recycle(&self, _: &mut ConnectionHandle, _: &Metrics) -> RecycleResult<Error> {
-                Ok(())
+            fn recycle(
+                &self,
+                _: &mut ConnectionHandle,
+                _: &Metrics,
+            ) -> impl std::future::Future<Output = RecycleResult<Error>> {
+                std::future::ready(Ok(()))
             }
         }
 

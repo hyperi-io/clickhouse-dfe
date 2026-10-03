@@ -124,7 +124,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(offsets.is_empty());
+        assert_eq!(offsets, [] as [usize; 0]);
     }
 
     #[tokio::test]
@@ -174,7 +174,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(offsets.is_empty());
+        assert_eq!(offsets, [] as [usize; 0]);
     }
 
     #[tokio::test]

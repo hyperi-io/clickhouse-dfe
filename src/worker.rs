@@ -295,13 +295,14 @@ mod tests {
             "counter-test"
         }
 
-        async fn handle(&mut self, cmd: CounterCmd) {
+        fn handle(&mut self, cmd: CounterCmd) -> impl Future<Output = ()> + Send + '_ {
             match cmd {
                 CounterCmd::Inc => self.n += 1,
                 CounterCmd::Get(reply) => {
                     let _ = reply.send(self.n);
                 }
             }
+            std::future::ready(())
         }
 
         fn idle_interval(&self) -> Option<Duration> {

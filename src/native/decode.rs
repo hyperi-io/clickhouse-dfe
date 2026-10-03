@@ -1503,7 +1503,10 @@ mod tests {
         body.push(0);
 
         let block = decode_via_cursor(body, 0).await;
-        assert!(block.column_as::<String>("j").unwrap().is_empty());
+        assert_eq!(
+            block.column_as::<String>("j").unwrap(),
+            [] as [std::string::String; 0]
+        );
     }
 
     #[tokio::test]
@@ -2834,7 +2837,7 @@ mod tests {
             num_rows: 0,
         };
         assert!(block.column("c").is_none());
-        assert!(block.column_as::<u64>("c").unwrap().is_empty());
+        assert_eq!(block.column_as::<u64>("c").unwrap(), [] as [u64; 0]);
     }
 
     /// The server ends every result set with a block that declares no
@@ -2847,7 +2850,7 @@ mod tests {
             schema: Vec::new(),
             num_rows: 0,
         };
-        assert!(block.column_as::<u64>("c").unwrap().is_empty());
+        assert_eq!(block.column_as::<u64>("c").unwrap(), [] as [u64; 0]);
     }
 
     #[tokio::test]

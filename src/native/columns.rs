@@ -2138,7 +2138,7 @@ mod tests {
         let cells = read_column(&mut cursor, &col_type, 0)
             .await
             .expect("a zero-row column reads nothing");
-        assert!(cells.is_empty());
+        assert_eq!(cells, [] as [std::vec::Vec<u8>; 0]);
         assert_eq!(cursor.position(), 0);
     }
 
