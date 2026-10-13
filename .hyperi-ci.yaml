@@ -38,6 +38,5 @@ build:
     # default, no-default, and dynamic-only.
     features: all
     targets: []
-publish:
+release:
   enabled: true
-  target: oss
