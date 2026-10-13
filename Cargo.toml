@@ -64,7 +64,7 @@ full = [
 
 [dependencies]
 # The only link to upstream: a crates.io release, never git/path/[patch].
-clickhouse = { version = "0.15.2", default-features = false }
+clickhouse = { version = "0.15.3", default-features = false }
 
 serde = { version = ">=1.0.228, <2", features = ["derive"] }
 bytes = ">=1.12.1, <2"
@@ -95,7 +95,7 @@ serde_json = { version = ">=1.0.149, <2", optional = true }
 
 [dev-dependencies]
 # `-native-roots` only picks the trust source; the HTTPS connector needs `-aws-lc` too.
-clickhouse = { version = "0.15.2", default-features = false, features = ["test-util", "rustls-tls-aws-lc", "rustls-tls-native-roots"] }
+clickhouse = { version = "0.15.3", default-features = false, features = ["test-util", "rustls-tls-aws-lc", "rustls-tls-native-roots"] }
 tokio = { version = ">=1.50.0, <2", features = ["full", "test-util"] }
 serde_json = ">=1.0.149, <2"
 dotenvy = ">=0.15.7, <0.16"
