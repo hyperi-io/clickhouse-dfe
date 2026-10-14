@@ -30,13 +30,27 @@ pub struct ServerException {
 }
 
 impl ServerException {
-    /// `None` for any other [`Error`] variant, and for a body that does not
-    /// open with `Code: N.` -- a proxy page or a bare status line.
+    /// `None` for any other [`Error`] variant, and for a body that neither opens
+    /// with `Code: N.` nor is a bare code -- a proxy page or a bare status line.
+    /// A bare code parses with an empty `message`.
     #[must_use]
     pub fn parse(error: &Error) -> Option<Self> {
         let Error::BadResponse(body) = error else {
             return None;
         };
+
+        // Upstream's `reason()` in `response.rs` substitutes the
+        // `X-ClickHouse-Exception-Code` header for a body that is empty, not
+        // UTF-8, or fails mid-read.
+        if let Ok(code) = body.trim().parse::<i32>() {
+            return Some(Self {
+                code,
+                name: None,
+                message: String::new(),
+                stack_trace: None,
+            });
+        }
+
         let code: i32 = body
             .strip_prefix("Code: ")?
             .split_once('.')
@@ -211,7 +225,6 @@ mod tests {
         for body in [
             "404 Not Found",
             "",
-            // Upstream drops the header code, so the body is the only source.
             "DB::Exception: oops",
             // A code but no message left after stripping.
             "Code: 60. DB::Exception: (UNKNOWN_TABLE)",
@@ -223,6 +236,23 @@ mod tests {
             );
         }
         assert!(ServerException::parse(&Error::TimedOut).is_none());
+    }
+
+    /// Declining a bare code loses the only field a caller classifies on.
+    #[test]
+    fn parse_accepts_the_bare_code_upstream_falls_back_to() {
+        let exc = ServerException::parse(&Error::BadResponse("117".into()))
+            .expect("a bare exception code is a rejection, not junk");
+        assert_eq!(exc.code, 117);
+        assert_eq!(exc.name, None);
+        assert!(exc.message.is_empty(), "no message is on the wire to read");
+        assert!(exc.stack_trace.is_none());
+
+        // Upstream trims the body, and a retriable code still reads as one.
+        let exc = ServerException::parse(&Error::BadResponse(" 202 ".into()))
+            .expect("a padded bare code still parses");
+        assert_eq!(exc.code, 202);
+        assert!(exc.is_retriable());
     }
 
     #[test]
