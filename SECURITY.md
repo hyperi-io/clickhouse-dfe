@@ -5,7 +5,7 @@
 If you discover a security vulnerability in this project, please report it
 responsibly. We take security seriously and will respond promptly.
 
-**Email**: security@hyperi.io
+**Email**: <security@hyperi.io>
 
 Please include:
 
@@ -63,6 +63,6 @@ The following are generally out of scope:
 
 ## Contact
 
-**Security reports**: security@hyperi.io
+**Security reports**: <security@hyperi.io>
 
 For non-security issues, please use the project's issue tracker.
