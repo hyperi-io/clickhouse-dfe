@@ -71,7 +71,7 @@ bytes = ">=1.12.1, <2"
 thiserror = ">=2.0.21, <3"
 tracing = { version = ">=0.1.44, <0.2", default-features = false, features = ["std"] }
 futures-util = { version = ">=0.3.34, <0.4", default-features = false }
-tokio = { version = ">=1.53.3, <2", features = ["rt", "macros", "io-util", "sync", "net", "time"] }
+tokio = { version = ">=1.54.1, <2", features = ["rt", "macros", "io-util", "sync", "net", "time"] }
 
 # tcp
 deadpool = { version = ">=0.13.1, <0.14", default-features = false, features = ["managed", "rt_tokio_1"], optional = true }
@@ -87,7 +87,7 @@ rustls = { version = ">=0.23.46, <0.24", default-features = false, features = ["
 tokio-rustls = { version = ">=0.26.6, <0.27", default-features = false, features = ["aws_lc_rs", "tls12", "logging"], optional = true }
 rustls-pki-types = { version = ">=1.15.1, <2", features = ["std"], optional = true }
 # 1.x, not the 0.26 shim over it: the shim carried a second webpki-roots copy.
-webpki-roots = { version = ">=1.0.9, <2", optional = true }
+webpki-roots = { version = ">=1.0.11, <2", optional = true }
 rustls-native-certs = { version = ">=0.8.5, <0.9", optional = true }
 
 # dynamic
@@ -96,7 +96,7 @@ serde_json = { version = ">=1.0.154, <2", optional = true }
 [dev-dependencies]
 # `-native-roots` only picks the trust source; the HTTPS connector needs `-aws-lc` too.
 clickhouse = { version = "0.15.3", default-features = false, features = ["test-util", "rustls-tls-aws-lc", "rustls-tls-native-roots"] }
-tokio = { version = ">=1.53.3, <2", features = ["full", "test-util"] }
+tokio = { version = ">=1.54.1, <2", features = ["full", "test-util"] }
 serde_json = ">=1.0.154, <2"
 dotenvy = ">=0.15.7, <0.16"
 static_assertions = ">=1.1, <2"
