@@ -1,5 +1,20 @@
 # Changelog
 
+Rendered by CI and committed back at the end of a release -- do not edit by
+hand. Release notes also appear on the GitHub Releases page, one per tag.
+
+## [0.1.3](https://github.com/hyperi-io/clickhouse-dfe/compare/v0.1.2...v0.1.3) (2026-10-25)
+
+### Bug Fixes
+
+* allow unused_async_trait_impl on ensure_active without tcp ([#24](https://github.com/hyperi-io/clickhouse-dfe/issues/24)) ([36aa13e](https://github.com/hyperi-io/clickhouse-dfe/commit/36aa13e2e7cbf32ac9a58cd4e24df1b2e1b52aae))
+* **deps:** take tokio 1.54.1 and webpki-roots 1.0.11 ([#26](https://github.com/hyperi-io/clickhouse-dfe/issues/26)) ([3e3ee9c](https://github.com/hyperi-io/clickhouse-dfe/commit/3e3ee9c455ab47622f660973ee3081a2f734a166))
+* **deps:** update Rust crate rustls to >=0.23.46, <0.24 ([#22](https://github.com/hyperi-io/clickhouse-dfe/issues/22)) ([dca99d8](https://github.com/hyperi-io/clickhouse-dfe/commit/dca99d8b8f4e834683114732c4252b495cf54ba6))
+* **deps:** update Rust to v1.99.0 ([#23](https://github.com/hyperi-io/clickhouse-dfe/issues/23)) ([29935de](https://github.com/hyperi-io/clickhouse-dfe/commit/29935de5c4c821fc2c1a2cafb3bf408926842b3a))
+* move -D warnings to per-target rustflags ([#21](https://github.com/hyperi-io/clickhouse-dfe/issues/21)) ([8e3cf0e](https://github.com/hyperi-io/clickhouse-dfe/commit/8e3cf0e8574cbcb6aea9ffa3653b9a8a6caffa66)), closes [#20](https://github.com/hyperi-io/clickhouse-dfe/issues/20)
+
+# Changelog
+
 Released sections are rendered by CI at the end of a release and committed
 back. `[Unreleased]` is maintained by hand until then. Release notes also
 appear on the GitHub Releases page, one per tag.
