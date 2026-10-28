@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/unified.rs
 // Purpose:   One client dispatching over HTTP and TCP transports
 // Language:  Rust

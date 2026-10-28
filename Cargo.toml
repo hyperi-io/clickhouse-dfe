@@ -1,4 +1,4 @@
-# Project:   clickhouse-dfe
+# Project:   dfe-clickhouse-rs
 # File:      Cargo.toml
 # Purpose:   Crate manifest, feature layers and dependency policy
 # Language:  TOML
@@ -7,7 +7,7 @@
 # Copyright: (c) 2026 HYPERI PTY LIMITED
 
 [package]
-name = "clickhouse-dfe"
+name = "dfe-clickhouse"
 version = "0.1.0"
 edition = "2024"
 # Upstream's MSRV. Keep in step with rust-toolchain.toml.
@@ -15,7 +15,7 @@ rust-version = "1.89.0"
 description = "HyperI extensions for the official ClickHouse Rust client: TCP transport, dynamic inserts, unified client"
 authors = ["HYPERI PTY LIMITED <dev@hyperi.io>"]
 license = "Apache-2.0"
-repository = "https://github.com/hyperi-io/clickhouse-dfe"
+repository = "https://github.com/hyperi-io/dfe-clickhouse-rs"
 publish = true
 keywords = ["clickhouse", "database", "tcp", "tokio"]
 categories = ["database", "asynchronous"]

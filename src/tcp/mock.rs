@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/tcp/mock.rs
 // Purpose:   Server-side wire script shared by the TCP unit tests
 // Language:  Rust

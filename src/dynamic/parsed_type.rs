@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/dynamic/parsed_type.rs
 // Purpose:   Runtime ClickHouse type-string parser (ParsedType)
 // Language:  Rust
@@ -154,7 +154,7 @@ impl TypeTag {
 /// # Examples
 ///
 /// ```
-/// use clickhouse_dfe::dynamic::ParsedType;
+/// use dfe_clickhouse::dynamic::ParsedType;
 ///
 /// let t = ParsedType::parse("LowCardinality(Nullable(String))");
 /// assert_eq!(t.base, "String");

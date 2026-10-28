@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/lib.rs
 // Purpose:   Crate root -- feature-gated layers over the official client
 // Language:  Rust

@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      tests/tcp_params_live.rs
 // Purpose:   Server-side query parameters over TCP, against a real cluster
 // Language:  Rust
@@ -23,7 +23,7 @@
 
 use std::sync::OnceLock;
 
-use clickhouse_dfe::{Error, TcpClient};
+use dfe_clickhouse::{Error, TcpClient};
 
 struct Cluster {
     addr: String,

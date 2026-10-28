@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      tests/json_tcp_live.rs
 // Purpose:   Live JSON-over-TCP round trip against a real ClickHouse cluster
 // Language:  Rust
@@ -24,12 +24,12 @@ use std::sync::OnceLock;
 
 use serde_json::{Map, Value, json};
 
-use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
-use clickhouse_dfe::{Result, TcpClient};
+use dfe_clickhouse::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+use dfe_clickhouse::{Result, TcpClient};
 
 /// Shared by every table here, so a run that dies mid-test leaves something
 /// obviously disposable behind.
-const TABLE_PREFIX: &str = "clickhouse_dfe_s3t2_";
+const TABLE_PREFIX: &str = "dfe_clickhouse_s3t2_";
 
 struct Cluster {
     addr: String,
@@ -151,13 +151,13 @@ async fn insert_rows(client: &TcpClient, table: &str, rows: &[(u64, String, Valu
         insert
             .write_map(&row(*id, tag, doc))
             .await
-            .map_err(|e| clickhouse_dfe::Error::Custom(e.to_string()))?;
+            .map_err(|e| dfe_clickhouse::Error::Custom(e.to_string()))?;
     }
     insert
         .end()
         .await
         .map(|_| ())
-        .map_err(|e| clickhouse_dfe::Error::Custom(e.to_string()))
+        .map_err(|e| dfe_clickhouse::Error::Custom(e.to_string()))
 }
 
 /// `doc` comes back parsed, so a difference in JSON key order is not a

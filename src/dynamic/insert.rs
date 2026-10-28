@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/dynamic/insert.rs
 // Purpose:   DynamicInsert adapter over the clickhouse-rs RowBinary/Native sinks
 // Language:  Rust

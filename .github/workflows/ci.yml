@@ -1,4 +1,4 @@
-# Project:   clickhouse-dfe
+# Project:   dfe-clickhouse-rs
 # File:      .github/workflows/ci.yml
 # Purpose:   CI pipeline
 #

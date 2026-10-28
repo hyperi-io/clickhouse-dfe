@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/tcp/query.rs
 // Purpose:   Query builder over the TCP transport
 // Language:  Rust
@@ -64,8 +64,8 @@ impl<'a> TcpQuery<'a> {
     /// # Examples
     ///
     /// ```no_run
-    /// # use clickhouse_dfe::TcpClient;
-    /// # async fn run(client: &TcpClient) -> clickhouse_dfe::Result<()> {
+    /// # use dfe_clickhouse::TcpClient;
+    /// # async fn run(client: &TcpClient) -> dfe_clickhouse::Result<()> {
     /// let blocks = client
     ///     .query("SELECT name FROM system.columns WHERE database = {db:String}")
     ///     .param("db", "'default'")

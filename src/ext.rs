@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/ext.rs
 // Purpose:   Extension traits on clickhouse::Client
 // Language:  Rust

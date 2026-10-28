@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      tests/tcp_public_surface.rs
 // Purpose:   Drive the public TCP surface offline -- builder plus handle bounds
 // Language:  Rust
@@ -12,8 +12,8 @@
 
 use std::time::Duration;
 
-use clickhouse_dfe::TcpClient;
-use clickhouse_dfe::tcp::{ConnectionHandle, RetryPolicy, TcpInsertSession, TcpRawCursor};
+use dfe_clickhouse::TcpClient;
+use dfe_clickhouse::tcp::{ConnectionHandle, RetryPolicy, TcpInsertSession, TcpRawCursor};
 
 /// Every builder knob has to be readable back before a connection exists.
 #[test]

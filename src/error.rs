@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/error.rs
 // Purpose:   Crate error enum, upstream mapping and retry classification
 // Language:  Rust

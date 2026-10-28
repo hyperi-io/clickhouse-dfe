@@ -1,4 +1,4 @@
-# Project:   clickhouse-dfe
+# Project:   dfe-clickhouse
 # File:      .config/nextest.toml
 # Purpose:   Serialise the tests that each start a ClickHouse container
 #

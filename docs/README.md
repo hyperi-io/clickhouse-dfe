@@ -1,4 +1,4 @@
-# clickhouse-dfe docs
+# dfe-clickhouse docs
 
 Start at the [README](../README.md): it is the crate's front page, the feature
 table and the quick start, and it is what renders on docs.rs.
