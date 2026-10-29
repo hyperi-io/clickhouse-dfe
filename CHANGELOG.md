@@ -3,6 +3,13 @@
 Rendered by CI and committed back at the end of a release -- do not edit by
 hand. Release notes also appear on the GitHub Releases page, one per tag.
 
+## [0.1.4](https://github.com/hyperi-io/dfe-clickhouse-rs/compare/v0.1.3...v0.1.4) (2026-10-29)
+
+### Bug Fixes
+
+* **deps:** update Rust to v1.99.1 ([#27](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/27)) ([3f6e2cf](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/3f6e2cfc13aec3522181e0864c501fc4f612310d))
+* rename the crate to dfe-clickhouse ([#28](https://github.com/hyperi-io/dfe-clickhouse-rs/issues/28)) ([04b68a9](https://github.com/hyperi-io/dfe-clickhouse-rs/commit/04b68a99ad5df61dba9b3100a60b9d0d81e5229f))
+
 ## [0.1.3](https://github.com/hyperi-io/clickhouse-dfe/compare/v0.1.2...v0.1.3) (2026-10-25)
 
 ### Bug Fixes
