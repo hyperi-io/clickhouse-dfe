@@ -4,7 +4,32 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-ignore = []
+# cargo-audit reports unsound advisories on every crate, so deny matches it and
+# each ignore below is one both tools see.
+unsound = "all"
+# hyperi-ci passes this list to cargo-audit and osv-scanner as well.
+#
+# zstd 0.13.3 / zstd-safe 7.3.0 arrive only through the opt-in `zstd` feature:
+# clickhouse 0.15.3 takes zstd ^0.13 with default-features off, so zstd-safe
+# resolves with `std` alone. clickhouse calls zstd_safe::compress (one-shot
+# ZSTD_compress) and decodes HTTP responses with a fresh raw::Decoder::new per
+# response. Every fix is in zstd 0.14.3 / zstd-safe 8.2.0, which no clickhouse
+# release takes yet. Drop the block when one moves to zstd 0.14.
+ignore = [
+    { id = "RUSTSEC-2026-0391", reason = "raw::{Encoder,Decoder}::with_context only, and clickhouse never reuses a context" },
+    { id = "RUSTSEC-2026-0395", reason = "CCtx::set_parameter with StableInBuffer. clickhouse builds no CCtx" },
+    { id = "RUSTSEC-2026-0396", reason = "zstd_safe::seekable only, and the seekable feature is off" },
+    { id = "RUSTSEC-2026-0397", reason = "OutBuffer::around_pos only. raw::Decoder uses OutBuffer::around" },
+    { id = "RUSTSEC-2026-0398", reason = "zstd_safe::seekable only, and the seekable feature is off" },
+    { id = "RUSTSEC-2026-0399", reason = "init_using_cdict / init_using_ddict only. clickhouse loads no dictionary" },
+    { id = "RUSTSEC-2026-0400", reason = "one-shot DCtx::decompress* on a context with an open stream. clickhouse only streams" },
+    { id = "RUSTSEC-2026-0401", reason = "train_from_buffer only, and the zdict_builder feature is off" },
+    { id = "RUSTSEC-2026-0402", reason = "CCtx::try_clone only. clickhouse builds no CCtx" },
+    { id = "RUSTSEC-2026-0403", reason = "legacy frames only, and the legacy feature is off, so legacy frames are rejected" },
+    { id = "RUSTSEC-2026-0404", reason = "DCtx::try_clone only, never called" },
+    { id = "RUSTSEC-2026-0405", reason = "seekable::SeekableCStream only, and the seekable feature is off" },
+    { id = "RUSTSEC-2026-0406", reason = "CCtx methods only. clickhouse builds no CCtx" },
+]
 
 [licenses]
 allow = [
