@@ -1,4 +1,4 @@
-# Project:   clickhouse-dfe
+# Project:   dfe-clickhouse
 # File:      clippy.toml
 # Purpose:   Clippy linter configuration
 # Language:  TOML

@@ -1,4 +1,4 @@
-# Project:   clickhouse-dfe
+# Project:   dfe-clickhouse
 # File:      Makefile
 # Purpose:   CI targets wrapping hyperi-ci
 #

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/dynamic/schema.rs
 // Purpose:   system.columns schema fetch + TTL cache for dynamic inserts
 // Language:  Rust

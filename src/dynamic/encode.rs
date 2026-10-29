@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 HYPERI PTY LIMITED
 
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/dynamic/encode.rs
 // Purpose:   Dynamic Map<String, Value> to RowBinary encoder
 // Language:  Rust

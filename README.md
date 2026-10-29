@@ -1,10 +1,10 @@
-# clickhouse-dfe
+# dfe-clickhouse
 
 <!-- BADGES:START -->
-[![Build Status](https://github.com/hyperi-io/clickhouse-dfe/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/clickhouse-dfe/actions)
-[![Crates.io](https://img.shields.io/crates/v/clickhouse-dfe?logo=rust)](https://crates.io/crates/clickhouse-dfe)
-[![docs.rs](https://img.shields.io/docsrs/clickhouse-dfe?logo=rust)](https://docs.rs/clickhouse-dfe)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/hyperi-io/clickhouse-dfe/blob/main/LICENSE)
+[![Build Status](https://github.com/hyperi-io/dfe-clickhouse-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hyperi-io/dfe-clickhouse-rs/actions)
+[![Crates.io](https://img.shields.io/crates/v/dfe-clickhouse?logo=rust)](https://crates.io/crates/dfe-clickhouse)
+[![docs.rs](https://img.shields.io/docsrs/dfe-clickhouse?logo=rust)](https://docs.rs/dfe-clickhouse)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/LICENSE)
 <!-- BADGES:END -->
 
 > The official ClickHouse Rust client speaks HTTP and nothing else. Plenty of
@@ -17,7 +17,7 @@ published `clickhouse` release. Adds a native TCP transport, runtime-schema
 inserts, and one client that dispatches over either.
 
 ```console
-cargo add clickhouse clickhouse-dfe
+cargo add clickhouse dfe-clickhouse
 ```
 
 ## Extension traits on the HTTP client
@@ -27,9 +27,9 @@ cargo add clickhouse clickhouse-dfe
 
 ```rust,no_run
 use clickhouse::Client;
-use clickhouse_dfe::ClientExt;
+use dfe_clickhouse::ClientExt;
 
-# async fn example() -> clickhouse_dfe::Result<()> {
+# async fn example() -> dfe_clickhouse::Result<()> {
 let client = Client::default()
     .with_url("http://localhost:8123")
     .with_query_id("nightly-rollup");
@@ -42,14 +42,14 @@ client.ping().await?;
 ## Native TCP
 
 ```console
-cargo add clickhouse-dfe --features tcp
+cargo add dfe-clickhouse --features tcp
 ```
 
 Reads are column-typed, and `JSON`, `Variant` and `Dynamic` decode to their
 per-row document text.
 
 ```rust,ignore
-use clickhouse_dfe::TcpClient;
+use dfe_clickhouse::TcpClient;
 
 let client = TcpClient::new("localhost:9000").with_database("default");
 let blocks = client
@@ -67,7 +67,7 @@ for block in &blocks {
 ## Runtime-schema inserts
 
 ```console
-cargo add clickhouse-dfe --features dynamic
+cargo add dfe-clickhouse --features dynamic
 ```
 
 Rows arrive as `serde_json::Map`, column types come from `system.columns`.
@@ -94,10 +94,10 @@ upstream's. `tcp` brings deadpool, socket2 and backon.
 
 | Read | When |
 |---|---|
-| [type-support](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/TYPE-SUPPORT.md) | Checking whether a column type reads and writes |
-| [insert-formats](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/INSERT-FORMATS.md) | Asking why there is no JSONEachRow option |
-| [unified-client](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/UNIFIED-CLIENT.md) | Choosing a transport at runtime |
-| [coverage](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/COVERAGE.md) | Adding to a hot-path module |
+| [type-support](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/TYPE-SUPPORT.md) | Checking whether a column type reads and writes |
+| [insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/INSERT-FORMATS.md) | Asking why there is no JSONEachRow option |
+| [unified-client](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/UNIFIED-CLIENT.md) | Choosing a transport at runtime |
+| [coverage](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/COVERAGE.md) | Adding to a hot-path module |
 
 ## Upstream
 
@@ -110,12 +110,12 @@ cherry-pick from here without a reformat or a relicence.
 ## Licence
 
 Apache-2.0. See
-[LICENSE](https://github.com/hyperi-io/clickhouse-dfe/blob/main/LICENSE) and
-[NOTICE](https://github.com/hyperi-io/clickhouse-dfe/blob/main/NOTICE).
+[LICENSE](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/LICENSE) and
+[NOTICE](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/NOTICE).
 
 ## Context
 
-Depth: [docs/architecture.md](https://github.com/hyperi-io/clickhouse-dfe/blob/main/docs/architecture.md).
+Depth: [docs/architecture.md](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/architecture.md).
 
 ### What this is
 
@@ -168,7 +168,7 @@ Three ways green lies, each recorded in the repo:
 
 ### Where this sits
 
-`dfe-stack suite --consumer clickhouse-dfe` and `--producer clickhouse-dfe` both
+`dfe-stack suite --consumer dfe-clickhouse` and `--producer dfe-clickhouse` both
 return this node with an EMPTY edge list -- registered as a general-audience OSS
 library with `default_in_pass: false`. The one relationship that matters is
 upstream, and the graph does not carry it:
@@ -179,4 +179,4 @@ upstream, and the graph does not carry it:
 
 ## Issues
 
-Open bugs: [this repo](https://github.com/hyperi-io/clickhouse-dfe/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fclickhouse-dfe+repo%3Ahyperi-io%2Ffactbook-rs)
+Open bugs: [this repo](https://github.com/hyperi-io/dfe-clickhouse-rs/issues?q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor) | [whole DFE suite](https://github.com/search?type=issues&q=is%3Aopen+is%3Aissue+type%3ABug+-label%3Abacklog+-label%3Anext-minor+repo%3Ahyperi-io%2Fdfe-infra+repo%3Ahyperi-io%2Fdfe-docker+repo%3Ahyperi-io%2Fdfe-deploy+repo%3Ahyperi-io%2Fdfe-engine+repo%3Ahyperi-io%2Fdfe-loader+repo%3Ahyperi-io%2Fdfe-receiver+repo%3Ahyperi-io%2Fdfe-fetcher+repo%3Ahyperi-io%2Fdfe-archiver+repo%3Ahyperi-io%2Fdfe-transform-vrl+repo%3Ahyperi-io%2Fdfe-transform-vector+repo%3Ahyperi-io%2Fdfe-transform-elastic+repo%3Ahyperi-io%2Fdfe-ui+repo%3Ahyperi-io%2Fdfe-hyperdx+repo%3Ahyperi-io%2Fscalo-rs+repo%3Ahyperi-io%2Fscalo-py+repo%3Ahyperi-io%2Flogreducer+repo%3Ahyperi-io%2Fdfe-schemas+repo%3Ahyperi-io%2Fvector-vrl+repo%3Ahyperi-io%2Fculvert+repo%3Ahyperi-io%2Fdfe-clickhouse+repo%3Ahyperi-io%2Ffactbook-rs)

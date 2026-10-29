@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/tls.rs
 // Purpose:   Trust description to a rustls ClientConfig for the TCP transport
 // Language:  Rust

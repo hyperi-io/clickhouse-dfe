@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      tests/unified_live.rs
 // Purpose:   UnifiedClient parity over HTTP and TCP against a real cluster
 // Language:  Rust
@@ -24,12 +24,12 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
-use clickhouse_dfe::dynamic::DynamicSchemaCache;
-use clickhouse_dfe::unified::{Columns, UnifiedClient};
-use clickhouse_dfe::{Result, TcpClient};
+use dfe_clickhouse::dynamic::DynamicSchemaCache;
+use dfe_clickhouse::unified::{Columns, UnifiedClient};
+use dfe_clickhouse::{Result, TcpClient};
 
 /// So a run that dies mid-test leaves something obviously disposable behind.
-const TABLE_PREFIX: &str = "clickhouse_dfe_s4_";
+const TABLE_PREFIX: &str = "dfe_clickhouse_s4_";
 
 struct Cluster {
     host: String,
@@ -269,12 +269,12 @@ async fn insert_and_read_back(db: &str, table: &str) -> Result<(Vec<u64>, Vec<St
                     -i64::try_from(base + i).expect("test ids are small"),
                 ))
                 .await
-                .map_err(|e| clickhouse_dfe::Error::Custom(e.to_string()))?;
+                .map_err(|e| dfe_clickhouse::Error::Custom(e.to_string()))?;
         }
         insert
             .end()
             .await
-            .map_err(|e| clickhouse_dfe::Error::Custom(e.to_string()))?;
+            .map_err(|e| dfe_clickhouse::Error::Custom(e.to_string()))?;
     }
 
     // `select_sequential_consistency` does not hold one shard for another, so

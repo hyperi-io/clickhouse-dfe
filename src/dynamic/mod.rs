@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      src/dynamic/mod.rs
 // Purpose:   Runtime-schema insert -- type parser, schema reflection, RowBinary encoder
 // Language:  Rust

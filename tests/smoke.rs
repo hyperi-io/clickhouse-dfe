@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      tests/smoke.rs
 // Purpose:   Prove the crate's own entry points construct from outside it
 // Language:  Rust
@@ -21,20 +21,20 @@
 fn the_crate_constructs_its_own_entry_points() {
     #[cfg(feature = "tcp")]
     {
-        let tcp = clickhouse_dfe::TcpClient::new("127.0.0.1:9000").with_pool_size(3);
+        let tcp = dfe_clickhouse::TcpClient::new("127.0.0.1:9000").with_pool_size(3);
         assert_eq!(tcp.pool().status().max_size, 3);
     }
 
     #[cfg(feature = "unified")]
     {
-        use clickhouse_dfe::{Transport, UnifiedClient};
+        use dfe_clickhouse::{Transport, UnifiedClient};
 
         let http = UnifiedClient::Http(clickhouse::Client::default().with_url("http://h:8123"));
         assert_eq!(http.transport(), Transport::Http);
         assert!(http.as_http().is_some(), "the HTTP arm exposes its client");
         assert!(http.as_tcp().is_none());
 
-        let tcp = UnifiedClient::Tcp(clickhouse_dfe::TcpClient::new("127.0.0.1:9000"));
+        let tcp = UnifiedClient::Tcp(dfe_clickhouse::TcpClient::new("127.0.0.1:9000"));
         assert_eq!(tcp.transport(), Transport::Tcp);
         assert!(tcp.as_tcp().is_some(), "the TCP arm exposes its client");
         assert!(tcp.as_http().is_none());
@@ -42,7 +42,7 @@ fn the_crate_constructs_its_own_entry_points() {
 
     #[cfg(feature = "dynamic")]
     {
-        use clickhouse_dfe::dynamic::{ColumnDef, DynamicSchema, DynamicSchemaCache, TypeTag};
+        use dfe_clickhouse::dynamic::{ColumnDef, DynamicSchema, DynamicSchemaCache, TypeTag};
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -68,7 +68,7 @@ fn the_crate_constructs_its_own_entry_points() {
 
     #[cfg(feature = "ext")]
     {
-        use clickhouse_dfe::ServerException;
+        use dfe_clickhouse::ServerException;
 
         let parsed = ServerException::parse(&clickhouse::error::Error::BadResponse(
             "Code: 60. DB::Exception: Table db.t does not exist. (UNKNOWN_TABLE)".into(),
@@ -87,17 +87,17 @@ fn the_crate_constructs_its_own_entry_points() {
 fn public_types_are_send_and_sync() {
     use static_assertions::assert_impl_all;
 
-    assert_impl_all!(clickhouse_dfe::Error: Send, Sync);
+    assert_impl_all!(dfe_clickhouse::Error: Send, Sync);
 
     #[cfg(feature = "unified")]
     {
-        assert_impl_all!(clickhouse_dfe::UnifiedClient: Send, Sync, Clone);
-        assert_impl_all!(clickhouse_dfe::Columns: Send, Sync, Clone);
+        assert_impl_all!(dfe_clickhouse::UnifiedClient: Send, Sync, Clone);
+        assert_impl_all!(dfe_clickhouse::Columns: Send, Sync, Clone);
     }
 
     #[cfg(feature = "dynamic")]
     {
-        use clickhouse_dfe::dynamic::{
+        use dfe_clickhouse::dynamic::{
             DynamicError, DynamicInsert, DynamicSchema, DynamicSchemaCache,
         };
         assert_impl_all!(DynamicSchema: Send, Sync, Clone);
@@ -107,5 +107,5 @@ fn public_types_are_send_and_sync() {
     }
 
     #[cfg(feature = "ext")]
-    assert_impl_all!(clickhouse_dfe::ServerException: Send, Sync, Clone);
+    assert_impl_all!(dfe_clickhouse::ServerException: Send, Sync, Clone);
 }

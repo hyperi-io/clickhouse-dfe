@@ -1,4 +1,4 @@
-// Project:   clickhouse-dfe
+// Project:   dfe-clickhouse
 // File:      tests/wire_docker.rs
 // Purpose:   Native wire round trip against a pinned ClickHouse in Docker
 // Language:  Rust
@@ -35,8 +35,8 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::Semaphore;
 
 use clickhouse::Client;
-use clickhouse_dfe::native::DecodedBlock;
-use clickhouse_dfe::{Columns, TcpClient, UnifiedClient};
+use dfe_clickhouse::native::DecodedBlock;
+use dfe_clickhouse::{Columns, TcpClient, UnifiedClient};
 
 /// Pinned, never `latest`: the wire format moves between server versions.
 const IMAGE_TAG: &str = "26.3.21.7";
@@ -519,7 +519,7 @@ async fn a_nested_low_cardinality_insert_matches_the_server_s_own() {
 
     use serde_json::{Map, json};
 
-    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+    use dfe_clickhouse::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
 
     const TYPE: &str = "Array(LowCardinality(String))";
     require_docker!();
@@ -589,7 +589,7 @@ async fn a_root_json_array_is_rejected_raw_and_round_trips_wrapped() {
 
     use serde_json::{Map, json};
 
-    use clickhouse_dfe::dynamic::{
+    use dfe_clickhouse::dynamic::{
         ColumnDef, DynamicInsert, DynamicSchema, JSON_ARRAY_WRAPPER_KEY,
     };
 
@@ -685,7 +685,7 @@ async fn json_documents_round_trip_as_the_server_stores_them() {
 
     use serde_json::{Map, Value};
 
-    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+    use dfe_clickhouse::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
 
     require_docker!();
     let _one = ONE_SERVER.acquire().await.unwrap();
@@ -783,7 +783,7 @@ async fn an_oversized_json_number_is_stored_as_a_lossy_float() {
 
     use serde_json::{Map, Value};
 
-    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+    use dfe_clickhouse::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
 
     const HUGE: &str = r#"{"huge":123456789012345678901234567890}"#;
 
@@ -849,7 +849,7 @@ async fn a_json_path_that_changes_type_between_rows_reads_back() {
 
     use serde_json::{Map, json};
 
-    use clickhouse_dfe::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
+    use dfe_clickhouse::dynamic::{ColumnDef, DynamicInsert, DynamicSchema};
 
     require_docker!();
     let _one = ONE_SERVER.acquire().await.unwrap();

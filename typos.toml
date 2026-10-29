@@ -1,4 +1,4 @@
-# Project:   clickhouse-dfe
+# Project:   dfe-clickhouse
 # File:      typos.toml
 # Purpose:   Spell checking configuration for typos-cli
 # Language:  TOML
