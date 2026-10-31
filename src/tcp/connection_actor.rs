@@ -495,12 +495,13 @@ enum ReaderMessage {
 #[derive(Clone, Debug, Default)]
 #[non_exhaustive]
 pub struct ActorConfig {
-    /// Per-packet idle read timeout. When `Some(d)`, a query, stream or
-    /// begin-insert read that goes `d` without receiving ANY packet is
-    /// treated as a stalled server: the connection is poisoned and the
-    /// caller sees [`Error::TimedOut`]. The timer resets on every packet,
-    /// so this bounds the gap BETWEEN packets, not the whole query.
-    /// `None` leaves reads bounded only by caller-side cancellation.
+    /// Per-operation I/O deadline. When `Some(d)`, a query, stream or
+    /// begin-insert read that goes `d` without receiving ANY packet, or an
+    /// INSERT block or finish write that takes longer than `d`, is treated
+    /// as a stalled server: the connection is poisoned and the caller sees
+    /// [`Error::TimedOut`]. The read timer resets on every packet, so it
+    /// bounds the gap BETWEEN packets, not the whole query. `None` leaves
+    /// I/O bounded only by caller-side cancellation.
     pub read_timeout: Option<Duration>,
     /// Quota key echoed into every Query packet's `ClientInfo`, so the
     /// server attributes the query to the same quota the handshake
@@ -525,7 +526,7 @@ pub struct ConnectionActor {
     /// Idle or InsertActive. Gates which commands are accepted in
     /// `CommandWorker::handle` -- see [`ActorState`] rustdoc.
     state: ActorState,
-    /// Per-packet idle read timeout; see [`ActorConfig::read_timeout`].
+    /// Per-operation I/O deadline; see [`ActorConfig::read_timeout`].
     read_timeout: Option<Duration>,
     /// Quota key echoed into every Query packet's `ClientInfo`.
     quota_key: String,
@@ -981,15 +982,15 @@ impl ConnectionActor {
             }
         }
 
-        let result = writer::send_data_block(
+        let write = writer::send_data_block(
             &mut self.writer,
             self.server_hello.revision,
             "",
             &column_bytes,
             num_columns,
             num_rows,
-        )
-        .await;
+        );
+        let result = bounded_io(self.read_timeout, write).await;
         if result.is_err() {
             self.poisoned.store(true, Ordering::Release);
             self.state = ActorState::Idle;
@@ -1002,8 +1003,8 @@ impl ConnectionActor {
     /// Exception). Caller's `handle()` arm returns the actor to Idle
     /// regardless of outcome.
     async fn do_finish_insert(&mut self) -> Result<()> {
-        if let Err(e) = writer::send_empty_block(&mut self.writer, self.server_hello.revision).await
-        {
+        let write = writer::send_empty_block(&mut self.writer, self.server_hello.revision);
+        if let Err(e) = bounded_io(self.read_timeout, write).await {
             self.poisoned.store(true, Ordering::Release);
             return Err(e);
         }
@@ -1320,6 +1321,20 @@ impl Drop for ConnectionActor {
     }
 }
 
+/// Run one socket write under the connection's I/O deadline. A write that
+/// outlasts it leaves a partial frame behind, so every caller poisons on `Err`.
+async fn bounded_io<F>(limit: Option<Duration>, io: F) -> Result<()>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    match limit {
+        Some(limit) => tokio::time::timeout(limit, io)
+            .await
+            .unwrap_or(Err(Error::TimedOut)),
+        None => io.await,
+    }
+}
+
 /// Answer a command without touching the socket. [`Error::Transient`] because
 /// a fresh connection may succeed where this one cannot.
 async fn reject_poisoned(cmd: ConnectionCmd) {
@@ -1578,6 +1593,53 @@ mod tests {
             "a drain that never reaches EndOfStream must poison the connection"
         );
 
+        drop(server);
+    }
+
+    /// A server that stops reading fills the socket buffers and parks the
+    /// write for the kernel's whole retransmission window. `read_timeout` is
+    /// the per-operation I/O deadline, so it must bound the write too, and
+    /// the half-written frame means the connection cannot be reused.
+    #[tokio::test]
+    async fn a_block_write_that_outlasts_read_timeout_times_out_and_poisons() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired_with_config(ActorConfig {
+            read_timeout: Some(Duration::from_millis(300)),
+            ..ActorConfig::default()
+        })
+        .await;
+
+        let opener = handle.clone();
+        let begin = tokio::spawn(async move {
+            opener
+                .begin_insert(
+                    "q_stall".into(),
+                    "INSERT INTO t FORMAT Native".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+        });
+        let mut buf = [0u8; 4096];
+        let n = server.read(&mut buf).await.expect("the Query packet");
+        assert!(n > 0);
+        write_schema_block(&mut server, &[("n", "UInt64")]).await;
+        begin.await.unwrap().expect("the INSERT opens");
+
+        // Far past any loopback socket buffer, and the server never reads.
+        let block = vec![0u8; 64 * 1024 * 1024];
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            handle.send_insert_block(block, 1, 1),
+        )
+        .await
+        .expect("the write must stop at read_timeout, not wait on the peer")
+        .expect_err("a stalled write is an error");
+        assert!(matches!(err, Error::TimedOut), "got {err:?}");
+        assert!(
+            !handle.is_alive(),
+            "a half-written frame poisons the connection"
+        );
         drop(server);
     }
 
