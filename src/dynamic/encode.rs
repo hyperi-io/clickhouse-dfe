@@ -645,6 +645,10 @@ fn decimal_tag_for_precision(precision: u8) -> TypeTag {
     }
 }
 
+/// 2^127, exact in f64. An `as i128` cast saturates past it, which would store
+/// the i128 maximum in place of the value.
+const I128_BOUND: f64 = 170_141_183_460_469_231_731_687_303_715_884_105_728.0;
+
 /// Compute the backing integer for a `Decimal(P, S)` by scaling the value by
 /// `10^scale`. The concrete width is applied by the caller.
 ///
@@ -662,13 +666,20 @@ fn decimal_backing_i128(value: &Value, scale: u8, col: &str) -> Result<i128, Dyn
     if let Some(backing) = decimal_from_text(&text, scale) {
         return Ok(backing);
     }
-    // Exponent forms and magnitudes past i128 fall back to f64 scaling, which
-    // is lossy but still better than refusing the row.
+    // A plain literal that missed overflowed i128, and f64 would round it into range.
+    let digits = text.trim_start_matches(['+', '-']);
+    if digits.bytes().any(|b| b.is_ascii_digit())
+        && digits.bytes().all(|b| b.is_ascii_digit() || b == b'.')
+    {
+        return Err(enc_err(col, "decimal out of range"));
+    }
+    // Exponent forms fall back to f64 scaling, which is lossy but still better
+    // than refusing the row.
     let f = text
         .parse::<f64>()
         .map_err(|_| enc_err(col, "not parseable as a decimal"))?;
     let scaled = f * 10f64.powi(i32::from(scale));
-    if !scaled.is_finite() {
+    if !scaled.is_finite() || scaled >= I128_BOUND || scaled < -I128_BOUND {
         return Err(enc_err(col, "decimal out of range after scaling"));
     }
     #[allow(clippy::cast_possible_truncation)]
@@ -1302,11 +1313,25 @@ mod tests {
 
     #[test]
     fn datetime_from_string() {
-        // 2024-12-25 10:30:00 UTC = 1735122600.
-        assert_eq!(
-            enc(json!({"ts": "2024-12-25 10:30:00"}), &[("ts", "DateTime")]),
-            1_735_122_600u32.to_le_bytes()
-        );
+        // 2024-12-25 10:30:00 UTC = 1735122600. A zone argument changes
+        // nothing on the wire.
+        for ty in [
+            "DateTime",
+            "DateTime('UTC')",
+            "Nullable(DateTime('Australia/Sydney'))",
+        ] {
+            let nullable = ty.starts_with("Nullable");
+            let mut expected = Vec::new();
+            if nullable {
+                expected.push(0);
+            }
+            expected.extend_from_slice(&1_735_122_600u32.to_le_bytes());
+            assert_eq!(
+                enc(json!({"ts": "2024-12-25 10:30:00"}), &[("ts", ty)]),
+                expected,
+                "{ty}"
+            );
+        }
     }
 
     #[test]
@@ -1855,6 +1880,20 @@ mod tests {
             ("Int8", json!(-200)),
             ("Int16", json!(40_000)),
             ("Int32", json!(3_000_000_000u64)),
+            // Past i128 the f64 fallback would saturate to the maximum.
+            ("Decimal128(38, 10)", json!("1e40")),
+            ("Decimal128(2)", json!(1e60)),
+            ("Decimal256(2)", json!("-1e60")),
+            // One past each i128 edge: the exact parser overflows, and the
+            // f64 rounding of the text would land back on the edge.
+            (
+                "Decimal128(0)",
+                json!("170141183460469231731687303715884105728"),
+            ),
+            (
+                "Decimal128(0)",
+                json!("-170141183460469231731687303715884105729"),
+            ),
         ] {
             let e = enc_err_of(json!({ "x": value }), &[("x", ty)]);
             assert!(

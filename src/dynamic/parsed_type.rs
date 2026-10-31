@@ -269,6 +269,21 @@ impl ParsedType {
             return result;
         }
 
+        // DateTime('zone'): the zone rides on the type, the wire is the same
+        // UInt32 seconds.
+        if let Some(inner) = Self::extract_wrapper(&type_str, "DateTime") {
+            result.base = "DateTime".to_string();
+            result.tag = TypeTag::DateTime;
+            result.timezone = Some(
+                inner
+                    .trim()
+                    .trim_matches('\'')
+                    .trim_matches('"')
+                    .to_string(),
+            );
+            return result;
+        }
+
         // Check for FixedString(N)
         if let Some(inner) = Self::extract_wrapper(&type_str, "FixedString") {
             result.base = "FixedString".to_string();
@@ -541,6 +556,23 @@ mod tests {
         assert_eq!(t.base, "DateTime64");
         assert_eq!(t.precision, Some(6));
         assert_eq!(t.timezone, Some("UTC".to_string()));
+    }
+
+    /// A zone argument is part of the column type, not a different type:
+    /// `system.columns` reports `DateTime('UTC')` for every zoned column.
+    #[test]
+    fn test_parse_datetime_with_and_without_a_zone() {
+        for (ty, zone) in [
+            ("DateTime", None),
+            ("DateTime('UTC')", Some("UTC")),
+            ("DateTime('Australia/Sydney')", Some("Australia/Sydney")),
+            ("Nullable(DateTime('UTC'))", Some("UTC")),
+        ] {
+            let t = ParsedType::parse(ty);
+            assert_eq!(t.tag, TypeTag::DateTime, "{ty}");
+            assert_eq!(t.base, "DateTime", "{ty}");
+            assert_eq!(t.timezone.as_deref(), zone, "{ty}");
+        }
     }
 
     #[test]

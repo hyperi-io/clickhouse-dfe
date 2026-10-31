@@ -327,6 +327,10 @@ impl ConnectionHandle {
         params: Vec<(String, String)>,
     ) -> Result<Vec<(String, String)>> {
         let (reply, rx) = oneshot::channel();
+        // Dropping this future after the command is queued leaves the actor
+        // to finish opening an INSERT nobody will complete, and the handle
+        // goes back to the pool before the actor notices.
+        let abandoned = PoisonOnDrop::arm(&self.poisoned);
         self.inner
             .send(ConnectionCmd::BeginInsert {
                 query_id,
@@ -337,8 +341,11 @@ impl ConnectionHandle {
             })
             .await
             .map_err(|_| Error::Custom("tcp: connection actor closed".into()))?;
-        rx.await
-            .map_err(|_| Error::Custom("tcp: connection actor dropped begin_insert reply".into()))?
+        let outcome = rx.await.map_err(|_| {
+            Error::Custom("tcp: connection actor dropped begin_insert reply".into())
+        })?;
+        abandoned.disarm();
+        outcome
     }
 
     /// Send one Native-format block during an in-flight INSERT.
@@ -453,6 +460,28 @@ impl ConnectionHandle {
     }
 }
 
+/// Poisons the connection when dropped while armed, so a cancelled caller
+/// future cannot hand the pool a connection in an unknown protocol state.
+struct PoisonOnDrop<'a>(Option<&'a AtomicBool>);
+
+impl<'a> PoisonOnDrop<'a> {
+    fn arm(flag: &'a AtomicBool) -> Self {
+        Self(Some(flag))
+    }
+
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PoisonOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(flag) = self.0 {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
+
 /// Internal message carried over the reader -> actor mpsc; splitting
 /// `Packet` from `Error` keeps every consumer off `Result` matching.
 enum ReaderMessage {
@@ -555,7 +584,12 @@ impl ConnectionActor {
         // receiver drops.
         let revision = server_hello.revision;
         let (pkt_tx, pkt_rx) = mpsc::channel(PACKET_CHANNEL_CAPACITY);
-        let reader_task = tokio::spawn(reader_loop(reader_half, pkt_tx, revision));
+        let reader_task = tokio::spawn(reader_loop(
+            reader_half,
+            pkt_tx,
+            revision,
+            Arc::clone(&poisoned),
+        ));
 
         let actor = ConnectionActor {
             writer: writer_half,
@@ -1121,6 +1155,17 @@ impl CommandWorker for ConnectionActor {
     }
 
     async fn handle(&mut self, cmd: Self::Command) {
+        // A command queued behind the one that poisoned the stream must not reach it.
+        // An open INSERT still drains first, so a rejection buffered ahead of a close surfaces.
+        let continues_insert = matches!(
+            cmd,
+            ConnectionCmd::SendInsertBlock { .. } | ConnectionCmd::FinishInsert { .. }
+        );
+        if self.poisoned.load(Ordering::Acquire) && !continues_insert {
+            reject_poisoned(cmd).await;
+            return;
+        }
+
         // State gate: Ping / ExecuteQuery / BeginInsert / ExecuteStream
         // only in `Idle`, SendInsertBlock / FinishInsert only in
         // `InsertActive`. An out-of-state command replies with an error
@@ -1275,13 +1320,37 @@ impl Drop for ConnectionActor {
     }
 }
 
+/// Answer a command without touching the socket. [`Error::Transient`] because
+/// a fresh connection may succeed where this one cannot.
+async fn reject_poisoned(cmd: ConnectionCmd) {
+    let refusal = || Error::Transient("tcp: connection is poisoned; command not sent".into());
+    match cmd {
+        ConnectionCmd::Ping { reply }
+        | ConnectionCmd::ExecuteQuery { reply, .. }
+        | ConnectionCmd::SendInsertBlock { reply, .. }
+        | ConnectionCmd::FinishInsert { reply } => {
+            let _ = reply.send(Err(refusal()));
+        }
+        ConnectionCmd::BeginInsert { reply, .. } => {
+            let _ = reply.send(Err(refusal()));
+        }
+        ConnectionCmd::ExecuteStream { results, .. } => {
+            let _ = results.send(Err(refusal())).await;
+        }
+    }
+}
+
 /// Reader sub-task body: own the read half, forward packets one at a
-/// time, and on I/O or decode failure send one `Error` and exit. A
-/// closed receiver means the actor has already torn the connection down.
+/// time, and on I/O or decode failure poison the handle, send one `Error`
+/// and exit. Poisoning here rather than when the actor reads the `Error` is
+/// what lets the pool refuse a connection the server closed while it sat
+/// idle, since no command is running to consume the message. A closed
+/// receiver means the actor has already torn the connection down.
 async fn reader_loop(
     mut r: BufReader<ReadHalf<MaybeTlsStream>>,
     tx: mpsc::Sender<ReaderMessage>,
     server_revision: u64,
+    poisoned: Arc<AtomicBool>,
 ) {
     loop {
         match reader::read_packet(&mut r, server_revision).await {
@@ -1293,6 +1362,7 @@ async fn reader_loop(
                 }
             }
             Err(e) => {
+                poisoned.store(true, Ordering::Release);
                 let _ = tx.send(ReaderMessage::Error(e)).await;
                 return;
             }
@@ -1509,6 +1579,120 @@ mod tests {
         );
 
         drop(server);
+    }
+
+    /// A server that rejects an INSERT and then closes poisons the connection
+    /// through the reader, but the rejection is already queued. The caller
+    /// must see it, not a transient refusal a retry loop would replay.
+    #[tokio::test]
+    async fn an_insert_rejection_queued_before_a_close_still_reaches_the_caller() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired().await;
+
+        let opener = handle.clone();
+        let begin = tokio::spawn(async move {
+            opener
+                .begin_insert(
+                    "q_reject".into(),
+                    "INSERT INTO t FORMAT Native".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+        });
+        let mut buf = [0u8; 4096];
+        let n = server.read(&mut buf).await.expect("the Query packet");
+        assert!(n > 0);
+        write_schema_block(&mut server, &[("n", "UInt64")]).await;
+        begin.await.unwrap().expect("the INSERT opens");
+
+        server
+            .write_var_uint(ServerPacketId::Exception as u64)
+            .await
+            .unwrap();
+        server.write_i32_le(469).await.unwrap();
+        server.write_string(b"DB::Exception").await.unwrap();
+        server.write_string(b"constraint violated").await.unwrap();
+        server.write_string(b"").await.unwrap();
+        AsyncWriteExt::write_u8(&mut server, 0).await.unwrap();
+        server.flush().await.unwrap();
+        server.shutdown().await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while handle.is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reader poisons the connection on the close");
+
+        let err = handle
+            .send_insert_block(Vec::new(), 1, 0)
+            .await
+            .expect_err("the buffered rejection must surface");
+        assert!(
+            matches!(err, Error::ServerException { code: 469, .. }),
+            "got {err:?}"
+        );
+        assert!(!err.is_retriable(), "a constraint violation is terminal");
+    }
+
+    /// A poisoned connection may still hold the previous answer on the wire,
+    /// so a command queued behind the poisoning one must be refused unsent.
+    #[tokio::test]
+    async fn a_command_on_a_poisoned_connection_is_refused_without_a_write() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired().await;
+        handle.poison();
+
+        let err = tokio::time::timeout(Duration::from_secs(2), handle.ping())
+            .await
+            .expect("a poisoned connection must answer, not wait on the server")
+            .expect_err("the ping must be refused");
+        assert!(
+            err.is_retriable(),
+            "a fresh connection may succeed: {err:?}"
+        );
+
+        drop(handle);
+        let mut rest = Vec::new();
+        server.read_to_end(&mut rest).await.unwrap();
+        assert!(rest.is_empty(), "nothing may reach the wire: {rest:?}");
+    }
+
+    /// A caller that drops `begin_insert` after the Query packet went out
+    /// cannot be told the INSERT opened, so the actor lands in `InsertActive`
+    /// with nobody to finish it. The handle goes back to the pool at once, so
+    /// it must already be poisoned or the next borrower gets "actor busy".
+    #[tokio::test]
+    async fn dropping_begin_insert_in_flight_poisons_the_connection() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired().await;
+
+        let opener = handle.clone();
+        let begin = tokio::spawn(async move {
+            opener
+                .begin_insert(
+                    "q_cancel".into(),
+                    "INSERT INTO t FORMAT Native".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+        });
+
+        // The Query packet reaching the server proves the command is in flight.
+        let mut buf = [0u8; 4096];
+        let n = server.read(&mut buf).await.expect("the Query packet");
+        assert!(n > 0, "the actor must have issued the query");
+
+        begin.abort();
+        let _ = begin.await;
+
+        assert!(
+            !handle.is_alive(),
+            "a begin_insert the caller abandoned must poison the connection"
+        );
     }
 
     /// The pool hands the same connection to the next caller, so a
