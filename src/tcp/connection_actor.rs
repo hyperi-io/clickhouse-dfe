@@ -106,6 +106,10 @@ const STREAM_CHANNEL_CAPACITY: usize = 4;
 /// thereby its pool slot, indefinitely.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Upper bound on flushing and closing the write half at shutdown. Past it the
+/// actor drops the socket unflushed, since the peer is not reading.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Cap on a single INSERT block's pre-encoded payload. One oversized
 /// block stalls the actor for the length of its socket write and blocks
 /// every other command on that connection, so blocks past this cap are
@@ -1290,13 +1294,21 @@ impl CommandWorker for ConnectionActor {
 
     /// Close the write half so the server sees FIN. `WriteHalf` has no
     /// `Drop` of its own, so nothing else ends the session from our side.
+    /// Bounded because the close flushes buffered bytes first, and a peer that
+    /// stopped reading would hold this task and its fd for the kernel's
+    /// retransmission window.
     async fn on_shutdown(&mut self) {
-        if let Err(e) = self.writer.shutdown().await {
-            tracing::debug!(
+        match tokio::time::timeout(SHUTDOWN_TIMEOUT, self.writer.shutdown()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::debug!(
                 target: "clickhouse::tcp",
                 error = %e,
                 "closing the writer half on shutdown failed"
-            );
+            ),
+            Err(_) => tracing::debug!(
+                target: "clickhouse::tcp",
+                "closing the writer half on shutdown timed out"
+            ),
         }
     }
 }
@@ -1641,6 +1653,66 @@ mod tests {
             "a half-written frame poisons the connection"
         );
         drop(server);
+    }
+
+    /// Shutdown flushes whatever a timed-out write left in the buffer. A peer
+    /// that never reads would hold that flush, the actor task and the fd for
+    /// the kernel's retransmission window unless the close is bounded.
+    #[tokio::test]
+    async fn closing_a_connection_whose_peer_stopped_reading_is_bounded() {
+        use tokio::io::AsyncReadExt;
+        let (handle, mut server) = paired_with_config(ActorConfig {
+            read_timeout: Some(Duration::from_millis(200)),
+            ..ActorConfig::default()
+        })
+        .await;
+
+        let opener = handle.clone();
+        let begin = tokio::spawn(async move {
+            opener
+                .begin_insert(
+                    "q_close".into(),
+                    "INSERT INTO t FORMAT Native".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+        });
+        let mut buf = [0u8; 4096];
+        let n = server.read(&mut buf).await.expect("the Query packet");
+        assert!(n > 0);
+        write_schema_block(&mut server, &[("n", "UInt64")]).await;
+        begin.await.unwrap().expect("the INSERT opens");
+
+        // Blocks under the 64 KiB write buffer flush quickly until the kernel
+        // buffers fill. The block that hits the wall times out with its bytes
+        // still in the buffer, which is what shutdown then has to flush.
+        let mut sent = 0;
+        let err = loop {
+            match handle.send_insert_block(vec![0u8; 32 * 1024], 1, 1).await {
+                Ok(()) => sent += 1,
+                Err(e) => break e,
+            }
+            assert!(sent < 10_000, "the kernel buffers never filled");
+        };
+        assert!(matches!(err, Error::TimedOut), "got {err:?}");
+
+        let started = tokio::time::Instant::now();
+        tokio::time::timeout(SHUTDOWN_TIMEOUT * 2, handle.close())
+            .await
+            .expect("close must give up on a peer that is not reading")
+            .expect("the actor exits cleanly");
+        assert!(
+            started.elapsed() >= SHUTDOWN_TIMEOUT,
+            "the flush had nowhere to go, so close waited out its bound: {:?}",
+            started.elapsed()
+        );
+
+        // The socket is released: draining what was sent ends in EOF or reset.
+        let mut sink = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(5), server.read_to_end(&mut sink))
+            .await
+            .expect("the server must see the connection end");
     }
 
     /// A server that rejects an INSERT and then closes poisons the connection
