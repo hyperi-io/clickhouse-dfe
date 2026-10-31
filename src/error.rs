@@ -183,12 +183,7 @@ impl Error {
             // A stale, missing or unreadable schema is fixed by re-reading it;
             // an unsupported type or a bad value is not.
             #[cfg(feature = "dynamic")]
-            Self::Dynamic(e) => matches!(
-                e,
-                crate::dynamic::DynamicError::SchemaFetch { .. }
-                    | crate::dynamic::DynamicError::SchemaMismatch { .. }
-                    | crate::dynamic::DynamicError::EmptySchema { .. }
-            ),
+            Self::Dynamic(e) => e.is_retriable(),
             _ => false,
         }
     }
@@ -341,6 +336,10 @@ mod tests {
             DynamicError::SchemaFetch {
                 table: "db.t".into(),
                 source: clickhouse::error::Error::TimedOut,
+            },
+            DynamicError::Transport {
+                table: "db.t".into(),
+                source: Box::new(Error::TimedOut),
             },
         ];
         for e in retriable {

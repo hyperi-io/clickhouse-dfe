@@ -60,4 +60,33 @@ pub enum DynamicError {
         /// Fully qualified `database.table`.
         table: String,
     },
+    /// The insert failed in transit or on a transient server condition (a
+    /// timeout, a failed connect, a connection the server dropped, a server
+    /// code worth retrying). Nothing is wrong with the rows, so the batch is
+    /// retriable and must not be dead-lettered.
+    #[error("transport failure inserting into '{table}': {source}")]
+    Transport {
+        /// Fully qualified `database.table`.
+        table: String,
+        /// The underlying failure, boxed because [`crate::Error`] holds a
+        /// [`DynamicError`].
+        #[source]
+        source: Box<crate::Error>,
+    },
+}
+
+impl DynamicError {
+    /// Whether a fresh attempt may succeed: a transport failure, or a stale,
+    /// missing or unreadable schema that a re-read fixes. An unsupported type,
+    /// a bad value and a schema-valid rejection are not.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        matches!(
+            self,
+            Self::Transport { .. }
+                | Self::SchemaFetch { .. }
+                | Self::SchemaMismatch { .. }
+                | Self::EmptySchema { .. }
+        )
+    }
 }
