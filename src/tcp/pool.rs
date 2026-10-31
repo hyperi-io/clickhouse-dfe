@@ -2,7 +2,7 @@
 //!
 //! HOT PATH. Every operation acquires from here, so this module is held to a
 //! 90% line-coverage target rather than the repo's 80% floor, and meets it.
-//! See `docs/COVERAGE.md`.
+//! See `docs/coverage.md`.
 //!
 //! Wraps [`crate::tcp::connection_actor::ConnectionHandle`] in a
 //! [`deadpool::managed::Pool`] so callers can acquire ready-to-use
@@ -99,10 +99,48 @@ pub struct TcpConnectionManager {
     /// Maximum connection age; `None` keeps connections for life. See
     /// [`PoolConfig::max_lifetime`].
     pub max_lifetime: Option<Duration>,
-    /// Per-packet idle read timeout threaded to each spawned actor; see
-    /// [`PoolConfig::read_timeout`]. `None` leaves reads bounded only by
+    /// Per-operation I/O deadline threaded to each spawned actor; see
+    /// [`PoolConfig::read_timeout`]. `None` leaves I/O bounded only by
     /// caller-side cancellation.
     pub read_timeout: Option<Duration>,
+    /// Budget for one whole `create`, shared across the endpoints it walks;
+    /// see [`PoolConfig::create_timeout`]. `None` leaves each attempt
+    /// unbounded.
+    pub create_timeout: Option<Duration>,
+}
+
+impl TcpConnectionManager {
+    /// Resolve `endpoint`, connect, handshake and spawn the actor. Resolution
+    /// goes through tokio's async resolver, not the blocking std
+    /// `ToSocketAddrs`, and takes the first address only.
+    async fn connect_endpoint(&self, endpoint: &str) -> Result<ConnectionHandle> {
+        let addr = tokio::net::lookup_host(endpoint)
+            .await
+            .map_err(|e| Error::Connect(format!("tcp: cannot resolve {endpoint:?}: {e}")))?
+            .next()
+            .ok_or_else(|| Error::Connect(format!("tcp: {endpoint:?} resolved to no addresses")))?;
+        let (stream, hello) = connect::open_handshaken(addr, &self.kind, &self.config).await?;
+        Ok(ConnectionActor::spawn_with_config(
+            stream,
+            hello,
+            ActorConfig {
+                read_timeout: self.read_timeout,
+                quota_key: self.config.quota_key.clone(),
+            },
+        ))
+    }
+}
+
+/// Smallest slice of the create budget one endpoint gets. A TLS connect and
+/// handshake over a WAN link is several round trips, so a slice under this
+/// would fail a healthy but distant endpoint just because the list is long.
+const MIN_ENDPOINT_SLICE: Duration = Duration::from_secs(1);
+
+/// The share of `remaining` one attempt may spend with `endpoints_left`
+/// still to try, floored at [`MIN_ENDPOINT_SLICE`] and capped at `remaining`.
+fn endpoint_slice(remaining: Duration, endpoints_left: usize) -> Duration {
+    let share = remaining / u32::try_from(endpoints_left.max(1)).unwrap_or(u32::MAX);
+    share.max(MIN_ENDPOINT_SLICE).min(remaining)
 }
 
 impl managed::Manager for TcpConnectionManager {
@@ -123,47 +161,40 @@ impl managed::Manager for TcpConnectionManager {
             ));
         }
         let start = self.next.fetch_add(1, Ordering::Relaxed) % n;
+        let began = tokio::time::Instant::now();
         let mut last_err: Option<Error> = None;
         for i in 0..n {
             let endpoint = &self.endpoints[(start + i) % n];
-            // Resolve per connection via tokio's async resolver, not the
-            // blocking std `ToSocketAddrs`; first address only.
-            let resolved = match tokio::net::lookup_host(endpoint).await {
-                Ok(mut addrs) => addrs.next().ok_or_else(|| {
-                    Error::Connect(format!("tcp: {endpoint:?} resolved to no addresses"))
-                }),
-                Err(e) => Err(Error::Connect(format!(
-                    "tcp: cannot resolve {endpoint:?}: {e}"
-                ))),
-            };
-            let addr = match resolved {
-                Ok(addr) => addr,
-                Err(e) => {
-                    // Remember and try the next endpoint -- a single
-                    // unresolvable host must not sink the whole pass.
-                    last_err = Some(e);
-                    continue;
+            let attempt = self.connect_endpoint(endpoint);
+            let outcome = match self.create_timeout {
+                Some(total) => {
+                    let remaining = total.saturating_sub(began.elapsed());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    let slice = endpoint_slice(remaining, n - i);
+                    tokio::time::timeout(slice, attempt)
+                        .await
+                        .unwrap_or_else(|_| {
+                            Err(Error::Connect(format!(
+                                "tcp: {endpoint:?} did not answer within {slice:?}"
+                            )))
+                        })
                 }
+                None => attempt.await,
             };
-            match connect::open_handshaken(addr, &self.kind, &self.config).await {
-                Ok((stream, hello)) => {
-                    return Ok(ConnectionActor::spawn_with_config(
-                        stream,
-                        hello,
-                        ActorConfig {
-                            read_timeout: self.read_timeout,
-                            quota_key: self.config.quota_key.clone(),
-                        },
-                    ));
-                }
+            match outcome {
+                Ok(handle) => return Ok(handle),
+                // Remember and try the next endpoint -- a single dead or
+                // unresolvable host must not sink the whole pass.
                 Err(e) => last_err = Some(e),
             }
         }
         // Every endpoint failed this pass. Surface the last error unchanged so
-        // it stays typed for retry classification. `last_err` is always set:
-        // the loop ran at least once, guarded by the emptiness check above.
+        // it stays typed for retry classification. `last_err` is only unset
+        // when the budget was spent before the first attempt.
         Err(last_err.unwrap_or_else(|| {
-            Error::Connect("tcp: no endpoints configured for this pool".to_string())
+            Error::Connect("tcp: create timeout spent before any endpoint was tried".to_string())
         }))
     }
 
@@ -234,8 +265,11 @@ pub struct PoolConfig {
     /// How long a caller may wait for a free pool slot before
     /// `Pool::get` returns `Err`. `None` waits indefinitely.
     pub acquire_timeout: Option<Duration>,
-    /// How long `Manager::create` may take before deadpool aborts
-    /// it. `None` waits indefinitely.
+    /// How long `Manager::create` may take in total. The budget is split
+    /// across the endpoints it walks, each attempt getting the remaining
+    /// time divided by the endpoints left (never under one second), so a
+    /// silent first endpoint still leaves time for the next. `None` waits
+    /// indefinitely.
     pub create_timeout: Option<Duration>,
     /// How long `Manager::recycle` may take before deadpool aborts
     /// it. `None` waits indefinitely.
@@ -249,13 +283,15 @@ pub struct PoolConfig {
     /// handled separately by the actor's reader sub-task (poison on
     /// EOF/I/O error); this dial is purely an age bound.
     pub max_lifetime: Option<Duration>,
-    /// Per-packet idle read timeout, threaded into every spawned actor.
+    /// Per-operation I/O deadline, threaded into every spawned actor.
     /// A query/stream/begin-insert read that goes this long without
-    /// receiving ANY packet poisons the connection and surfaces
-    /// [`Error::TimedOut`]. The timer resets on each packet, so it bounds
-    /// the gap BETWEEN packets, not total query time -- a long streaming
-    /// SELECT that keeps delivering blocks never trips it. `None`
-    /// (default) leaves reads bounded only by caller-side cancellation.
+    /// receiving ANY packet, or an INSERT block or finish write that takes
+    /// this long, poisons the connection and surfaces [`Error::TimedOut`].
+    /// The read timer resets on each packet, so it bounds the gap BETWEEN
+    /// packets, not total query time -- a long streaming SELECT that keeps
+    /// delivering blocks never trips it. A block write is bounded as a
+    /// whole, so size the timeout for the largest block. `None` (default)
+    /// leaves I/O bounded only by caller-side cancellation.
     pub read_timeout: Option<Duration>,
 }
 
@@ -423,11 +459,14 @@ pub fn build_pool(
         config,
         max_lifetime: pool_cfg.max_lifetime,
         read_timeout: pool_cfg.read_timeout,
+        create_timeout: pool_cfg.create_timeout,
     };
+    // The manager splits the create budget across endpoints itself, so
+    // deadpool's whole-create abort would only cut the last slice short.
     Pool::builder(manager)
         .max_size(pool_cfg.max_size)
         .wait_timeout(pool_cfg.acquire_timeout)
-        .create_timeout(pool_cfg.create_timeout)
+        .create_timeout(None)
         .recycle_timeout(pool_cfg.recycle_timeout)
         .runtime(Runtime::Tokio1)
         .build()
@@ -812,6 +851,7 @@ mod tests {
             config: HandshakeConfig::default(),
             max_lifetime: None,
             read_timeout: None,
+            create_timeout: None,
         }
     }
 
@@ -869,6 +909,58 @@ mod tests {
             vec![1],
             "create should have connected only to the accepting endpoint after skipping the refusing one"
         );
+    }
+
+    /// A host that accepts and never answers holds a connect for the whole
+    /// create budget unless each endpoint gets its own slice of it.
+    #[tokio::test]
+    async fn a_silent_first_endpoint_leaves_budget_for_the_second() {
+        let hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let silent = hole.local_addr().unwrap().to_string();
+        let holder = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((sock, _)) = hole.accept().await {
+                held.push(sock);
+            }
+        });
+        let order = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let live = spawn_mock_endpoint(1, 1, Arc::clone(&order)).await;
+
+        let mut mgr = manager_over(vec![silent, live]);
+        mgr.create_timeout = Some(Duration::from_secs(4));
+        let started = tokio::time::Instant::now();
+        mgr.create()
+            .await
+            .expect("the live endpoint must still be reached");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "failover finished inside the create budget, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(order.lock().unwrap().clone(), vec![1]);
+        holder.abort();
+    }
+
+    #[test]
+    fn endpoint_slice_divides_the_budget_with_a_floor_and_a_cap() {
+        let s = Duration::from_secs;
+        let ms = Duration::from_millis;
+        for (remaining, left, expected) in [
+            (s(10), 1, s(10)),
+            (s(10), 2, s(5)),
+            (s(10), 3, s(10) / 3),
+            // The floor keeps a long list from starving each endpoint.
+            (s(10), 20, s(1)),
+            // The cap keeps the floor from outrunning the budget.
+            (ms(400), 3, ms(400)),
+        ] {
+            assert_eq!(
+                endpoint_slice(remaining, left),
+                expected,
+                "{remaining:?} over {left}"
+            );
+        }
     }
 
     /// A name that will not resolve fails BEFORE the connect, on a

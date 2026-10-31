@@ -494,8 +494,25 @@ const SCHEMA_DRIFT_CODES: &[i32] = &[
     117, // INCORRECT_DATA
 ];
 
-/// Classify a sink error as schema drift (the cached schema is stale) or a
-/// generic encoding/transport failure.
+/// Whether a fresh attempt may succeed because nothing is wrong with the rows:
+/// a timeout, a failed connect, a connection the server dropped, a poisoned
+/// handle or a server code worth retrying.
+fn is_transport_failure(e: &crate::Error) -> bool {
+    #[cfg(feature = "tcp")]
+    {
+        crate::tcp::retry::is_retriable_transport(e)
+    }
+    #[cfg(not(feature = "tcp"))]
+    {
+        e.is_retriable()
+    }
+}
+
+/// Classify a sink error as a transport failure (retry the batch), schema drift
+/// (the cached schema is stale) or a rejection of the rows themselves.
+///
+/// Transport comes first: a timeout or a dropped connection says nothing about
+/// the rows, and reporting it as an encoding error gets good rows dead-lettered.
 ///
 /// The code is read structurally wherever the error carries one, so this does
 /// not become a second opinion on what the server's message wording means. The
@@ -505,6 +522,12 @@ const SCHEMA_DRIFT_CODES: &[i32] = &[
 /// [`ServerException::parse`]: crate::ext::ServerException::parse
 fn classify_error(full_table: &str, e: impl Into<crate::Error>) -> DynamicError {
     let err: crate::Error = e.into();
+    if is_transport_failure(&err) {
+        return DynamicError::Transport {
+            table: full_table.to_string(),
+            source: Box::new(err),
+        };
+    }
     let code = match &err {
         crate::Error::ServerException { code, .. } => Some(*code),
         crate::Error::BadResponse(body) => {
@@ -597,10 +620,10 @@ mod tests {
             "code 47 is schema drift"
         );
 
-        // 241 = MEMORY_LIMIT_EXCEEDED: a real rejection, but not schema drift,
-        // so the cached schema must not be thrown away over it.
+        // 469 = VIOLATED_CONSTRAINT: a real rejection of the rows, but not
+        // schema drift, so the cached schema must not be thrown away over it.
         let not_drift = clickhouse::error::Error::BadResponse(
-            "Code: 241. DB::Exception: Memory limit exceeded (MEMORY_LIMIT_EXCEEDED)".into(),
+            "Code: 469. DB::Exception: Constraint violated (VIOLATED_CONSTRAINT)".into(),
         );
         assert!(matches!(
             classify_error("db.t", not_drift),
@@ -642,6 +665,150 @@ mod tests {
             classify_error("db.t", e),
             DynamicError::EncodingError { .. }
         ));
+    }
+
+    /// A failure that says nothing about the rows must stay retriable, or the
+    /// caller dead-letters a good batch on a timeout. A rejection of the rows
+    /// itself must not, or it retries forever.
+    #[test]
+    fn classify_keeps_transport_failures_retriable_and_row_failures_terminal() {
+        use std::io::{Error as Io, ErrorKind};
+
+        let io = |kind| crate::Error::from(Io::new(kind, "io"));
+        let server = |code| crate::Error::ServerException {
+            code,
+            name: None,
+            message: "rejected".into(),
+            stack_trace: None,
+        };
+        let transport: Vec<(&str, crate::Error)> = vec![
+            ("timeout", crate::Error::TimedOut),
+            ("connect", crate::Error::Connect("refused".into())),
+            ("transient", crate::Error::Transient("poisoned".into())),
+            ("network", crate::Error::Network("down".into())),
+            ("broken pipe", io(ErrorKind::BrokenPipe)),
+            ("eof", io(ErrorKind::UnexpectedEof)),
+            ("reset", io(ErrorKind::ConnectionReset)),
+            ("memory limit", server(241)),
+            ("too many parts", server(252)),
+        ];
+        for (what, err) in transport {
+            let classified = classify_error("db.t", err);
+            assert!(
+                matches!(classified, DynamicError::Transport { .. }),
+                "{what}: {classified:?}"
+            );
+            assert!(classified.is_retriable(), "{what}");
+            assert!(crate::Error::from(classified).is_retriable(), "{what}");
+        }
+
+        let terminal: Vec<(&str, crate::Error)> = vec![
+            ("constraint", server(469)),
+            ("custom", crate::Error::Custom("bad row".into())),
+            ("io other kind", io(ErrorKind::PermissionDenied)),
+        ];
+        for (what, err) in terminal {
+            let classified = classify_error("db.t", err);
+            assert!(
+                matches!(classified, DynamicError::EncodingError { .. }),
+                "{what}: {classified:?}"
+            );
+            assert!(!classified.is_retriable(), "{what}");
+        }
+    }
+
+    /// The same classification, reached through the real sink: a server that
+    /// never answers the INSERT, and one that hangs up after opening it.
+    #[cfg(feature = "tcp")]
+    mod over_tcp {
+        use std::time::Duration;
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        use super::*;
+        use crate::tcp::mock::{serve_one_handshake, write_schema_block};
+
+        fn rows() -> (Arc<DynamicSchema>, Map<String, Value>) {
+            let schema = Arc::new(DynamicSchema::from_columns(
+                "db.t",
+                vec![
+                    ColumnDef::new("n", "UInt64"),
+                    ColumnDef::new("_json", "String"),
+                ],
+            ));
+            let row = json!({ "n": 1 }).as_object().unwrap().clone();
+            (schema, row)
+        }
+
+        /// A DynamicInsert against a mock that answers the handshake and then
+        /// runs `script`, with a read timeout short enough to hit.
+        async fn insert_against<F, Fut>(
+            script: F,
+        ) -> (DynamicInsert, tokio::task::JoinHandle<TcpStream>)
+        where
+            F: FnOnce(TcpStream) -> Fut + Send + 'static,
+            Fut: std::future::Future<Output = TcpStream> + Send + 'static,
+        {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                serve_one_handshake(&mut sock).await;
+                script(sock).await
+            });
+            let client = TcpClient::new(addr).with_read_timeout(Some(Duration::from_millis(250)));
+            let (schema, _) = rows();
+            (DynamicInsert::tcp(client, "db", "t", schema), server)
+        }
+
+        /// Opening the INSERT times out waiting for the schema block, through
+        /// both entry points that open it.
+        #[tokio::test]
+        async fn a_timeout_opening_the_insert_is_retriable() {
+            let (_, row) = rows();
+            for with_raw in [false, true] {
+                let (mut insert, server) = insert_against(|sock| async move {
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    sock
+                })
+                .await;
+                let err = if with_raw {
+                    insert.write_map_with_raw(&row, ("_json", b"{}")).await
+                } else {
+                    insert.write_map(&row).await
+                }
+                .expect_err("the server never answers the INSERT");
+                assert!(
+                    matches!(&err, DynamicError::Transport { source, .. }
+                        if matches!(**source, crate::Error::TimedOut)),
+                    "with_raw={with_raw}: {err:?}"
+                );
+                assert!(err.is_retriable());
+                server.abort();
+            }
+        }
+
+        /// The server opens the INSERT and then closes: committing the block
+        /// fails in transit, not because of the rows.
+        #[tokio::test]
+        async fn a_connection_dropped_before_commit_is_retriable() {
+            let (_, row) = rows();
+            let (mut insert, server) = insert_against(|mut sock| async move {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                write_schema_block(&mut sock, &[("n", "UInt64"), ("_json", "String")]).await;
+                sock.shutdown().await.unwrap();
+                sock
+            })
+            .await;
+            insert.write_map(&row).await.expect("the row buffers");
+
+            let err = insert.end().await.expect_err("the server hung up");
+            assert!(matches!(err, DynamicError::Transport { .. }), "got {err:?}");
+            assert!(err.is_retriable());
+            let _sock = server.await.unwrap();
+        }
     }
 
     #[test]

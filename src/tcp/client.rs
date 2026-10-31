@@ -200,7 +200,9 @@ impl TcpClient {
         self
     }
 
-    /// How long `Manager::create` (connect + handshake) may take.
+    /// How long `Manager::create` (connect + handshake) may take in total,
+    /// split across the configured endpoints so a silent one cannot use the
+    /// whole budget.
     #[must_use]
     pub fn with_pool_create_timeout(mut self, d: Option<Duration>) -> Self {
         self.config.pool.create_timeout = d;
@@ -216,7 +218,10 @@ impl TcpClient {
         self
     }
 
-    /// Per-packet idle read timeout threaded into every spawned actor.
+    /// Per-operation I/O deadline threaded into every spawned actor: the gap
+    /// between packets on a read, and the whole of an INSERT block or finish
+    /// write. A timeout poisons the connection and returns
+    /// [`crate::Error::TimedOut`].
     #[must_use]
     pub fn with_read_timeout(mut self, d: Option<Duration>) -> Self {
         self.config.pool.read_timeout = d;

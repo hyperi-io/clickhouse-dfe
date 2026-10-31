@@ -13,10 +13,10 @@ Per-layer notes land here as each grows past what a comment can carry:
 - [architecture.md](architecture.md) -- the cross-layer map: the three gaps the
   crate exists to close, the feature layers, and the invariants that span more
   than one module.
-- [COVERAGE.md](COVERAGE.md) -- the 80% floor, the 90% hot-path target, how to
+- [coverage.md](coverage.md) -- the 80% floor, the 90% hot-path target, how to
   measure, and where any tracked debt is recorded.
-- [INSERT-FORMATS.md](INSERT-FORMATS.md) -- why every insert path sends binary,
+- [insert-formats.md](insert-formats.md) -- why every insert path sends binary,
   and why there is no JSONEachRow option.
-- [TYPE-SUPPORT.md](TYPE-SUPPORT.md) -- which ClickHouse types the codec reads
+- [type-support.md](type-support.md) -- which ClickHouse types the codec reads
   and writes.
-- [UNIFIED-CLIENT.md](UNIFIED-CLIENT.md) -- one entry point over two transports.
+- [unified-client.md](unified-client.md) -- one entry point over two transports.

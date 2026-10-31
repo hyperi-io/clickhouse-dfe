@@ -3,7 +3,7 @@
 //!
 //! HOT PATH. Every row in and out of the server passes through here, so this
 //! module is held to a 90% line-coverage target rather than the repo's 80%
-//! floor, and every file in it meets that today. `docs/COVERAGE.md` carries
+//! floor, and every file in it meets that today. `docs/coverage.md` carries
 //! the numbers and how to measure them. Adding a wire format here means adding
 //! the test with it, or the next reader inherits a claim that is no longer
 //! true.

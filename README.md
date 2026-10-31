@@ -94,10 +94,10 @@ upstream's. `tcp` brings deadpool, socket2 and backon.
 
 | Read | When |
 |---|---|
-| [type-support](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/TYPE-SUPPORT.md) | Checking whether a column type reads and writes |
-| [insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/INSERT-FORMATS.md) | Asking why there is no JSONEachRow option |
-| [unified-client](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/UNIFIED-CLIENT.md) | Choosing a transport at runtime |
-| [coverage](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/COVERAGE.md) | Adding to a hot-path module |
+| [type-support](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/type-support.md) | Checking whether a column type reads and writes |
+| [insert-formats](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/insert-formats.md) | Asking why there is no JSONEachRow option |
+| [unified-client](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/unified-client.md) | Choosing a transport at runtime |
+| [coverage](https://github.com/hyperi-io/dfe-clickhouse-rs/blob/main/docs/coverage.md) | Adding to a hot-path module |
 
 ## Upstream
 
@@ -153,13 +153,13 @@ Three ways green lies, each recorded in the repo:
 |---|---|---|
 | `-D warnings` covers the crate | It reaches only the `features: all` set. The feature matrix runs `cargo hack --each-feature --no-dev-deps check`, and `check` does not fail on a warning, so feature-gated dead code and feature-conditional lints pass. Four accumulated in the default set before the review gate started linting it on 2026-09-02 | `.hyperi-ci.yaml` |
 | The live tests ran | CI never runs the eleven `#[ignore]`d tests in `tests/*_live.rs`. They need a real cluster through `CLICKHOUSE_DFE_ENV_FILE`, and nextest is given no `--run-ignored` | `tests/*_live.rs` |
-| Coverage is held | It reports and does not gate. `coverage: false` is deliberate -- hyperi-ci reads `test.min_coverage` for Python only. Measure out of band with `cargo llvm-cov --all-features --all-targets --summary-only`, keeping `--all-targets`, because a `--lib`-only run reads lower on the codec and invents regressions | `docs/COVERAGE.md` |
+| Coverage is held | It reports and does not gate. `coverage: false` is deliberate -- hyperi-ci reads `test.min_coverage` for Python only. Measure out of band with `cargo llvm-cov --all-features --all-targets --summary-only`, keeping `--all-targets`, because a `--lib`-only run reads lower on the codec and invents regressions | `docs/coverage.md` |
 
 ### What tends to bite
 
 | Don't | Do | Why |
 |---|---|---|
-| Trust a unit test on a wire format | Add a row to `tests/wire_docker.rs` | The sparse kind-stack bug sat in code the unit tests executed happily -- the fixtures agreed with the decoder because both were written from the same wrong reading of the spec. A real server writing the bytes caught it (`0ee6201`, `docs/COVERAGE.md`) |
+| Trust a unit test on a wire format | Add a row to `tests/wire_docker.rs` | The sparse kind-stack bug sat in code the unit tests executed happily -- the fixtures agreed with the decoder because both were written from the same wrong reading of the spec. A real server writing the bytes caught it (`0ee6201`, `docs/coverage.md`) |
 | Raise the advertised protocol revision on its own | Consume the fields the new gates add, in the handshake and in Progress and ProfileInfo | `88137d3` advertised 54473 and stalled against a real server until `64baef4` and `aae05d3` read the added fields |
 | Add `#[ignore]` to a test in `tests/wire_docker.rs` | Leave it running and let it skip when there is no container runtime | nextest has no `--run-ignored` here, so an ignored test in that file is one CI never runs (`tests/wire_docker.rs:16`) |
 | Assume the default feature set is linted | Run `make check-features`, and lint the sets by hand | A lint ratchet macro hid 64 warnings until `66b271f` retired it, and `d49c721` then had to lint the sets nobody was linting |

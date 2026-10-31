@@ -439,6 +439,52 @@ mod tests {
         let _socks = server.await.unwrap();
     }
 
+    /// A pooled connection the server closed while it sat idle is only
+    /// discovered by the reader. If that does not poison the handle, the next
+    /// acquire hands out a dead socket and the caller's first command fails.
+    #[tokio::test]
+    async fn a_connection_the_server_closed_while_idle_is_not_handed_out() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut first, _) = listener.accept().await.unwrap();
+            serve_one_handshake(&mut first).await;
+            drop(first);
+
+            let (mut fresh, _) = listener.accept().await.unwrap();
+            serve_one_handshake(&mut fresh).await;
+            assert_eq!(
+                fresh.read_var_uint().await.unwrap(),
+                ClientPacketId::Ping as u64
+            );
+            fresh
+                .write_var_uint(ServerPacketId::Pong as u64)
+                .await
+                .unwrap();
+            fresh.flush().await.unwrap();
+            fresh
+        });
+
+        let pool = pool_of(addr, 1);
+        let idle = pool.get().await.expect("first connection");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while idle.is_alive() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the reader must poison a connection the server closed");
+        drop(idle);
+
+        let conn = pool.get().await.expect("acquire after the server closed");
+        conn.ping()
+            .await
+            .expect("the pool must reconnect rather than reuse the closed socket");
+
+        drop(conn);
+        let _sock = server.await.unwrap();
+    }
+
     /// Releasing the slot at dispatch time would let the next `get()`
     /// hand out a connection that is still streaming, and the two
     /// callers would interleave on one socket.
