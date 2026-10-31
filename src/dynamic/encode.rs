@@ -231,14 +231,17 @@ fn encode_typed(
             let s = value_to_str(value);
             let n = pt.fixed_size.unwrap_or(1);
             let bytes = s.as_bytes();
-            // CH FixedString is a raw N-byte run: pad short values with NULs,
-            // truncate long ones. No length prefix.
-            if bytes.len() <= n {
-                buf.extend_from_slice(bytes);
-                buf.resize(buf.len() + (n - bytes.len()), 0);
-            } else {
-                buf.extend_from_slice(&bytes[..n]);
+            // CH FixedString is a raw N-byte run with no length prefix: short
+            // values are NUL-padded, and a long one fails the row because cutting
+            // it would drop bytes, possibly mid-character.
+            if bytes.len() > n {
+                return Err(enc_err(
+                    col,
+                    &format!("FixedString({n}) value out of range: {} bytes", bytes.len()),
+                ));
             }
+            buf.extend_from_slice(bytes);
+            buf.resize(buf.len() + (n - bytes.len()), 0);
         }
         TypeTag::Bool => {
             buf.push(u8::from(as_bool(value, col)?));
@@ -1155,14 +1158,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn fixed_string_truncate() {
-        assert_eq!(
-            enc(json!({"f": "abcdef"}), &[("f", "FixedString(3)")]),
-            vec![b'a', b'b', b'c']
-        );
-    }
-
     // ---- Integers ----
 
     #[test]
@@ -1884,6 +1879,9 @@ mod tests {
             ("Decimal128(38, 10)", json!("1e40")),
             ("Decimal128(2)", json!(1e60)),
             ("Decimal256(2)", json!("-1e60")),
+            // A value wider than the column is an error, not a cut-down copy.
+            ("FixedString(3)", json!("abcdef")),
+            ("FixedString(2)", json!("\u{e9}\u{e9}\u{e9}")),
             // One past each i128 edge: the exact parser overflows, and the
             // f64 rounding of the text would land back on the edge.
             (
@@ -1902,6 +1900,10 @@ mod tests {
             );
             assert!(format!("{e}").contains("out of range"), "{ty}: {e}");
         }
+        // The error names the column and how wide the value was.
+        let e = enc_err_of(json!({"tag": "abcdef"}), &[("tag", "FixedString(3)")]);
+        let text = e.to_string();
+        assert!(text.contains("'tag'") && text.contains("6 bytes"), "{text}");
         // The widest value each column CAN hold still encodes.
         assert_eq!(enc(json!({"x": 255}), &[("x", "UInt8")]), vec![255]);
         assert_eq!(
