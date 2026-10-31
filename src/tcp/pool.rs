@@ -2,7 +2,7 @@
 //!
 //! HOT PATH. Every operation acquires from here, so this module is held to a
 //! 90% line-coverage target rather than the repo's 80% floor, and meets it.
-//! See `docs/COVERAGE.md`.
+//! See `docs/coverage.md`.
 //!
 //! Wraps [`crate::tcp::connection_actor::ConnectionHandle`] in a
 //! [`deadpool::managed::Pool`] so callers can acquire ready-to-use
